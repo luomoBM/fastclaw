@@ -103,6 +103,7 @@ func main() {
 	rootCmd.AddCommand(apikeyCmd())
 	rootCmd.AddCommand(agentsCmd())
 	rootCmd.AddCommand(sessionCmd())
+	rootCmd.AddCommand(wechatCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
