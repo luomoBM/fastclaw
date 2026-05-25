@@ -22,6 +22,7 @@ func RegisterAll(r *toolproviders.Registry) {
 	r.Register(&Brave{})
 	r.Register(&Exa{})
 	r.Register(&SearxNG{})
+	r.Register(&None{})
 }
 
 // --- shared arg parsing ---

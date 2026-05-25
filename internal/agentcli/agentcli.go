@@ -673,7 +673,20 @@ var agentScopeKeys = map[string]string{
 	"maxParallelToolCalls": "agents.defaults",
 	"thinking":             "agents.defaults",
 	"policy":               "agents.defaults",
-	"sandbox":              "sandbox",
+	// promptMode selects which framework sections BuildSystemPromptAs
+	// emits AND which built-in tools the LLM sees. One of "agent",
+	// "chatbot", "customize". Stored as a plain string under
+	// agents.defaults.promptMode. The built-in tool set per mode is
+	// hardcoded in builtinAllowForMode (internal/agent/loop.go) —
+	// custom tools come from Plugin / MCP, not a per-agent allowlist.
+	"promptMode": "agents.defaults",
+	// splitReplies — per-agent multi-bubble toggle. When true, the
+	// dispatcher splits the reply at SplitMessageMarker before sending
+	// to any IM channel (WeChat / Telegram / Discord / Slack / LINE /
+	// Feishu). System-level fallback is gone — false is the default
+	// when the key is absent.
+	"splitReplies": "agents.defaults",
+	"sandbox":      "sandbox",
 }
 
 var systemSettingNamespaces = []string{

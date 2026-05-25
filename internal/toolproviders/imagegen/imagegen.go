@@ -18,6 +18,8 @@ const Category = "image_gen"
 func RegisterAll(r *toolproviders.Registry) {
 	r.Register(&OpenAI{})
 	r.Register(&Fal{})
+	r.Register(&Replicate{})
+	r.Register(&None{})
 }
 
 type args struct {

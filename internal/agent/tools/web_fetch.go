@@ -170,6 +170,14 @@ func RegisterWebFetchChain(r *Registry, chain *toolproviders.Chain) {
 		if args.URL == "" {
 			return "", fmt.Errorf("url is required")
 		}
+		// Mirror the direct-fetcher scheme guard on the chain path:
+		// the upstream provider may or may not reject file:// /
+		// gopher:// / data:// itself, and we'd rather not depend on
+		// a third-party to enforce our minimum bar. Same check the
+		// non-chain branch runs in webFetchTool.
+		if err := assertHTTPScheme(args.URL); err != nil {
+			return "", err
+		}
 		// Re-use the same per-turn duplicate-URL guard the direct
 		// fetcher uses so the model can't burn rounds rotating through
 		// guessed URLs that all 404. Applies regardless of which
@@ -214,16 +222,8 @@ func webFetchTool(ctx context.Context, r *Registry, rawArgs json.RawMessage) (st
 		return "", fmt.Errorf("url is required")
 	}
 
-	// Reject non-http(s) schemes up front. file:// would let the agent
-	// read the host filesystem; gopher:// / ftp:// / data:// open weird
-	// surfaces we never intended to support. http.Get follows what the
-	// caller hands it, so the gate has to live here.
-	parsedURL, perr := url.Parse(args.URL)
-	if perr != nil {
-		return "", fmt.Errorf("parse url: %w", perr)
-	}
-	if scheme := strings.ToLower(parsedURL.Scheme); scheme != "http" && scheme != "https" {
-		return "", fmt.Errorf("scheme %q not allowed; use http or https", parsedURL.Scheme)
+	if err := assertHTTPScheme(args.URL); err != nil {
+		return "", err
 	}
 
 	// Refuse a retry of a URL that already failed in this turn. The
@@ -282,6 +282,22 @@ func webFetchTool(ctx context.Context, r *Registry, rawArgs json.RawMessage) (st
 	}
 
 	return text, nil
+}
+
+// assertHTTPScheme rejects non-http(s) URLs up front. file:// would
+// let the tool read the host filesystem; gopher:// / ftp:// / data://
+// open weird surfaces we never intended to support. Both the direct
+// fetcher and the toolproviders-chain fetcher call this so the gate
+// is uniform regardless of which backend services the call.
+func assertHTTPScheme(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse url: %w", err)
+	}
+	if scheme := strings.ToLower(u.Scheme); scheme != "http" && scheme != "https" {
+		return fmt.Errorf("scheme %q not allowed; use http or https", u.Scheme)
+	}
+	return nil
 }
 
 // stripHTML removes HTML tags and cleans up whitespace.

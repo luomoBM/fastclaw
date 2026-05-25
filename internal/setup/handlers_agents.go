@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strings"
 
+	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/buildinfo"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
@@ -64,6 +65,139 @@ func (s *Server) saveAgentScopeModel(r *http.Request, agentID, model string) err
 		return scope.SaveSettingByScope(r.Context(), s.dataStore, scope.Agent, agentID, "agents.defaults", nil)
 	}
 	return scope.SaveSettingByScope(r.Context(), s.dataStore, scope.Agent, agentID, "agents.defaults", map[string]interface{}{"model": model})
+}
+
+// agentScopeDefaultsRead returns the current agent-scope agents.defaults
+// row data, or an empty map if the row doesn't exist yet. Callers use
+// this as the base for merge-aware patches (read-modify-write) so a
+// single PATCH that touches one field doesn't clobber the rest.
+func (s *Server) agentScopeDefaultsRead(r *http.Request, agentID string) map[string]interface{} {
+	rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "agents.defaults")
+	if err != nil || rec == nil || rec.Data == nil {
+		return map[string]interface{}{}
+	}
+	// Copy so callers mutating the result don't accidentally write
+	// back through the cached store object.
+	out := make(map[string]interface{}, len(rec.Data))
+	for k, v := range rec.Data {
+		out[k] = v
+	}
+	return out
+}
+
+// applyAgentScopeDefaultsPatch merges patch into the current
+// agents.defaults row and writes the result. Keys whose value is nil are
+// DELETED from the row (the caller's signal for "clear this override").
+// A row that ends up empty is removed entirely so MergedAgentConfig
+// falls all the way back to system/user defaults.
+func (s *Server) applyAgentScopeDefaultsPatch(r *http.Request, agentID string, patch map[string]interface{}) error {
+	if len(patch) == 0 {
+		return nil
+	}
+	data := s.agentScopeDefaultsRead(r, agentID)
+	for k, v := range patch {
+		if v == nil {
+			delete(data, k)
+			continue
+		}
+		data[k] = v
+	}
+	if len(data) == 0 {
+		return scope.SaveSettingByScope(r.Context(), s.dataStore, scope.Agent, agentID, "agents.defaults", nil)
+	}
+	return scope.SaveSettingByScope(r.Context(), s.dataStore, scope.Agent, agentID, "agents.defaults", data)
+}
+
+// applyAgentScopePluginsPatch merges per-agent plugin enable
+// overrides into the (scope=agent, name=plugins.enabled) row.
+//
+// patch keys whose value is true/false are written; the rest of the
+// row is preserved (so a UI toggle for one plugin doesn't clobber
+// overrides for sibling plugins). When reset is true, the entire row
+// is dropped — agent falls back to system-wide plugin enable state.
+func (s *Server) applyAgentScopePluginsPatch(r *http.Request, agentID string, patch map[string]bool, reset bool) error {
+	if reset {
+		return scope.SaveSettingByScope(r.Context(), s.dataStore, scope.Agent, agentID, "plugins.enabled", nil)
+	}
+	if len(patch) == 0 {
+		return nil
+	}
+	data := map[string]interface{}{}
+	if rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "plugins.enabled"); err == nil && rec != nil {
+		for k, v := range rec.Data {
+			data[k] = v
+		}
+	}
+	for k, v := range patch {
+		data[k] = v
+	}
+	return scope.SaveSettingByScope(r.Context(), s.dataStore, scope.Agent, agentID, "plugins.enabled", data)
+}
+
+// agentScopeSplitReplies reads the per-agent multi-bubble override.
+// Returns nil when absent — nil is treated as false by every runtime
+// consumer, so the distinction only matters for the GET response (the
+// dashboard could choose to render "unset" differently from "off", but
+// today the Switch renders both as off and that's fine).
+func (s *Server) agentScopeSplitReplies(r *http.Request, agentID string) *bool {
+	rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "agents.defaults")
+	if err != nil || rec == nil {
+		return nil
+	}
+	v, ok := rec.Data["splitReplies"].(bool)
+	if !ok {
+		return nil
+	}
+	return &v
+}
+
+// agentScopePromptMode reads the per-agent promptMode override.
+func (s *Server) agentScopePromptMode(r *http.Request, agentID string) string {
+	rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "agents.defaults")
+	if err != nil || rec == nil {
+		return ""
+	}
+	if v, ok := rec.Data["promptMode"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// agentScopePlugins reads the per-agent plugin enable overlay. Returns
+// nil when no row exists. Keyed pluginID → bool; missing keys fall
+// through to the system-wide plugin entry's enabled state.
+func (s *Server) agentScopePlugins(r *http.Request, agentID string) map[string]bool {
+	rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "plugins.enabled")
+	if err != nil || rec == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(rec.Data))
+	for k, v := range rec.Data {
+		if b, ok := v.(bool); ok {
+			out[k] = b
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// agentScopeAutoPersist reads the per-agent autoPersist override.
+// Returns nil when absent — same convention as agentScopeSplitReplies.
+// Drives the runPostTurn AutoPersistMemory pass (LLM-distilled writes to
+// USER.md / MEMORY.md) which is the only chatter-memory persistence
+// path in chatbot mode.
+func (s *Server) agentScopeAutoPersist(r *http.Request, agentID string) *bool {
+	rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "agents.defaults")
+	if err != nil || rec == nil {
+		return nil
+	}
+	v, ok := rec.Data["autoPersist"].(bool)
+	if !ok {
+		return nil
+	}
+	return &v
 }
 
 // effectiveUserID returns the resolved user_id for the request: the
@@ -326,11 +460,36 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name              string  `json:"name,omitempty"`
-		Description       *string `json:"description,omitempty"` // ptr so empty-string clears it
-		Model             *string `json:"model,omitempty"`       // ptr so empty-string clears the agent-scope override
-		IsPublic          *bool   `json:"isPublic,omitempty"`    // ptr so caller can leave it unchanged
-		ShareModelConfig  *bool   `json:"shareModelConfig,omitempty"`
+		Name              string    `json:"name,omitempty"`
+		Description       *string   `json:"description,omitempty"` // ptr so empty-string clears it
+		Model             *string   `json:"model,omitempty"`       // ptr so empty-string clears the agent-scope override
+		IsPublic          *bool     `json:"isPublic,omitempty"`    // ptr so caller can leave it unchanged
+		ShareModelConfig  *bool     `json:"shareModelConfig,omitempty"`
+		// PromptMode is a ptr so the caller can distinguish "leave
+		// unchanged" (omitted / null) from "clear override" (empty
+		// string). Allowed string values: "agent" | "chatbot" |
+		// "customize" — empty falls back to system default ("agent").
+		// PromptMode also drives the built-in tool surface; there is
+		// no separate allowlist field by design (extend via plugins).
+		PromptMode *string `json:"promptMode,omitempty"`
+		// SplitReplies per-agent override: nil = leave unchanged,
+		// non-nil pointer-to-bool = set explicit value (true/false).
+		// Distinct from "clear" which is a separate signal — the
+		// dashboard sends `splitRepliesReset: true` to delete
+		// the override and fall back to system default.
+		SplitReplies      *bool `json:"splitReplies,omitempty"`
+		SplitRepliesReset bool  `json:"splitRepliesReset,omitempty"`
+		// AutoPersist per-agent override — same semantics as SplitReplies.
+		// `autoPersistReset:true` clears the override and falls back to
+		// system default (currently effectively disabled).
+		AutoPersist      *bool `json:"autoPersist,omitempty"`
+		AutoPersistReset bool  `json:"autoPersistReset,omitempty"`
+		// Plugins per-agent enable overlay. Keys are plugin IDs, values
+		// are bool. Patch semantics: only the keys present in this map
+		// get written; other keys in the existing row are preserved.
+		// To clear all overrides for this agent, send pluginsReset:true.
+		Plugins      map[string]bool `json:"plugins,omitempty"`
+		PluginsReset bool            `json:"pluginsReset,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -376,12 +535,57 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	// Per-agent model override is its own configs row. nil = caller didn't
-	// touch it (e.g. a name-only patch); empty string = explicit "clear my
-	// override and fall back to user/system defaults" — the Models page's
-	// "Clear override" button relies on this. Non-empty saves the row.
+	// Per-agent defaults live in one configs row (kind=setting, scope=agent,
+	// namespace=agents.defaults). Collect every field the caller touched
+	// into a single merge-aware patch so e.g. updating promptMode doesn't
+	// clobber an existing model override and vice versa. nil pointer =
+	// caller didn't touch the field; ptr-to-empty = "clear this override".
+	defaultsPatch := map[string]interface{}{}
 	if req.Model != nil {
-		if err := s.saveAgentScopeModel(r, rec.ID, *req.Model); err != nil {
+		m := strings.TrimSpace(*req.Model)
+		if m == "" {
+			defaultsPatch["model"] = nil
+		} else {
+			defaultsPatch["model"] = m
+		}
+	}
+	if req.PromptMode != nil {
+		pm := strings.TrimSpace(*req.PromptMode)
+		// Allow only the documented values plus empty (= clear).
+		// Anything else is a 400 — silently coercing to "agent" would
+		// mask typos from the dashboard or CLI.
+		switch pm {
+		case "":
+			defaultsPatch["promptMode"] = nil
+		case config.PromptModeAgent, config.PromptModeChatbot, config.PromptModeCustomize:
+			defaultsPatch["promptMode"] = pm
+		default:
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "promptMode must be one of: agent, chatbot, customize"})
+			return
+		}
+	}
+	if req.SplitRepliesReset {
+		// Reset wins over set in the same request — the dashboard's
+		// "Inherit" pill writes this flag.
+		defaultsPatch["splitReplies"] = nil
+	} else if req.SplitReplies != nil {
+		defaultsPatch["splitReplies"] = *req.SplitReplies
+	}
+	if req.AutoPersistReset {
+		defaultsPatch["autoPersist"] = nil
+	} else if req.AutoPersist != nil {
+		defaultsPatch["autoPersist"] = *req.AutoPersist
+	}
+	if err := s.applyAgentScopeDefaultsPatch(r, rec.ID, defaultsPatch); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	// Plugins-enabled overlay: separate config row (scope=agent,
+	// name=plugins.enabled), so doesn't go through the agents.defaults
+	// patch path. Reset clears the row entirely; otherwise we merge
+	// the incoming map keys into the existing data.
+	if req.PluginsReset || req.Plugins != nil {
+		if err := s.applyAgentScopePluginsPatch(r, rec.ID, req.Plugins, req.PluginsReset); err != nil {
 			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
@@ -398,6 +602,10 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			"userId":           rec.UserID,
 			"name":             rec.Name,
 			"model":            s.agentScopeModel(r, rec.ID),
+			"promptMode":       s.agentScopePromptMode(r, rec.ID),
+			"splitReplies":     s.agentScopeSplitReplies(r, rec.ID),
+			"autoPersist":      s.agentScopeAutoPersist(r, rec.ID),
+			"plugins":          s.agentScopePlugins(r, rec.ID),
 			"config":           rec.Config,
 			"isPublic":         rec.IsPublic,
 			"shareModelConfig": share,
@@ -434,6 +642,10 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 			"userId":           rec.UserID,
 			"role":             role,
 			"model":            s.agentScopeModel(r, rec.ID),
+			"promptMode":       s.agentScopePromptMode(r, rec.ID),
+			"splitReplies":     s.agentScopeSplitReplies(r, rec.ID),
+			"autoPersist":      s.agentScopeAutoPersist(r, rec.ID),
+			"plugins":          s.agentScopePlugins(r, rec.ID),
 			"avatarUrl":        "/api/agents/" + rec.ID + "/files/avatar.png",
 			"createdAt":        rec.CreatedAt,
 			"isPublic":         rec.IsPublic,
@@ -1225,3 +1437,33 @@ func (s *Server) requireOwnerOrSuperAdmin(w http.ResponseWriter, r *http.Request
 }
 
 var _ workspace.Store = (workspace.Store)(nil)
+
+// handleListAgentRegisteredTools returns the live tool registry for the
+// specified agent. Drives the Tools tab's allowlist checkbox picker —
+// the operator clicks rather than typing tool names from memory.
+//
+// Permission is read-level (owner / super_admin / shared-link viewer)
+// rather than owner-only because viewers might want to see what they
+// have access to, even if they can't change the allowlist. The PUT
+// path stays owner-gated.
+func (s *Server) handleListAgentRegisteredTools(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !s.requireAgentReadable(w, r, id) {
+		return
+	}
+	ag := s.resolveAgent(r, id)
+	if ag == nil {
+		// Agent isn't loaded in the caller's UserSpace and lazy-attach
+		// also failed. We could fall back to the DB record, but the
+		// whole point of this endpoint is the LIVE registry (MCP tools
+		// only exist once the agent is attached), so a 404 here is
+		// honest rather than misleadingly returning just the builtins.
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not loaded"})
+		return
+	}
+	toolList := ag.RegisteredTools()
+	if toolList == nil {
+		toolList = []tools.ToolInfo{}
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"tools": toolList})
+}

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -162,14 +161,14 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 			if r == nil || r.shellMgr == nil {
 				return "", fmt.Errorf("run_in_background unavailable: shell manager not initialised")
 			}
-			// Build env exactly like the synchronous path so skills
-			// running in the background see their FAL_KEY etc.
-			var sessEnv []string
+			// Always pass an explicit (scrubbed) env so the child
+			// never inherits raw os.Environ() — that's the leak path
+			// that put OSS AccessKey + DB DSN in chat replies.
+			var skillEnv map[string]string
 			if envProvider != nil && skillDirs != nil {
-				if skillEnv := resolveSkillEnv(args.Command, envProvider, skillDirs); len(skillEnv) > 0 {
-					sessEnv = mergeEnv(os.Environ(), skillEnv)
-				}
+				skillEnv = resolveSkillEnv(args.Command, envProvider, skillDirs)
 			}
+			sessEnv := buildSubprocessEnv(skillEnv)
 			s, err := r.shellMgr.Start(command, sessEnv)
 			if err != nil {
 				return "", err
@@ -195,13 +194,15 @@ func makeExecToolFull(r *Registry, sbCfg *SandboxConfig, envProvider SkillEnvPro
 
 		cmd := exec.CommandContext(execCtx, "sh", "-c", command)
 
-		// Inject skill-specific env vars if the command references a skill directory
+		// Always set cmd.Env explicitly. Default Go behavior is to
+		// inherit the parent's full env, which leaks daemon secrets
+		// (FASTCLAW_STORAGE_DSN, FASTCLAW_OBJECT_STORE_*, ...) into
+		// every shell the model can run.
+		var skillEnv map[string]string
 		if envProvider != nil && skillDirs != nil {
-			skillEnv := resolveSkillEnv(args.Command, envProvider, skillDirs)
-			if len(skillEnv) > 0 {
-				cmd.Env = mergeEnv(os.Environ(), skillEnv)
-			}
+			skillEnv = resolveSkillEnv(args.Command, envProvider, skillDirs)
 		}
+		cmd.Env = buildSubprocessEnv(skillEnv)
 
 		output, err := cmd.CombinedOutput()
 
@@ -297,9 +298,10 @@ const HostExecToolName = "host_exec"
 
 // registerHostExec adds an escape-hatch exec tool that bypasses the
 // sandbox executor and runs straight on the operator's host shell.
-// Only registered on SELF-HOSTED installs (buildinfo.IsHostedDeploy()
-// false) AND only when a sandbox executor is also present — otherwise
-// `exec` already IS the host shell and host_exec would be a duplicate.
+// Gated by buildinfo.IsHostExecAllowed() — only registered when the
+// operator has explicitly opted in via FASTCLAW_ALLOW_HOST_EXEC=1
+// AND a sandbox executor is present (otherwise `exec` already IS the
+// host shell and host_exec would be a duplicate).
 //
 // Tool description spells out the boundary loudly so the model picks
 // `exec` (sandbox) by default and only escapes to host_exec for
@@ -308,9 +310,10 @@ const HostExecToolName = "host_exec"
 // machine). The dangerousCommands shortlist still applies — sandbox vs
 // host doesn't change the "no rm -rf /" rule.
 //
-// Hosted deployments deliberately don't get this tool: in a multi-
-// tenant cloud environment the chatter doesn't operate the daemon,
-// and exposing host shell would be a privilege-escalation path.
+// Default-OFF rationale: in any deployment reachable through an
+// external IM channel (WeChat, Discord, Feishu, …), an unsuspecting
+// chatter coaxing the model into host_exec is a privilege-escalation
+// path. Operators who need host shell access opt in explicitly.
 func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []string) {
 	r.Register(HostExecToolName,
 		"Execute a shell command on the OPERATOR's host machine, bypassing the sandbox. "+
@@ -363,11 +366,15 @@ func registerHostExec(r *Registry, envProvider SkillEnvProvider, skillDirs []str
 				command = fmt.Sprintf("(cat <<'__FCSTDIN__'\n%s\n__FCSTDIN__\n) | %s", args.Stdin, args.Command)
 			}
 			cmd := exec.CommandContext(execCtx, "sh", "-c", command)
+			// host_exec is the operator's escape hatch — even so, scrub
+			// daemon secrets from the inherited env. The operator
+			// rarely needs FASTCLAW_STORAGE_DSN reachable from a host
+			// shell, and never needs the model to be able to read it.
+			var skillEnv map[string]string
 			if envProvider != nil && skillDirs != nil {
-				if skillEnv := resolveSkillEnv(args.Command, envProvider, skillDirs); len(skillEnv) > 0 {
-					cmd.Env = mergeEnv(os.Environ(), skillEnv)
-				}
+				skillEnv = resolveSkillEnv(args.Command, envProvider, skillDirs)
 			}
+			cmd.Env = buildSubprocessEnv(skillEnv)
 			out, err := cmd.CombinedOutput()
 			result := string(out)
 			if err != nil {
@@ -471,7 +478,7 @@ func registerSandboxedExec(r *Registry, ex sandbox.Executor) {
 		// suggesting a tool that doesn't exist just confuses the
 		// model. We probe by tool name so the check is decoupled from
 		// the deploy-mode flag — same answer, less coupling.
-		if err != nil && looksLikeSandboxAbsence(err, out) && !buildinfo.IsHostedDeploy() {
+		if err != nil && looksLikeSandboxAbsence(err, out) && buildinfo.IsHostExecAllowed() {
 			err = fmt.Errorf("%w\n[hint: this looks like a sandbox-environment miss (binary or path not present in the container). If the command needs the user's actual host machine — e.g. `fastclaw upgrade`, `~/Downloads`, host CLI tools — retry with the `host_exec` tool instead.]", err)
 		}
 		return MetaSandboxPrefix + out, err

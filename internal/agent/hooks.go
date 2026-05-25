@@ -37,6 +37,12 @@ type HookContext struct {
 	Workspace     string    // agent workspace path (for PostTurn)
 	UserID        string    // owning user ID for multi-user namespace isolation
 	ChatID        string    // used by the plugin hook adapter
+	// Channel + AccountID complete the bus routing triple. Plugins
+	// reading these in a hook.fire payload can echo them back to
+	// chat.send so a follow-up message reaches the same chat that
+	// just got the agent's reply.
+	Channel   string
+	AccountID string
 	// Source mirrors bus.InboundMessage.Source so PostTurn hooks can
 	// distinguish a real user turn from a cron / heartbeat / sub-agent
 	// / goal-context turn. Empty means user. Hooks that should only

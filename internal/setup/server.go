@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
 	"github.com/fastclaw-ai/fastclaw/internal/api"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
@@ -47,6 +48,10 @@ type AgentHandle interface {
 	// read them via /workspace/<filename>. Returns the relative filenames
 	// in input order; per-image errors are skipped.
 	WriteSessionAttachments(ctx context.Context, sessionID, projectID string, urls []string) []string
+	// RegisteredTools returns the live tool registry projection — what
+	// this agent currently has loaded (built-ins + MCP + plugin tools).
+	// Used by the Tools tab to render the allowlist checkbox picker.
+	RegisteredTools() []tools.ToolInfo
 }
 
 // AgentProvider is implemented by gateway.UserSpace's agent manager — used
@@ -246,6 +251,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /api/agents/{id}", auth(s.handleGetAgent))
 	mux.HandleFunc("PUT /api/agents/{id}", auth(s.handleUpdateAgent))
 	mux.HandleFunc("GET /api/agents/{id}/config", auth(s.handleGetAgentConfig))
+	mux.HandleFunc("GET /api/agents/{id}/tools/registered", auth(s.handleListAgentRegisteredTools))
 	mux.HandleFunc("DELETE /api/agents/{id}", auth(s.handleDeleteAgent))
 
 	mux.HandleFunc("GET /api/agents/{id}/files", auth(s.handleAgentFileList))
@@ -309,6 +315,10 @@ func (s *Server) Run(ctx context.Context) error {
 	// Plugins (super_admin only).
 	mux.HandleFunc("GET /api/plugins", admin(s.handleListPlugins))
 	mux.HandleFunc("PUT /api/plugins/{id}", admin(s.handleUpdatePlugin))
+	// Hook plugin discovery — read-only metadata for the per-agent
+	// Plugins toggle on the Context page. Agent owners (not just
+	// admins) need this to know what plugins they can enable.
+	mux.HandleFunc("GET /api/plugins/hook", auth(s.handleListHookPlugins))
 
 	// Tools (super_admin only).
 	mux.HandleFunc("GET /api/tools", admin(s.handleGetTools))

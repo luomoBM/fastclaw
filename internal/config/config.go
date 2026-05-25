@@ -169,12 +169,24 @@ type TaskQueueCfg struct {
 }
 
 // SandboxCfg holds sandbox configuration for an agent.
+//
+// Image is the legacy single-slot image/template/snapshot — read-only
+// fallback now. The per-backend fields (DockerImage / E2BTemplate /
+// BoxliteSnapshot) are authoritative when set, so switching Backend in
+// the dashboard preserves each backend's last-entered value instead of
+// overwriting the shared slot. Consumers should prefer the per-backend
+// field for the active Backend and fall through to Image only when the
+// per-backend field is empty (migration path for configs predating the
+// split).
 type SandboxCfg struct {
-	Enabled bool   `json:"enabled"`
-	Image   string `json:"image,omitempty"`
-	Policy  string `json:"policy,omitempty"`
-	Backend string `json:"backend,omitempty"`
-	E2BKey  string `json:"e2bKey,omitempty"`
+	Enabled         bool   `json:"enabled"`
+	Image           string `json:"image,omitempty"`
+	DockerImage     string `json:"dockerImage,omitempty"`
+	E2BTemplate     string `json:"e2bTemplate,omitempty"`
+	BoxliteSnapshot string `json:"boxliteSnapshot,omitempty"`
+	Policy          string `json:"policy,omitempty"`
+	Backend         string `json:"backend,omitempty"`
+	E2BKey          string `json:"e2bKey,omitempty"`
 	// Boxlite (https://github.com/boxlite-ai/boxlite) is a hosted sandbox
 	// service speaking the REST spec at openapi/rest-sandbox-open-api.yaml.
 	// BoxliteURL is the full base URL (default https://api.boxlite.ai/v1);
@@ -257,18 +269,6 @@ type SkillsLearnerCfg struct {
 	Model        string `json:"model,omitempty"`
 }
 
-// WeChatCfg holds per-instance behavior toggles for the WeChat (iLink)
-// channel. Stored as a `channels.wechat` setting row (system scope).
-// Default zero value = split off: SendMessage collapses the marker into
-// a newline instead of producing multiple bubbles, and the per-turn
-// system-prompt hint that advertises the marker to the LLM is suppressed.
-type WeChatCfg struct {
-	// SplitReplies, when true, lets the agent emit channels.SplitMessageMarker
-	// to break one outbound text into multiple chat bubbles. Off by default
-	// because some users find the multi-bubble shape jarring.
-	SplitReplies bool `json:"splitReplies,omitempty"`
-}
-
 // Config is the in-memory runtime snapshot. The gateway assembles this at
 // boot by reading FASTCLAW_* env vars + database (system_settings, providers,
 // channels, agents). Callers never serialize it back out — DB tables are
@@ -295,7 +295,6 @@ type Config struct {
 	Memory        MemoryCfg                  `json:"memory,omitempty"`
 	Privacy       PrivacyCfg                 `json:"privacy,omitempty"`
 	SkillsLearner SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
-	WeChat        WeChatCfg                  `json:"wechat,omitempty"`
 }
 
 // ModelCost holds pricing info for a model.
@@ -363,6 +362,25 @@ type AgentDefaults struct {
 	MaxParallelToolCalls int     `json:"maxParallelToolCalls,omitempty"`
 	Thinking             string  `json:"thinking,omitempty"`
 	PolicyPreset         string  `json:"policy,omitempty"`
+	// PromptMode lives here so the agent-scope `agents.defaults`
+	// config row (written by CLI and dashboard) round-trips into
+	// ResolvedAgent at userspace assembly time — see
+	// gateway/userspace.go where agentOverride is applied.
+	PromptMode string `json:"promptMode,omitempty"`
+	// SplitReplies — per-agent override of WeChatCfg.SplitReplies.
+	// Nil at this layer means the agent-scope row has no opinion; the
+	// effective value falls back to system-level WeChatCfg.SplitReplies.
+	SplitReplies *bool `json:"splitReplies,omitempty"`
+	// AutoPersist — per-agent override of MemoryCfg.AutoPersist.Enabled.
+	// Pointer-typed for the same reason as SplitReplies: distinguishing
+	// "operator hasn't touched it" from "explicitly false". When non-nil,
+	// flips ag.memoryCfg.AutoPersist.Enabled at agent build time so the
+	// runPostTurn check at loop.go:2286 either fires the background
+	// distill-into-USER.md/MEMORY.md pass or skips it. Mainly useful in
+	// chatbot mode — that mode's curated tool allowlist has no write_file,
+	// so this is the only way for the agent to remember a chatter across
+	// sessions.
+	AutoPersist *bool `json:"autoPersist,omitempty"`
 }
 
 // AgentEntry is the in-memory shape of one agent row, used during
@@ -373,19 +391,71 @@ type AgentDefaults struct {
 type AgentEntry struct {
 	ID                   string                     `json:"id"`
 	UserID               string                     `json:"userId,omitempty"`
+	// Name mirrors agents.name (the operator-given display name) and is
+	// carried through to ResolvedAgent.DisplayName so the system prompt
+	// can stamp a fallback identity line when IDENTITY.md is empty.
+	Name                 string                     `json:"name,omitempty"`
 	Workspace            string                     `json:"workspace,omitempty"`
 	MaxTokens            int                        `json:"maxTokens,omitempty"`
 	Temperature          float64                    `json:"temperature,omitempty"`
 	MaxToolIterations    int                        `json:"maxToolIterations,omitempty"`
 	MaxParallelToolCalls int                        `json:"maxParallelToolCalls,omitempty"`
 	Skills            []string                   `json:"skills,omitempty"`
-	Tools             []string                   `json:"tools,omitempty"`
 	MCPServers        map[string]MCPServerConfig `json:"mcpServers,omitempty"`
 	AlwaysLoadSkills  []string                   `json:"alwaysLoadSkills,omitempty"`
 	Thinking          string                     `json:"thinking,omitempty"`
 	Sandbox           SandboxCfg                 `json:"sandbox,omitempty"`
 	PolicyPreset      string                     `json:"policy,omitempty"`
+	// PromptMode selects how heavily the framework system prompt
+	// participates AND which built-in tools the LLM sees. Empty =
+	// "agent" (current default) for backward compatibility. See
+	// PromptMode* constants. The built-in tool set per mode is
+	// hardcoded in builtinAllowForMode (internal/agent/loop.go) —
+	// extension via Plugin / MCP, not per-agent allowlists, by design.
+	PromptMode string `json:"promptMode,omitempty"`
+	// SplitReplies overrides the system-wide WeChatCfg.SplitReplies
+	// setting for THIS agent. Nil = inherit system default; non-nil =
+	// authoritative for this agent. Pointer (not bool) because we need
+	// to distinguish "operator hasn't touched it" from "operator
+	// explicitly turned it off". The agent uses the effective value to
+	// (1) decide whether to advertise the SplitMessageMarker in the
+	// system-prompt hint, and (2) stamp OutboundMessage.AllowSplit so
+	// the WeChat adapter knows whether to honor the marker.
+	SplitReplies *bool `json:"splitReplies,omitempty"`
+	// AutoPersist overrides MemoryCfg.AutoPersist.Enabled for this agent.
+	// Same pointer semantics as SplitReplies. When true, the agent's
+	// runPostTurn fires a background LLM call every N turns to distill
+	// recent messages into USER.md (chatter profile) and MEMORY.md
+	// (long-term facts) — the chatbot-mode persistence path since that
+	// mode's curated tool allowlist excludes write_file.
+	AutoPersist *bool `json:"autoPersist,omitempty"`
 }
+
+// PromptMode controls which framework sections BuildSystemPromptAs emits.
+// Chatbot-style products (companion, customer support, role-play) cannot
+// inherit the agent-shaped instructions (task delegation, todo tracking,
+// tool-use discipline, sandbox rules) without their character bleeding
+// into a generic AI-assistant tone. PromptMode lets a deployment opt out
+// of those sections per agent.
+const (
+	// PromptModeAgent emits the full framework prompt (task delegation,
+	// todo.md, tool-use discipline, sandbox rules, workspace self-update,
+	// scheduling). Default when PromptMode is empty.
+	PromptModeAgent = "agent"
+	// PromptModeChatbot keeps the minimal identity scaffolding
+	// (file-purpose schema, confidentiality, date) and drops every
+	// agent-loop instruction so chatbot persona files (SOUL.md /
+	// IDENTITY.md / USER.md / MEMORY.md) shape behavior directly.
+	PromptModeChatbot = "chatbot"
+	// PromptModeCustomize emits ONLY the bootstrap files (plus a date
+	// anchor). The author is responsible for putting any framework
+	// guidance they need inside SOUL.md / IDENTITY.md themselves —
+	// this mode hands the floor over to the persona files completely.
+	// (Renamed from PromptModeMinimal to make the intent more obvious:
+	// you're CUSTOMIZING the system prompt yourself, not asking fastclaw
+	// for a minimal version of its built-in one.)
+	PromptModeCustomize = "customize"
+)
 
 // ChannelConfig holds per-channel runtime configuration. Built by the
 // channels scope resolver from system/user/agent rows.
@@ -473,6 +543,15 @@ type AgentFileConfig struct {
 	ToolProviders     map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
 	Tools             map[string]ToolCategoryCfg `json:"tools,omitempty"`
 	Providers         map[string]ProviderConfig  `json:"providers,omitempty"`
+	// PromptMode mirrors AgentEntry.PromptMode at the file-config layer.
+	// Non-empty values override the entry-level setting.
+	PromptMode string `json:"promptMode,omitempty"`
+	// SplitReplies mirrors AgentEntry.SplitReplies. Nil =
+	// inherit; non-nil = authoritative for this agent.
+	SplitReplies *bool `json:"splitReplies,omitempty"`
+	// AutoPersist mirrors AgentEntry.AutoPersist. Nil = inherit;
+	// non-nil = authoritative for this agent.
+	AutoPersist *bool `json:"autoPersist,omitempty"`
 	// Admins gates write-mode slash commands (/new /reset /undo /retry /compact
 	// /model /personality) in IM channels. Keyed by channel name ("discord",
 	// "telegram", "slack", ...), each value is the platform-side user IDs
@@ -514,8 +593,13 @@ type SkillsLoadCfg struct {
 
 // ResolvedAgent is the fully merged config for a single agent.
 type ResolvedAgent struct {
-	ID                   string
-	UserID               string
+	ID     string
+	UserID string
+	// DisplayName mirrors agents.name — the human-readable name the
+	// operator gave the agent ("Bob", "tdj", "Sonny"). Used as a
+	// fallback identity line in the system prompt when IDENTITY.md
+	// is empty so the model doesn't introduce itself as "Claude".
+	DisplayName          string
 	Home                 string
 	Workspace            string
 	Model                string
@@ -534,6 +618,20 @@ type ResolvedAgent struct {
 	// Admins is the per-channel admin allowlist for write-mode slash
 	// commands. See AgentFileConfig.Admins for semantics + default.
 	Admins map[string][]string
+	// PromptMode selects the system-prompt assembly profile AND the
+	// built-in tool set the LLM sees. See AgentEntry.PromptMode for
+	// semantics. Empty = PromptModeAgent.
+	PromptMode string
+	// SplitReplies — nil = inherit system WeChatCfg.SplitReplies,
+	// non-nil = authoritative for this agent. The agent stamps the
+	// EFFECTIVE value (override OR system default) on every
+	// OutboundMessage.AllowSplit at send time.
+	SplitReplies *bool
+	// AutoPersist — nil = inherit system MemoryCfg.AutoPersist.Enabled,
+	// non-nil = authoritative for this agent. Drives whether the
+	// runPostTurn hook fires AutoPersistMemory (the LLM-driven distill-
+	// to-USER.md/MEMORY.md pass) every N turns.
+	AutoPersist *bool
 }
 
 type TeamEntry struct {
@@ -626,6 +724,7 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 	resolved := ResolvedAgent{
 		ID:                   entry.ID,
 		UserID:               entry.UserID,
+		DisplayName:          entry.Name,
 		Home:                 home,
 		Workspace:            workspace,
 		Model:                cfg.Agents.Defaults.Model,
@@ -658,6 +757,17 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 	}
 	if entry.PolicyPreset != "" {
 		resolved.PolicyPreset = entry.PolicyPreset
+	}
+	if entry.PromptMode != "" {
+		resolved.PromptMode = entry.PromptMode
+	}
+	if entry.SplitReplies != nil {
+		v := *entry.SplitReplies
+		resolved.SplitReplies = &v
+	}
+	if entry.AutoPersist != nil {
+		v := *entry.AutoPersist
+		resolved.AutoPersist = &v
 	}
 
 	if len(cfg.MCPServers) > 0 {
@@ -733,6 +843,17 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 				resolved.Tools = make(map[string]ToolCategoryCfg)
 			}
 			resolved.Tools[k] = v
+		}
+		if fileCfg.PromptMode != "" {
+			resolved.PromptMode = fileCfg.PromptMode
+		}
+		if fileCfg.SplitReplies != nil {
+			v := *fileCfg.SplitReplies
+			resolved.SplitReplies = &v
+		}
+		if fileCfg.AutoPersist != nil {
+			v := *fileCfg.AutoPersist
+			resolved.AutoPersist = &v
 		}
 	}
 

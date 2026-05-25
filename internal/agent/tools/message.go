@@ -15,10 +15,15 @@ type messageArgs struct {
 }
 
 // RegisterMessage registers the message tool with the given message bus.
-func RegisterMessage(r *Registry, mb *bus.MessageBus) {
+// allowSplitFn (optional) is consulted on every send to stamp
+// OutboundMessage.AllowSplit — controls whether the WeChat adapter will
+// honor SplitMessageMarker for multi-bubble output. Pass nil if the
+// caller doesn't care (e.g. tests, non-WeChat-bound deployments) —
+// AllowSplit defaults to false in that case.
+func RegisterMessage(r *Registry, mb *bus.MessageBus, allowSplitFn func() bool) {
 	r.tools["message"] = registeredTool{
 		def: r.tools["message"].def,
-		fn:  makeMessageTool(mb),
+		fn:  makeMessageTool(mb, allowSplitFn),
 	}
 }
 
@@ -46,17 +51,23 @@ func registerMessage(r *Registry) {
 	})
 }
 
-func makeMessageTool(mb *bus.MessageBus) ToolFunc {
+func makeMessageTool(mb *bus.MessageBus, allowSplitFn func() bool) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 		var args messageArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
 
+		allowSplit := false
+		if allowSplitFn != nil {
+			allowSplit = allowSplitFn()
+		}
+
 		mb.Outbound <- bus.OutboundMessage{
-			Channel: args.Channel,
-			ChatID:  args.ChatID,
-			Text:    args.Text,
+			Channel:    args.Channel,
+			ChatID:     args.ChatID,
+			Text:       args.Text,
+			AllowSplit: allowSplit,
 		}
 
 		return "Message sent", nil

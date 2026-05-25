@@ -10,11 +10,15 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +27,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 )
 
 // WeChat implements the Channel interface for the iLink (微信) bot
@@ -66,12 +71,28 @@ const (
 	// the ImageItem.media.encrypt_query_param.
 	wechatCDNBaseURL        = "https://novac2c.cdn.weixin.qq.com/c2c"
 	wechatCDNMediaTypeImage = 1
+	wechatCDNMediaTypeVideo = 2
+	wechatCDNMediaTypeFile  = 3
 	wechatCDNEncryptType    = 1 // AES-128-ECB
 
 	// Media-send timeout. Covers the getuploadurl round-trip + CDN POST
 	// + the second sendmessage. Longer than wechatSendTimeout because
 	// the CDN leg can be slow for larger images.
 	wechatMediaSendTimeout = 90 * time.Second
+
+	// Threshold of consecutive empty-buf SessionExpired responses before
+	// we declare the bot token dead and fire onExpired. iLink returns
+	// SessionExpired when the supplied get_updates_buf is missing or
+	// stale — including the legitimate "freshly rescanned account that
+	// hasn't received its first message yet" case. Treating the first
+	// occurrence as terminal would purge healthy accounts on every
+	// restart (we used to do this). Combined with calcBackoff capping at
+	// wechatBackoffMax (typically 60s), 20 consecutive failures gives
+	// roughly 15–20 minutes of retries before we give up — long enough
+	// for a freshly-rescanned bot to receive its first message and
+	// graduate to a real buf, short enough that a truly revoked token
+	// doesn't loop forever.
+	wechatEmptyBufExpiredThreshold = 20
 )
 
 // WeChat is the iLink long-poll adapter for one logged-in WeChat bot.
@@ -87,14 +108,22 @@ type WeChat struct {
 	httpClient *http.Client
 	wechatUIN  string // randomized per process; iLink wants a stable-ish header
 
-	// Long-poll cursor. iLink's `get_updates_buf` advances each turn;
-	// keeping it on the struct (vs. on disk like the upstream daemon
-	// does) is fine because fastclaw's gateway holds one *WeChat per
-	// (account, process lifetime). Process restart re-syncs from "" —
-	// iLink replays from the last-seen sequence on the server side
-	// rather than re-delivering, so duplicates are handled there.
+	// Long-poll cursor. iLink's `get_updates_buf` advances each turn
+	// and is persisted to disk at `bufPath` so process restarts don't
+	// poll with the empty buf (which iLink answers with SessionExpired,
+	// which the old code misread as "bot token dead" — see
+	// wechatEmptyBufExpiredThreshold for the matching softened heuristic).
 	getUpdatesBuf string
+	bufPath       string
 	failures      int
+
+	// emptyBufExpiredCount counts consecutive SessionExpired responses
+	// where the supplied get_updates_buf was already empty. We don't
+	// declare the bot token dead until this hits
+	// wechatEmptyBufExpiredThreshold so a legitimate "fresh process /
+	// dropped buf file" first call isn't misread as a permanent expiry.
+	// Reset to 0 on any successful response.
+	emptyBufExpiredCount int
 
 	// Per-chat ContextToken cache. The /ilink/bot/getconfig call that
 	// mints typing_ticket wants the latest context_token from the user's
@@ -110,26 +139,12 @@ type WeChat struct {
 	// can disable the configs row + unregister the adapter; without it
 	// the loop would log the same warning every 5s forever.
 	onExpired func(accountID string)
-
-	// splitReplies gates SendMessage on the channels.wechat.splitReplies
-	// system setting. False (the default) collapses SplitMessageMarker
-	// to a newline so a stray marker doesn't show up as literal text and
-	// the reply stays in one bubble. The matching system-prompt hint in
-	// renderChannelHints is suppressed in lockstep, so the LLM normally
-	// won't emit the marker either.
-	splitReplies bool
 }
 
 // SetOnExpired registers a callback that fires when the bot token is
 // confirmed dead. The callback runs once; Start exits afterwards.
 func (w *WeChat) SetOnExpired(fn func(accountID string)) {
 	w.onExpired = fn
-}
-
-// SetSplitReplies toggles multi-bubble outbound. See the field doc on
-// WeChat.splitReplies for the full contract.
-func (w *WeChat) SetSplitReplies(enabled bool) {
-	w.splitReplies = enabled
 }
 
 // NewWeChat creates a new WeChat channel adapter from a connected
@@ -151,7 +166,91 @@ func NewWeChat(botToken, baseURL, ilinkUserID, accountID string, mb *bus.Message
 		httpClient:  &http.Client{},
 		wechatUIN:   wechatGenerateUIN(),
 		ctxTokens:   make(map[string]string),
+		bufPath:     wechatBufPath(accountID),
 	}, nil
+}
+
+// wechatBufPath returns the on-disk location for this account's
+// persisted get_updates_buf. AccountIDs contain `@` (e.g.
+// `4090de018d12@im.bot`) which is filesystem-safe on every OS we ship
+// to, but we replace path separators defensively in case iLink ever
+// hands one back. Returns "" when HomeDir() fails — caller treats that
+// as "persistence disabled, fall back to in-process state."
+func wechatBufPath(accountID string) string {
+	home, err := config.HomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	safe := strings.ReplaceAll(accountID, "/", "_")
+	safe = strings.ReplaceAll(safe, string(os.PathSeparator), "_")
+	return filepath.Join(home, "state", "wechat", safe+".json")
+}
+
+// loadBuf populates getUpdatesBuf from disk. Missing file → no-op
+// (first run for this account, or state dir was wiped). Corrupt file
+// → log + ignore (we'll just sync from "" once, which is fine — the
+// softened expiry threshold prevents a single empty-buf reply from
+// purging the account).
+func (w *WeChat) loadBuf() {
+	if w.bufPath == "" {
+		return
+	}
+	data, err := os.ReadFile(w.bufPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("wechat loadBuf failed",
+				"account", w.accountID, "path", w.bufPath, "error", err)
+		}
+		return
+	}
+	var s struct {
+		GetUpdatesBuf string `json:"get_updates_buf"`
+	}
+	if err := json.Unmarshal(data, &s); err != nil {
+		slog.Warn("wechat loadBuf parse failed — discarding",
+			"account", w.accountID, "path", w.bufPath, "error", err)
+		return
+	}
+	w.getUpdatesBuf = s.GetUpdatesBuf
+	if s.GetUpdatesBuf != "" {
+		slog.Info("wechat loaded persisted sync buf",
+			"account", w.accountID, "path", w.bufPath)
+	}
+}
+
+// saveBuf writes the current getUpdatesBuf to disk. Best-effort: errors
+// are logged but don't abort the poll loop — losing the buf only costs
+// us one fresh-sync round next start, and the softened expiry threshold
+// keeps that from triggering a purge.
+func (w *WeChat) saveBuf() {
+	if w.bufPath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(w.bufPath), 0o700); err != nil {
+		slog.Warn("wechat saveBuf mkdir failed",
+			"account", w.accountID, "path", w.bufPath, "error", err)
+		return
+	}
+	data, _ := json.Marshal(struct {
+		GetUpdatesBuf string `json:"get_updates_buf"`
+	}{GetUpdatesBuf: w.getUpdatesBuf})
+	if err := os.WriteFile(w.bufPath, data, 0o600); err != nil {
+		slog.Warn("wechat saveBuf write failed",
+			"account", w.accountID, "path", w.bufPath, "error", err)
+	}
+}
+
+// clearBuf removes the on-disk buf file. Called after we declare the
+// token dead so a manually-rescanned-and-relabeled account doesn't
+// inherit the dead session's stale cursor on the next process start.
+func (w *WeChat) clearBuf() {
+	if w.bufPath == "" {
+		return
+	}
+	if err := os.Remove(w.bufPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("wechat clearBuf failed",
+			"account", w.accountID, "path", w.bufPath, "error", err)
+	}
 }
 
 func (w *WeChat) Name() string        { return "wechat" }
@@ -165,7 +264,9 @@ func (w *WeChat) BotUsername() string { return w.accountID }
 //     the sync buf was already empty the bot token itself is dead
 //     (operator needs to re-scan).
 func (w *WeChat) Start(ctx context.Context) error {
-	slog.Info("wechat long-poll loop starting", "account", w.accountID)
+	w.loadBuf()
+	slog.Info("wechat long-poll loop starting",
+		"account", w.accountID, "buf_present", w.getUpdatesBuf != "")
 	for {
 		select {
 		case <-ctx.Done():
@@ -194,6 +295,7 @@ func (w *WeChat) Start(ctx context.Context) error {
 			if w.getUpdatesBuf != "" {
 				slog.Info("wechat session expired, resetting sync buf", "account", w.accountID)
 				w.getUpdatesBuf = ""
+				w.saveBuf()
 				select {
 				case <-time.After(5 * time.Second):
 				case <-ctx.Done():
@@ -201,12 +303,48 @@ func (w *WeChat) Start(ctx context.Context) error {
 				}
 				continue
 			}
-			// Sync buf was already empty: server is telling us the bot
-			// token itself is dead. Continuing to poll just spams the
-			// same warning every 5s forever — instead, log once, fire
-			// the registered onExpired callback (the gateway disables
-			// the configs row + unregisters us), and exit.
-			slog.Warn("wechat bot token expired — user must rescan QR", "account", w.accountID)
+			// Sync buf already empty. This is ambiguous — it could mean
+			// "first poll after restart, server doesn't know us yet" or
+			// "bot token has been revoked." Treating the first occurrence
+			// as terminal (the old behavior) caused every restart of a
+			// healthy account to purge itself before iLink had a chance
+			// to mint a fresh buf. Mirror upstream weclaw: keep retrying
+			// with exponential backoff, and only declare the token dead
+			// after wechatEmptyBufExpiredThreshold consecutive failures.
+			w.emptyBufExpiredCount++
+			if w.emptyBufExpiredCount < wechatEmptyBufExpiredThreshold {
+				// Only the first attempt warns — subsequent retries log
+				// at Debug so a slow-to-warm-up account doesn't fill the
+				// log with N copies of the same message before either
+				// recovering (counter resets, see below) or hitting
+				// threshold (which logs its own terminal Warn).
+				if w.emptyBufExpiredCount == 1 {
+					slog.Warn("wechat session expired with empty buf — will retry up to threshold",
+						"account", w.accountID,
+						"threshold", wechatEmptyBufExpiredThreshold)
+				} else {
+					slog.Debug("wechat session expired with empty buf — retrying",
+						"account", w.accountID,
+						"attempt", w.emptyBufExpiredCount,
+						"threshold", wechatEmptyBufExpiredThreshold)
+				}
+				w.failures = w.emptyBufExpiredCount
+				backoff := w.calcBackoff()
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return nil
+				}
+				continue
+			}
+			// Threshold tripped: token is dead for real. Wipe the on-disk
+			// buf so a freshly-rescanned account doesn't inherit the
+			// stale cursor on the next process start, then fire onExpired
+			// (the gateway disables the configs row + unregisters us)
+			// and exit.
+			slog.Warn("wechat bot token expired — user must rescan QR",
+				"account", w.accountID, "attempts", w.emptyBufExpiredCount)
+			w.clearBuf()
 			if w.onExpired != nil {
 				w.onExpired(w.accountID)
 			}
@@ -217,8 +355,16 @@ func (w *WeChat) Start(ctx context.Context) error {
 				"account", w.accountID, "ret", resp.Ret, "errcode", resp.ErrCode, "errmsg", resp.ErrMsg)
 			continue
 		}
-		if resp.GetUpdatesBuf != "" {
+		// Any non-SessionExpired success resets the empty-buf counter —
+		// we got a real response from the server, the token is alive.
+		if w.emptyBufExpiredCount > 0 {
+			slog.Info("wechat session recovered after empty-buf retries",
+				"account", w.accountID, "attempts", w.emptyBufExpiredCount)
+			w.emptyBufExpiredCount = 0
+		}
+		if resp.GetUpdatesBuf != "" && resp.GetUpdatesBuf != w.getUpdatesBuf {
 			w.getUpdatesBuf = resp.GetUpdatesBuf
+			w.saveBuf()
 		}
 		for _, m := range resp.Msgs {
 			w.dispatchInbound(m)
@@ -334,19 +480,20 @@ func (w *WeChat) SendMessage(msg bus.OutboundMessage) error {
 	// "label: value" / middle-dot lines BEFORE wechatStripMarkdown
 	// throws away the rest of the markdown — running it after would
 	// leave a bare `|cell|cell|` blob that's strictly worse.
+	// Splitting on SplitMessageMarker happens at the dispatcher layer
+	// (internal/channels/manager.go: routeOutbound) so all IM adapters
+	// honor it uniformly — by the time SendMessage gets called here,
+	// msg.Text is a single bubble's worth of content. The dispatcher
+	// also collapses stray markers to newlines when AllowSplit is off,
+	// so we never see them here.
 	plain := wechatStripMarkdown(FlattenMarkdownTables(msg.Text))
-	chunks := []string{plain}
-	if w.splitReplies {
-		chunks = SplitOutboundText(plain)
-	} else if strings.Contains(plain, SplitMessageMarker) {
-		// Split disabled but the LLM emitted the marker anyway (stale
-		// system-prompt cache, or a value baked into a prompt template
-		// the operator hasn't updated). Collapse to a newline so the
-		// raw `<|split|>` token doesn't surface as literal text.
-		chunks = []string{strings.ReplaceAll(plain, SplitMessageMarker, "\n")}
-	}
-	for _, chunk := range chunks {
-		if err := w.sendTextOnly(msg.ChatID, chunk); err != nil {
+	// Skip the text leg when the body has nothing visible left after
+	// markdown strip — caught the case where a multi-bubble split
+	// produced a chunk whose only content was whitespace or markdown
+	// punctuation, which `sendTextOnly` would otherwise post as a
+	// blank bubble alongside any attached media.
+	if strings.TrimSpace(plain) != "" {
+		if err := w.sendTextOnly(msg.ChatID, plain); err != nil {
 			return err
 		}
 	}
@@ -354,8 +501,8 @@ func (w *WeChat) SendMessage(msg bus.OutboundMessage) error {
 		if len(item.Bytes) == 0 {
 			continue
 		}
-		if err := w.sendImage(msg.ChatID, item); err != nil {
-			slog.Warn("wechat send image failed",
+		if err := w.sendMedia(msg.ChatID, item); err != nil {
+			slog.Warn("wechat send media failed",
 				"account", w.accountID, "chat", msg.ChatID,
 				"filename", item.Filename, "error", err)
 		}
@@ -633,6 +780,19 @@ type wechatItem struct {
 	TextItem  *wechatTextItem  `json:"text_item,omitempty"`
 	ImageItem *wechatImageItem `json:"image_item,omitempty"`
 	VoiceItem *wechatVoiceItem `json:"voice_item,omitempty"`
+	VideoItem *wechatVideoItem `json:"video_item,omitempty"`
+	FileItem  *wechatFileItem  `json:"file_item,omitempty"`
+}
+
+type wechatVideoItem struct {
+	Media     *wechatMediaInfo `json:"media,omitempty"`
+	VideoSize int              `json:"video_size,omitempty"` // ciphertext size
+}
+
+type wechatFileItem struct {
+	Media    *wechatMediaInfo `json:"media,omitempty"`
+	FileName string           `json:"file_name,omitempty"`
+	Len      string           `json:"len,omitempty"` // plaintext size, as a string (iLink quirk)
 }
 
 type wechatTextItem struct {
@@ -734,22 +894,29 @@ type wechatGetUploadURLResponse struct {
 	UploadFullURL string `json:"upload_full_url,omitempty"`
 }
 
-// wechatUploadedFile is the post-upload handle: enough to mint an
-// ImageItem.media reference for the follow-up sendmessage.
+// wechatUploadedFile is the post-upload handle: enough to mint a
+// MediaInfo reference (image/video/file) for the follow-up sendmessage.
 type wechatUploadedFile struct {
 	DownloadParam string
 	AESKeyHex     string
+	FileSize      int // plaintext size — needed by FileItem.Len
 	CipherSize    int
 }
 
-// sendImage uploads one MediaItem's bytes to the iLink CDN and posts a
-// type=2 image message referencing the result. Called per-item by
-// SendMessage; errors are returned to the caller so it can log + continue.
-func (w *WeChat) sendImage(chatID string, item bus.MediaItem) error {
+// sendMedia uploads one MediaItem's bytes to the iLink CDN and posts a
+// sendmessage referencing the result. The MediaItem's ContentType /
+// Filename pick the wire shape: image (type=2), video (type=5), or file
+// (type=4) for everything else (including audio — outbound voice items
+// need codec/sample-rate metadata we don't reliably have, and sending
+// audio as a file still plays back inline in WeChat). Mirrors the
+// dispatcher in upstream weclaw/messaging/media.go.
+func (w *WeChat) sendMedia(chatID string, item bus.MediaItem) error {
+	cdnMediaType, itemType := classifyWeChatMedia(item)
+
 	ctx, cancel := context.WithTimeout(context.Background(), wechatMediaSendTimeout)
 	defer cancel()
 
-	uploaded, err := w.uploadImageToCDN(ctx, chatID, item.Bytes)
+	uploaded, err := w.uploadToCDN(ctx, chatID, item.Bytes, cdnMediaType)
 	if err != nil {
 		return fmt.Errorf("upload: %w", err)
 	}
@@ -758,6 +925,45 @@ func (w *WeChat) sendImage(chatID string, item bus.MediaItem) error {
 	contextToken := w.ctxTokens[chatID]
 	w.ctxTokensMu.Unlock()
 
+	media := &wechatMediaInfo{
+		EncryptQueryParam: uploaded.DownloadParam,
+		AESKey:            base64.StdEncoding.EncodeToString([]byte(uploaded.AESKeyHex)),
+		EncryptType:       wechatCDNEncryptType,
+	}
+
+	var sendItem wechatItem
+	switch itemType {
+	case wechatItemTypeImage:
+		sendItem = wechatItem{
+			Type: wechatItemTypeImage,
+			ImageItem: &wechatImageItem{
+				Media:   media,
+				MidSize: uploaded.CipherSize,
+			},
+		}
+	case wechatItemTypeVideo:
+		sendItem = wechatItem{
+			Type: wechatItemTypeVideo,
+			VideoItem: &wechatVideoItem{
+				Media:     media,
+				VideoSize: uploaded.CipherSize,
+			},
+		}
+	default: // wechatItemTypeFile
+		fileName := item.Filename
+		if fileName == "" {
+			fileName = "file"
+		}
+		sendItem = wechatItem{
+			Type: wechatItemTypeFile,
+			FileItem: &wechatFileItem{
+				Media:    media,
+				FileName: fileName,
+				Len:      strconv.Itoa(uploaded.FileSize),
+			},
+		}
+	}
+
 	body := wechatSendRequest{
 		Msg: wechatSendMsg{
 			FromUserID:   w.accountID,
@@ -765,17 +971,7 @@ func (w *WeChat) sendImage(chatID string, item bus.MediaItem) error {
 			ClientID:     uuid.NewString(),
 			MessageType:  wechatMsgTypeBot,
 			MessageState: wechatMsgStateFinish,
-			ItemList: []wechatItem{{
-				Type: wechatItemTypeImage,
-				ImageItem: &wechatImageItem{
-					Media: &wechatMediaInfo{
-						EncryptQueryParam: uploaded.DownloadParam,
-						AESKey:            base64.StdEncoding.EncodeToString([]byte(uploaded.AESKeyHex)),
-						EncryptType:       wechatCDNEncryptType,
-					},
-					MidSize: uploaded.CipherSize,
-				},
-			}},
+			ItemList:     []wechatItem{sendItem},
 			ContextToken: contextToken,
 		},
 		BaseInfo: wechatBaseInfo{},
@@ -787,12 +983,50 @@ func (w *WeChat) sendImage(chatID string, item bus.MediaItem) error {
 	if resp.Ret != 0 {
 		return fmt.Errorf("send: ret=%d errmsg=%s", resp.Ret, resp.ErrMsg)
 	}
-	slog.Debug("wechat image sent",
-		"account", w.accountID, "chat", chatID, "filename", item.Filename, "bytes", len(item.Bytes))
+	slog.Debug("wechat media sent",
+		"account", w.accountID, "chat", chatID,
+		"filename", item.Filename, "kind", itemType, "bytes", len(item.Bytes))
 	return nil
 }
 
-func (w *WeChat) uploadImageToCDN(ctx context.Context, toUserID string, data []byte) (*wechatUploadedFile, error) {
+// classifyWeChatMedia decides how to send a MediaItem on iLink: image,
+// video, or file (default). Prefers MediaItem.ContentType when set;
+// otherwise infers from the filename extension. Audio falls through to
+// file — matches upstream weclaw's classifyMedia behavior.
+func classifyWeChatMedia(item bus.MediaItem) (cdnMediaType int, itemType int) {
+	ct := strings.ToLower(item.ContentType)
+	if ct == "" {
+		ct = strings.ToLower(mime.TypeByExtension(filepath.Ext(item.Filename)))
+	}
+	if strings.HasPrefix(ct, "image/") || isWeChatImageExt(item.Filename) {
+		return wechatCDNMediaTypeImage, wechatItemTypeImage
+	}
+	if strings.HasPrefix(ct, "video/") || isWeChatVideoExt(item.Filename) {
+		return wechatCDNMediaTypeVideo, wechatItemTypeVideo
+	}
+	return wechatCDNMediaTypeFile, wechatItemTypeFile
+}
+
+func isWeChatImageExt(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp":
+		return true
+	}
+	return false
+}
+
+func isWeChatVideoExt(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".mp4", ".mov", ".webm", ".mkv", ".avi":
+		return true
+	}
+	return false
+}
+
+// uploadToCDN handles the AES-encrypted CDN upload leg for any media
+// type. `mediaType` is one of wechatCDNMediaType{Image,Video,File} and
+// determines how iLink's CDN classifies + serves the bytes later.
+func (w *WeChat) uploadToCDN(ctx context.Context, toUserID string, data []byte, mediaType int) (*wechatUploadedFile, error) {
 	filekey := make([]byte, 16)
 	aeskey := make([]byte, 16)
 	if _, err := rand.Read(filekey); err != nil {
@@ -810,7 +1044,7 @@ func (w *WeChat) uploadImageToCDN(ctx context.Context, toUserID string, data []b
 
 	upReq := wechatGetUploadURLRequest{
 		FileKey:     filekeyHex,
-		MediaType:   wechatCDNMediaTypeImage,
+		MediaType:   mediaType,
 		ToUserID:    toUserID,
 		RawSize:     len(data),
 		RawFileMD5:  rawMD5,
@@ -850,6 +1084,7 @@ func (w *WeChat) uploadImageToCDN(ctx context.Context, toUserID string, data []b
 	return &wechatUploadedFile{
 		DownloadParam: downloadParam,
 		AESKeyHex:     aeskeyHex,
+		FileSize:      len(data),
 		CipherSize:    cipherSize,
 	}, nil
 }

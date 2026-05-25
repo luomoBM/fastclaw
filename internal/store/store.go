@@ -122,6 +122,16 @@ type Store interface {
 	// untouched by compaction. DeleteSession cascades to clean these up.
 	AppendSessionMessage(ctx context.Context, userID, agentID, sessionKey string, msg SessionMessage) error
 	ListSessionMessages(ctx context.Context, userID, agentID, sessionKey string) ([]SessionMessage, error)
+	// CountChatterUserMessages returns how many role='user' rows this
+	// chatter has accumulated under the agent — across all sessions,
+	// all channels. Used by the autoPersist gate as a *durable* "every
+	// N user turns" counter that survives daemon restart and UserSpace
+	// invalidation (the previous in-memory `turnCount` reset on both).
+	// Counts only rows where chatter_user_id matches; legacy rows where
+	// the column is empty are skipped — those predate per-chatter
+	// resolution and conflating them with the new chatter would
+	// over-count.
+	CountChatterUserMessages(ctx context.Context, agentID, chatterUserID string) (int, error)
 
 	// --- Chat events (in-flight streaming deltas, persisted for resume) ---
 	//

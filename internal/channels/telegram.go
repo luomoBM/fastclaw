@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"mime"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -311,18 +313,52 @@ func (t *Telegram) SendMessage(msg bus.OutboundMessage) error {
 	}
 
 	// Then upload any pre-resolved attachments (image-tool output etc.).
-	// Photo APIs accept raw bytes via FileBytes; tgbotapi sniffs the
-	// content type from the filename's extension.
+	// Telegram has four distinct media APIs and the right one is picked
+	// from MediaItem.ContentType (set by the gateway) or the filename
+	// extension. Sending a PDF/MP3/MP4 through NewPhoto — which the old
+	// code did unconditionally — gets rejected with `PHOTO_INVALID_DIMENSIONS`
+	// or similar.
 	for _, item := range msg.MediaItems {
-		photo := tgbotapi.NewPhoto(id, tgbotapi.FileBytes{
-			Name:  item.Filename,
-			Bytes: item.Bytes,
-		})
-		if _, err := t.bot.Send(photo); err != nil {
-			slog.Warn("telegram photo upload failed", "filename", item.Filename, "error", err)
+		fb := tgbotapi.FileBytes{Name: item.Filename, Bytes: item.Bytes}
+		var c tgbotapi.Chattable
+		switch telegramMediaKind(item) {
+		case "photo":
+			c = tgbotapi.NewPhoto(id, fb)
+		case "video":
+			c = tgbotapi.NewVideo(id, fb)
+		case "audio":
+			c = tgbotapi.NewAudio(id, fb)
+		default: // "document"
+			c = tgbotapi.NewDocument(id, fb)
+		}
+		if _, err := t.bot.Send(c); err != nil {
+			slog.Warn("telegram media upload failed",
+				"filename", item.Filename, "content_type", item.ContentType, "error", err)
 		}
 	}
 	return nil
+}
+
+// telegramMediaKind picks photo / video / audio / document for a
+// MediaItem. Preference: explicit ContentType (set by the gateway from
+// the file's mime/ext) → filename extension lookup → "document" as the
+// safe fallback. Telegram is lax about document uploads (any file
+// works), so anything we can't classify confidently still goes through
+// rather than being dropped.
+func telegramMediaKind(item bus.MediaItem) string {
+	ct := strings.ToLower(item.ContentType)
+	if ct == "" {
+		ct = strings.ToLower(mime.TypeByExtension(filepath.Ext(item.Filename)))
+	}
+	switch {
+	case strings.HasPrefix(ct, "image/"):
+		return "photo"
+	case strings.HasPrefix(ct, "video/"):
+		return "video"
+	case strings.HasPrefix(ct, "audio/"):
+		return "audio"
+	}
+	return "document"
 }
 
 // convertMarkdownForTelegram does a lightweight pass over GFM text so

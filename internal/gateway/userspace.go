@@ -14,6 +14,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/plugin"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
@@ -97,13 +98,19 @@ func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.E
 	}
 	var inner sandbox.ExecutorPool
 	home, _ := config.HomeDir()
+	// Prefer the per-backend image field (DockerImage / E2BTemplate /
+	// BoxliteSnapshot); fall back to the legacy shared Image slot for
+	// configs predating the split.
 	switch cfg.Backend {
 	case "e2b":
 		apiKey := cfg.E2BKey
 		if apiKey == "" {
 			apiKey = os.Getenv("E2B_API_KEY")
 		}
-		template := cfg.Image
+		template := cfg.E2BTemplate
+		if template == "" {
+			template = cfg.Image
+		}
 		if template == "" {
 			template = "base"
 		}
@@ -115,20 +122,28 @@ func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.E
 		if secret == "" {
 			secret = os.Getenv("BOXLITE_API_KEY")
 		}
+		snapshot := cfg.BoxliteSnapshot
+		if snapshot == "" {
+			snapshot = cfg.Image
+		}
 		inner = sandbox.NewBoxliteExecutorPool(
 			cfg.BoxliteURL,
 			cfg.BoxlitePrefix,
 			cfg.BoxliteClientID,
 			secret,
-			cfg.Image,
+			snapshot,
 			home,
 			30*time.Minute,
 		)
 		slog.Info("system sandbox executor pool created",
-			"backend", "boxlite", "image", cfg.Image, "url", cfg.BoxliteURL)
+			"backend", "boxlite", "image", snapshot, "url", cfg.BoxliteURL)
 	default:
+		image := cfg.DockerImage
+		if image == "" {
+			image = cfg.Image
+		}
 		policy := &sandbox.Policy{NetMode: cfg.Network}
-		inner = sandbox.NewDockerExecutorPool(cfg.Image, home, policy)
+		inner = sandbox.NewDockerExecutorPool(image, home, policy)
 		slog.Info("system sandbox executor pool created",
 			"backend", "docker", "network", cfg.Network)
 	}
@@ -291,6 +306,11 @@ type UserSpace struct {
 	Provider    provider.Provider
 	Agents      *agent.Manager
 	SandboxPool sandbox.ExecutorPool
+	// PluginMgr is borrowed from the gateway (process-wide singleton).
+	// Held here so EnsureAgent — the foreign-agent attach path — can
+	// register hook plugins onto the lazy-built agent without
+	// reaching back into the gateway. Nil when systemPlugins is off.
+	PluginMgr *plugin.Manager
 
 	mu sync.Mutex
 }
@@ -345,7 +365,7 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 	if err != nil || rec == nil {
 		return fmt.Errorf("EnsureAgent: agent %q not found", agentID)
 	}
-	resolved := config.ResolveAgents(sp.Config, []config.AgentEntry{{ID: rec.ID, UserID: rec.UserID}})
+	resolved := config.ResolveAgents(sp.Config, []config.AgentEntry{{ID: rec.ID, UserID: rec.UserID, Name: rec.Name}})
 	if len(resolved) != 1 {
 		return fmt.Errorf("EnsureAgent: ResolveAgents returned %d entries", len(resolved))
 	}
@@ -459,6 +479,23 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			if ovr.PolicyPreset != "" {
 				rc.PolicyPreset = ovr.PolicyPreset
 			}
+			// Keep this overlay aligned with the owner-path equivalent in
+			// loadUserSpace — missing fields silently break per-agent
+			// settings for chatters who lazy-attach the agent via a
+			// channel binding (e.g. wechat multi-bubble hint never fires
+			// because rc.SplitReplies stays nil; chatbot persona renders
+			// in agent-prompt mode because rc.PromptMode stays "").
+			if ovr.PromptMode != "" {
+				rc.PromptMode = ovr.PromptMode
+			}
+			if ovr.SplitReplies != nil {
+				v := *ovr.SplitReplies
+				rc.SplitReplies = &v
+			}
+			if ovr.AutoPersist != nil {
+				v := *ovr.AutoPersist
+				rc.AutoPersist = &v
+			}
 		}
 	}
 	if chatterPin.Model != "" {
@@ -544,6 +581,16 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			ag.ToolRegistry().SetSandboxRoot(rc.Workspace)
 		}
 	}
+	// Wire hook plugins onto the freshly-attached agent. Mirrors what
+	// loadUserSpace does for owner agents — without this, hook
+	// plugins would only fire for the agent's owner and never for
+	// chatters who reach the agent through a foreign-attach (channel
+	// binding, public link, super_admin browse).
+	if sp.PluginMgr != nil {
+		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
+			registerHookPluginsForAgent(ctx, sp.PluginMgr, st, ag)
+		}
+	}
 	slog.Info("agent injected into foreign user space",
 		"caller", sp.UserID, "agent", rc.ID, "owner", rec.UserID)
 	return nil
@@ -560,7 +607,7 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 // by the resulting UserSpace. Pass nil when sandbox is disabled at
 // system scope; agents will run with path-only file roots in that
 // case.
-func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, systemSandboxPool sandbox.ExecutorPool) (*UserSpace, error) {
+func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager) (*UserSpace, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("loadUserSpace: userID required")
 	}
@@ -595,7 +642,7 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 
 	entries := make([]config.AgentEntry, 0, len(agentRecords))
 	for _, ar := range agentRecords {
-		entries = append(entries, config.AgentEntry{ID: ar.ID, UserID: ar.UserID})
+		entries = append(entries, config.AgentEntry{ID: ar.ID, UserID: ar.UserID, Name: ar.Name})
 	}
 
 	// Bindings used to live in their own kind=setting/name=bindings
@@ -641,6 +688,27 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 			}
 			if agentOverride.PolicyPreset != "" {
 				rc.PolicyPreset = agentOverride.PolicyPreset
+			}
+			if agentOverride.PromptMode != "" {
+				rc.PromptMode = agentOverride.PromptMode
+			}
+			// Per-agent WeChat split-replies — pointer semantics so
+			// "absent" (no row, or row without the key) is distinct
+			// from "explicitly false". Non-nil from the row means the
+			// operator made a deliberate choice; nil falls through to
+			// system WeChatCfg.SplitReplies later in NewAgentWithFullCfg.
+			if agentOverride.SplitReplies != nil {
+				v := *agentOverride.SplitReplies
+				rc.SplitReplies = &v
+			}
+			// Per-agent autoPersist — same pointer semantics. Non-nil
+			// here overrides the system/user memory.autoPersist.enabled
+			// for this agent specifically. Used most by chatbot-mode
+			// personas where the LLM can't write_file directly so the
+			// background distill pass is the only persistence path.
+			if agentOverride.AutoPersist != nil {
+				v := *agentOverride.AutoPersist
+				rc.AutoPersist = &v
 			}
 		}
 		// Same story for providers: assembleConfig was called with
@@ -700,6 +768,16 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 
 	pool := attachSandboxToAgents(systemSandboxPool, userID, resolved, agentMgr)
 
+	// Wire hook plugins onto each agent's HookRegistry. Per-agent
+	// enable comes from the configs row at (scope=agent, agent_id=X,
+	// name=plugins.enabled) — falling back to the plugin manifest's
+	// boot-time enabled state when there's no per-agent override.
+	if pluginMgr != nil {
+		for _, ag := range agentMgr.All() {
+			registerHookPluginsForAgent(ctx, pluginMgr, st, ag)
+		}
+	}
+
 	slog.Info("loaded user space", "user", userID, "agents", agentMgr.Names())
 
 	return &UserSpace{
@@ -708,7 +786,75 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		Provider:    prov,
 		Agents:      agentMgr,
 		SandboxPool: pool,
+		PluginMgr:   pluginMgr,
 	}, nil
+}
+
+// registerHookPluginsForAgent walks every running hook-type plugin
+// and attaches it to ag.HookRegistry IF this agent has explicitly
+// opted in via the per-agent plugins.enabled row.
+//
+// Default is OPT-IN: a plugin being enabled system-wide only means
+// its process runs and is available to attach. Each agent must
+// individually set `plugins.enabled[<id>] = true` (via the dashboard
+// Plugins card or directly in the configs table) for the plugin's
+// hooks to fire on its turns. System-wide enable without per-agent
+// opt-in = plugin idle for that agent.
+//
+// Rationale: hook plugins can change agent behavior in surprising
+// ways (extra messages, modified prompts, recorded conversation
+// data). Default-deny avoids accidentally affecting agents the
+// operator didn't intend.
+//
+// Idempotent at the manager level (Process is already running), but
+// the HookRegistry side accumulates — call sites must not double-
+// register for the same agent. Today the only call sites are
+// loadUserSpace (once per UserSpace boot) and EnsureAgent (once per
+// foreign attach), neither of which fires twice for the same agent.
+func registerHookPluginsForAgent(ctx context.Context, pluginMgr *plugin.Manager, st store.Store, ag *agent.Agent) {
+	overrides := readAgentScopePluginsEnabled(ctx, st, ag.Name())
+	if len(overrides) == 0 {
+		return // fast path: no opt-ins for this agent
+	}
+	for _, inst := range pluginMgr.HookPlugins() {
+		id := inst.Manifest.ID
+		// Opt-in: only attach if this agent explicitly set true.
+		// Missing key or explicit false → skip.
+		if !overrides[id] {
+			continue
+		}
+		if inst.Process == nil || !inst.Process.IsRunning() {
+			slog.Warn("plugin: agent opted in but plugin not running",
+				"plugin", id, "agent", ag.Name())
+			continue
+		}
+		if err := plugin.RegisterPluginHooks(ctx, pluginMgr, id, ag.HookRegistry(), ag.Name()); err != nil {
+			slog.Warn("plugin: hook register failed",
+				"plugin", id, "agent", ag.Name(), "error", err)
+		}
+	}
+}
+
+// readAgentScopePluginsEnabled reads the per-agent plugin enable
+// overlay from the configs table: scope=agent, name=plugins.enabled,
+// data = {"<pluginID>": true|false, ...}. Missing row / missing key
+// means "no override; use system default". Returns nil on lookup
+// error (callers treat nil as "no overrides").
+func readAgentScopePluginsEnabled(ctx context.Context, st store.Store, agentID string) map[string]bool {
+	if st == nil || agentID == "" {
+		return nil
+	}
+	rec, err := st.GetConfigByName(ctx, store.KindSetting, "", agentID, "plugins.enabled")
+	if err != nil || rec == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(rec.Data))
+	for k, v := range rec.Data {
+		if b, ok := v.(bool); ok {
+			out[k] = b
+		}
+	}
+	return out
 }
 
 // newProviderFromConfig picks an LLM provider for the resolved default
@@ -765,7 +911,12 @@ type userSpaceRegistry struct {
 	workspace         workspace.Store
 	meter             usage.Meter
 	systemSandboxPool sandbox.ExecutorPool
-	idleTTL           time.Duration
+	// pluginMgr is the shared (process-wide) plugin manager. Nil
+	// when systemPlugins is disabled. Used by loadUserSpace and
+	// EnsureAgent to register hook-type plugins onto each agent's
+	// HookRegistry, gated by per-agent plugins.enabled config.
+	pluginMgr *plugin.Manager
+	idleTTL   time.Duration
 }
 
 type userSpaceEntry struct {
@@ -773,7 +924,7 @@ type userSpaceEntry struct {
 	lastUsed time.Time
 }
 
-func newUserSpaceRegistry(mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, systemSandboxPool sandbox.ExecutorPool) *userSpaceRegistry {
+func newUserSpaceRegistry(mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager) *userSpaceRegistry {
 	return &userSpaceRegistry{
 		spaces:            make(map[string]*userSpaceEntry),
 		bus:               mb,
@@ -781,6 +932,7 @@ func newUserSpaceRegistry(mb *bus.MessageBus, st store.Store, ws workspace.Store
 		workspace:         ws,
 		meter:             meter,
 		systemSandboxPool: systemSandboxPool,
+		pluginMgr:         pluginMgr,
 		idleTTL:           30 * time.Minute,
 	}
 }
@@ -808,7 +960,7 @@ func (r *userSpaceRegistry) getOrLoad(ctx context.Context, userID string) (*User
 		e.lastUsed = time.Now()
 		return e.space, nil
 	}
-	sp, err := loadUserSpace(ctx, userID, r.bus, r.store, r.workspace, r.meter, r.systemSandboxPool)
+	sp, err := loadUserSpace(ctx, userID, r.bus, r.store, r.workspace, r.meter, r.systemSandboxPool, r.pluginMgr)
 	if err != nil {
 		return nil, err
 	}

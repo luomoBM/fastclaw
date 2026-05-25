@@ -115,6 +115,8 @@ func buildHookFireParams(pointName string, hc *agent.HookContext) HookFireParams
 	params := HookFireParams{
 		Point:      pointName,
 		AgentName:  hc.AgentName,
+		Channel:    hc.Channel,
+		AccountID:  hc.AccountID,
 		ChatID:     hc.ChatID,
 		UserID:     hc.UserID,
 		ToolName:   hc.ToolName,

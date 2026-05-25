@@ -187,8 +187,13 @@ func (m *shellManager) Start(command string, env []string) (*bashSession, error)
 	// is the only path that terminates it before natural exit.
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
+	// Fail closed: if the caller didn't pass an explicit env, build a
+	// scrubbed one rather than letting Go default to bare os.Environ()
+	// inheritance — that path is how daemon secrets reached chat replies.
 	if env != nil {
 		cmd.Env = env
+	} else {
+		cmd.Env = buildSubprocessEnv(nil)
 	}
 
 	// Spawn into a fresh process group so kill_shell reaches every

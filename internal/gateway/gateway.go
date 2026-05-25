@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/url"
 	"os"
 	"os/signal"
@@ -38,6 +39,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/webfetch"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders/websearch"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
+	"github.com/fastclaw-ai/fastclaw/internal/users"
 	"github.com/fastclaw-ai/fastclaw/internal/webhook"
 	"github.com/fastclaw-ai/fastclaw/internal/workspace"
 )
@@ -167,6 +169,7 @@ type Gateway struct {
 	pluginMgr   *plugin.Manager
 	taskQueue   *taskqueue.Queue
 	store       store.Store
+	accounts    *users.Accounts
 	workspace   workspace.Store
 	sandboxPool sandbox.ExecutorPool
 	usage       usage.Meter
@@ -333,13 +336,23 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	// refused to run with "sandbox required but no executor available".
 	systemSandboxPool := buildSystemSandboxPool(readSystemSandboxCfg(st), ws)
 
+	// Accounts service is used by the inbound routing loop to lazy-mint
+	// per-(channel, IM-sender) app_user rows so each chatter on an IM
+	// channel ends up with their own stable fastclaw u_xxx id (and thus
+	// their own per-chatter USER.md / MEMORY.md).
+	accts, err := users.NewAccounts(st)
+	if err != nil {
+		return nil, fmt.Errorf("init accounts: %w", err)
+	}
+
 	g := &Gateway{
 		bus:         mb,
 		store:       st,
+		accounts:    accts,
 		workspace:   ws,
 		usage:       meter,
 		sandboxPool: systemSandboxPool,
-		users:       newUserSpaceRegistry(mb, st, ws, meter, systemSandboxPool),
+		users:       newUserSpaceRegistry(mb, st, ws, meter, systemSandboxPool, pluginMgr),
 		chanMgr:     chanMgr,
 		webChan:     webChan,
 		scheduler:   scheduler,
@@ -420,7 +433,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// image-tool already saved the real file to /workspace. Dedupe
 		// by filename so we don't double-send anything
 		// splitMediaFromReply already resolved.
-		items = appendRecentWorkspaceImages(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, turnStart, items)
+		items = appendRecentWorkspaceMedia(ctx, g.workspace, task.AgentID, task.Message.ProjectID, task.Message.ChatID, turnStart, items)
 		// Web-streamed turns already delivered the reply via the hub.
 		// Skip the outbound push entirely when there's no media; with
 		// media, push with empty text so attachments still flow but
@@ -441,6 +454,11 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 			ReplyToMsgID: task.Message.MessageID,
 			ParseMode:    "Markdown",
 			MediaItems:   items,
+			// AllowSplit lets the WeChat adapter honor SplitMessageMarker
+			// for multi-bubble output. Sourced from the originating
+			// agent's per-agent setting (or the system fallback baked
+			// into it at boot) — see Agent.SplitReplies.
+			AllowSplit: ag.SplitReplies(),
 		}
 		// Bounded enqueue. If routeOutbound is wedged the task
 		// shouldn't sit on its taskQueue slot forever — let ctx's
@@ -809,7 +827,17 @@ func splitMediaFromReply(ctx context.Context, ws workspace.Store, agentID, proje
 		}
 
 		if len(bytes) > 0 {
-			items = append(items, bus.MediaItem{Filename: filename, Bytes: bytes})
+			if len(bytes) > maxAttachmentBytes {
+				slog.Warn("split media: skipping oversize attachment",
+					"agent", agentID, "session", sessionID,
+					"filename", filename, "size", len(bytes), "cap", maxAttachmentBytes)
+			} else {
+				items = append(items, bus.MediaItem{
+					Filename:    filename,
+					ContentType: mime.TypeByExtension(filepath.Ext(filename)),
+					Bytes:       bytes,
+				})
+			}
 		}
 
 		// Strip the `![alt](src)` either way — leaving an unresolvable
@@ -918,23 +946,39 @@ func decodeBase64Tolerant(s string) ([]byte, error) {
 	return nil, fmt.Errorf("all base64 encodings failed (%s)", strings.Join(errs, "; "))
 }
 
-// appendRecentWorkspaceImages lists the session's workspace and
-// attaches every image file modified at or after `turnStart`. This is
-// the IM-side guarantee that "if image-tool wrote a file this turn,
-// the user receives it" — independent of whether the LLM's reply
-// markdown referenced it correctly (broken data URLs, missing refs,
-// hallucinated filenames all bypass this path).
+// maxAttachmentBytes caps per-file outbound attachments. Sized to fit
+// under the tightest IM platform limit we care about (Discord free tier
+// = 25MB) and well under the WeChat CDN-upload timeout's practical
+// ceiling (90s leaves headroom for ~25MB over typical residential
+// uplinks). Files past this are skipped + logged rather than truncated;
+// the recipient sees no attachment but the chat-side text still goes
+// through.
+const maxAttachmentBytes = 25 * 1024 * 1024
+
+// appendRecentWorkspaceMedia lists the session's workspace and attaches
+// every shippable file modified at or after `turnStart`. This is the
+// IM-side guarantee that "if a tool wrote a deliverable this turn, the
+// user receives it" — independent of whether the LLM's reply markdown
+// referenced it correctly (broken data URLs, missing refs, hallucinated
+// filenames all bypass this path).
 //
 // Filter rules:
-//   - extension is one of .png/.jpg/.jpeg/.webp/.gif/.svg
-//   - ModTime >= turnStart (use a 1-second back-buffer for stores
-//     whose mtime granularity is coarse — better to over-send than
-//     drop a borderline file)
-//   - filename not already in `existing` (dedupe)
+//   - extension is in the deliverable allowlist (see isShippableExt):
+//     images / video / audio / common document containers. Notably
+//     EXCLUDES .md / .txt / .csv / .json / source files — those are
+//     usually agent scratchpads (todo.md, plans, intermediate output)
+//     and auto-shipping them would be noise, not value.
+//   - ModTime >= turnStart - 1s (back-buffer for stores with second-
+//     granularity mtimes — better to over-send than drop a borderline
+//     file).
+//   - size <= maxAttachmentBytes (skipped + logged otherwise; we'd
+//     blow channel limits or timeout the CDN upload).
+//   - filename not already in `existing` (dedupe — splitMediaFromReply
+//     may have already resolved it).
 //
-// Logs counts at every filter stage so a future "no image attached"
+// Logs counts at every filter stage so a future "no file attached"
 // report can be diagnosed from logs alone.
-func appendRecentWorkspaceImages(ctx context.Context, ws workspace.Store, agentID, projectID, sessionID string, turnStart time.Time, existing []bus.MediaItem) []bus.MediaItem {
+func appendRecentWorkspaceMedia(ctx context.Context, ws workspace.Store, agentID, projectID, sessionID string, turnStart time.Time, existing []bus.MediaItem) []bus.MediaItem {
 	if ws == nil {
 		return existing
 	}
@@ -955,20 +999,31 @@ func appendRecentWorkspaceImages(ctx context.Context, ws workspace.Store, agentI
 	// turn with a mtime stamp 0.6s before turnStart.
 	cutoff := turnStart.Add(-1 * time.Second)
 
-	imageCount := 0
+	candidateCount := 0
 	recentCount := 0
+	oversizeCount := 0
 	attached := 0
 	for _, obj := range objs {
-		if !looksLikeImage(obj.Path) {
+		if !isShippableExt(obj.Path) {
 			continue
 		}
-		imageCount++
+		candidateCount++
 		if obj.ModTime.Before(cutoff) {
 			continue
 		}
 		recentCount++
 		base := filepath.Base(obj.Path)
 		if have[base] {
+			continue
+		}
+		// Early-skip oversize using the listing's size hint. Stores
+		// that don't track size (Size == -1) fall through to the
+		// post-read check below.
+		if obj.Size > 0 && obj.Size > maxAttachmentBytes {
+			oversizeCount++
+			slog.Warn("workspace media fallback: skipping oversize file",
+				"agent", agentID, "session", sessionID,
+				"path", obj.Path, "size", obj.Size, "cap", maxAttachmentBytes)
 			continue
 		}
 		rc, gerr := ws.Get(ctx, agentID, projectID, sessionID, obj.Path)
@@ -982,22 +1037,49 @@ func appendRecentWorkspaceImages(ctx context.Context, ws workspace.Store, agentI
 		if rerr != nil || len(data) == 0 {
 			continue
 		}
-		existing = append(existing, bus.MediaItem{Filename: base, Bytes: data})
+		if len(data) > maxAttachmentBytes {
+			oversizeCount++
+			slog.Warn("workspace media fallback: skipping oversize file (post-read)",
+				"agent", agentID, "session", sessionID,
+				"path", obj.Path, "size", len(data), "cap", maxAttachmentBytes)
+			continue
+		}
+		existing = append(existing, bus.MediaItem{
+			Filename:    base,
+			ContentType: mime.TypeByExtension(filepath.Ext(base)),
+			Bytes:       data,
+		})
 		have[base] = true
 		attached++
 	}
 	slog.Info("workspace media fallback",
 		"agent", agentID, "session", sessionID,
-		"total_objs", len(objs), "images_total", imageCount,
-		"images_recent", recentCount, "attached", attached,
+		"total_objs", len(objs), "candidates", candidateCount,
+		"recent", recentCount, "oversize", oversizeCount,
+		"attached", attached,
 		"turn_start", turnStart.Format(time.RFC3339Nano))
 	return existing
 }
 
-func looksLikeImage(p string) bool {
-	ext := strings.ToLower(filepath.Ext(p))
-	switch ext {
+// isShippableExt is the "is this a deliverable" allowlist used by the
+// workspace media fallback. Conservative on purpose — auto-shipping
+// every .md / .txt / .json the agent writes would surface internal
+// scratchpads (todo.md, plans, intermediate stash) as chat
+// attachments. Add new extensions only when their files almost always
+// represent "something the user asked for."
+func isShippableExt(p string) bool {
+	switch strings.ToLower(filepath.Ext(p)) {
+	// Images
 	case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg":
+		return true
+	// Video
+	case ".mp4", ".mov", ".webm", ".mkv", ".avi":
+		return true
+	// Audio
+	case ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac":
+		return true
+	// Document containers — finished deliverables, not scratchpads.
+	case ".pdf", ".docx", ".xlsx", ".pptx", ".zip":
 		return true
 	}
 	return false

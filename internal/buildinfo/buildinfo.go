@@ -50,3 +50,24 @@ func IsHostedDeploy() bool {
 func osDeployVar() string {
 	return strings.ToLower(strings.TrimSpace(os.Getenv("FASTCLAW_DEPLOY")))
 }
+
+// IsHostExecAllowed reports whether the agent runtime should register
+// the `host_exec` escape-hatch tool. Returns true only when the
+// operator has explicitly opted in via FASTCLAW_ALLOW_HOST_EXEC=1
+// (or "true"/"yes") AND this isn't a hosted multi-tenant deploy.
+//
+// Default OFF. Earlier versions registered host_exec for every
+// self-hosted install — a too-permissive default that exposed the
+// operator's host shell to ANY external IM user (WeChat, Discord,
+// Feishu, …) the agent was reachable from. With the new gate, an
+// operator who actually needs host_exec (single-user laptop dev
+// flow, `fastclaw upgrade`, `~/Downloads` triage) sets the env var
+// at deploy time; everyone else gets the safer sandbox-or-nothing
+// behavior.
+func IsHostExecAllowed() bool {
+	if IsHostedDeploy() {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("FASTCLAW_ALLOW_HOST_EXEC")))
+	return v == "1" || v == "true" || v == "yes"
+}

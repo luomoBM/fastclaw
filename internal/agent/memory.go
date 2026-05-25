@@ -57,6 +57,12 @@ func NewMemoryWithStoreForUser(workspace string, st MemoryStore, userID, agentID
 	return &Memory{workspace: workspace, store: st, userID: userID, agentID: agentID}
 }
 
+// UserID returns the userID this Memory is bound to (set via
+// NewMemoryWithStoreForUser / WithUserID). Used by the agent loop's
+// autoPersist gate to query the per-chatter user-message count
+// without re-resolving chatterUID through the inbound message.
+func (m *Memory) UserID() string { return m.userID }
+
 // WithUserID returns a shallow copy bound to a different userID.
 // Lets a per-turn caller rebind MEMORY.md / USER.md reads + writes to
 // the chatter (rather than the agent owner) without mutating the
@@ -318,7 +324,10 @@ If nothing worth saving, output: {"memory_facts": [], "user_notes": []}`,
 		{Role: "user", Content: extractPrompt},
 	}, nil, model, 200, 0.3)
 	if err != nil {
-		slog.Debug("auto-persist: LLM call failed", "error", err)
+		// Warn (not Debug) — invisible failures here are exactly
+		// the "I turned the switch on but nothing got persisted"
+		// experience that's painful to debug after the fact.
+		slog.Warn("auto-persist: LLM call failed", "error", err, "model", model)
 		return
 	}
 
@@ -326,10 +335,25 @@ If nothing worth saving, output: {"memory_facts": [], "user_notes": []}`,
 		MemoryFacts []string `json:"memory_facts"`
 		UserNotes   []string `json:"user_notes"`
 	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(resp.Content)), &result); err != nil {
-		slog.Debug("auto-persist: failed to parse LLM response", "error", err)
+	// Strip markdown code fences before parsing — many tuned models
+	// (Sonnet 4.x, Opus, …) reflexively wrap structured output in
+	// ```json … ``` even when the prompt asks for "no markdown fences".
+	cleaned := stripJSONFence(resp.Content)
+	if err := json.Unmarshal([]byte(cleaned), &result); err != nil {
+		// Same Warn upgrade as above — silent skip here was hiding
+		// "Sonnet returned wrapped JSON, parse failed" in the wild.
+		preview := cleaned
+		if len(preview) > 200 {
+			preview = preview[:200] + "…"
+		}
+		slog.Warn("auto-persist: failed to parse LLM response",
+			"error", err, "model", model, "preview", preview)
 		return
 	}
+	slog.Info("auto-persist: extracted",
+		"model", model,
+		"memory_facts", len(result.MemoryFacts),
+		"user_notes", len(result.UserNotes))
 
 	// Append new memory facts
 	if len(result.MemoryFacts) > 0 {
@@ -373,4 +397,24 @@ func truncateStr(s string, n int) string {
 		return s
 	}
 	return s[:n] + "..."
+}
+
+// stripJSONFence removes a leading ```json (or ```) / trailing ```
+// wrapper from an LLM response. Tuned chat models routinely wrap
+// structured output even when the prompt asks for raw JSON. Returns
+// the original (trimmed) string when no fence is present.
+func stripJSONFence(s string) string {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "```") {
+		return s
+	}
+	// Drop the opening fence (```json\n or ```\n) — anything up to the
+	// first newline after the leading backticks.
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[i+1:]
+	} else {
+		s = strings.TrimPrefix(s, "```")
+	}
+	s = strings.TrimSuffix(strings.TrimSpace(s), "```")
+	return strings.TrimSpace(s)
 }

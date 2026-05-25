@@ -156,6 +156,22 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// Apikey ACL gate. UserSpaceFor loads every agent the owner has,
+	// regardless of which subset this particular apikey is scoped to.
+	// Without this check a type=agent apikey scoped to one agent
+	// could pass `x-fastclaw-agent-id: <sibling>` (or omit it and
+	// fall back to default / all[0]) and talk to any of the owner's
+	// agents. The /v1/agents listing already filters by
+	// CanAccessAgent — mirror that here so apikey scope is enforced
+	// uniformly. Use 404 (not 403) so the response is identical to
+	// the genuine "no such agent" case and the ACL doesn't leak the
+	// existence of out-of-scope agents.
+	if ident, ok := auth.FromContext(r.Context()); ok && !ident.CanAccessAgent(ag.Name()) {
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"error": map[string]string{"message": "agent not found", "type": "not_found_error"},
+		})
+		return
+	}
 
 	// Build session key from header
 	sessionKey := r.Header.Get("x-fastclaw-session-key")

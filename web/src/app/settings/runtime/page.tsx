@@ -15,7 +15,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Save, Check, Container, MessageSquare } from "lucide-react";
+import { Save, Check, Container } from "lucide-react";
 import { getConfig, updateConfig, getMe, type ConfigResponse } from "@/lib/api";
 
 export default function RuntimeSettingsPage() {
@@ -34,8 +34,6 @@ export default function RuntimeSettingsPage() {
   const [sandboxBoxliteKey, setSandboxBoxliteKey] = useState("");
   const [sandboxBoxliteURL, setSandboxBoxliteURL] = useState("");
 
-  const [wechatSplitReplies, setWechatSplitReplies] = useState(false);
-
   useEffect(() => {
     // Belt-and-suspenders gate: the layout already hides the nav item,
     // but a direct URL hit needs to bounce too.
@@ -51,19 +49,23 @@ export default function RuntimeSettingsPage() {
           setSandboxEnabled(cfg.sandbox?.enabled || false);
           const backend = cfg.sandbox?.backend || "docker";
           setSandboxBackend(backend);
+          // Each backend has its own persisted field. For configs
+          // predating the split there's only the legacy `image` slot,
+          // so we migrate it into the backend it belonged to (the saved
+          // `backend`) and leave the other two empty.
           const savedImage = cfg.sandbox?.image || "";
-          if (backend === "e2b") {
-            const looksLikeDockerImage = savedImage.includes(":") || savedImage.includes("/");
-            setSandboxE2BTemplate(looksLikeDockerImage || !savedImage ? "base" : savedImage);
-          } else if (backend === "boxlite") {
-            setSandboxBoxliteImage(savedImage);
-          } else {
-            setSandboxDockerImage(savedImage);
-          }
+          setSandboxDockerImage(
+            cfg.sandbox?.dockerImage ?? (backend === "docker" ? savedImage : ""),
+          );
+          setSandboxE2BTemplate(
+            cfg.sandbox?.e2bTemplate ?? (backend === "e2b" ? savedImage || "base" : "base"),
+          );
+          setSandboxBoxliteImage(
+            cfg.sandbox?.boxliteSnapshot ?? (backend === "boxlite" ? savedImage : ""),
+          );
           setSandboxE2BKey(cfg.sandbox?.e2bKey || "");
           setSandboxBoxliteKey(cfg.sandbox?.boxliteKey || "");
           setSandboxBoxliteURL(cfg.sandbox?.boxliteUrl || "");
-          setWechatSplitReplies(cfg.wechat?.splitReplies || false);
         })
         .catch(() => {})
         .finally(() => setLoading(false));
@@ -72,7 +74,11 @@ export default function RuntimeSettingsPage() {
 
   const handleSave = async () => {
     setSaving(true);
-    const image =
+    // Persist every backend's field so switching the dropdown after a
+    // save still surfaces the value the user typed for that backend.
+    // Also mirror the active backend's value into the legacy `image`
+    // slot so consumers that haven't migrated still resolve correctly.
+    const activeImage =
       sandboxBackend === "e2b"
         ? sandboxE2BTemplate
         : sandboxBackend === "boxlite"
@@ -82,13 +88,13 @@ export default function RuntimeSettingsPage() {
       sandbox: {
         enabled: sandboxEnabled,
         backend: sandboxBackend,
-        image: image || undefined,
+        image: activeImage || undefined,
+        dockerImage: sandboxDockerImage || undefined,
+        e2bTemplate: sandboxE2BTemplate || undefined,
+        boxliteSnapshot: sandboxBoxliteImage || undefined,
         e2bKey: sandboxE2BKey || undefined,
         boxliteKey: sandboxBoxliteKey || undefined,
         boxliteUrl: sandboxBoxliteURL || undefined,
-      },
-      wechat: {
-        splitReplies: wechatSplitReplies,
       },
     });
     setSaving(false);
@@ -244,25 +250,6 @@ export default function RuntimeSettingsPage() {
             </div>
           </div>
         )}
-      </div>
-
-      <div className="rounded-lg border border-border bg-card">
-        <div className="p-5">
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="flex items-center gap-2 mb-1">
-                <MessageSquare className="h-4 w-4 text-emerald-500" />
-                <h3 className="font-medium">WeChat multi-bubble replies</h3>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Let the agent split one reply into multiple WeChat bubbles using a
-                separator marker. Off by default — keeps each reply as a single
-                message.
-              </p>
-            </div>
-            <Switch checked={wechatSplitReplies} onCheckedChange={setWechatSplitReplies} />
-          </div>
-        </div>
       </div>
     </div>
   );

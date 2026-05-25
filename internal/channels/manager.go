@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
@@ -218,9 +219,63 @@ func (m *Manager) routeOutbound(ctx context.Context) {
 				slog.Warn("unknown outbound channel", "key", key)
 				continue
 			}
-			if err := ch.SendMessage(msg); err != nil {
-				slog.Error("send message failed", "key", key, "error", err)
-			}
+			m.dispatchOutbound(ch, msg, key)
+		}
+	}
+}
+
+// dispatchOutbound handles SplitMessageMarker centrally — every channel
+// adapter sees one logical message per SendMessage call, regardless of
+// whether the agent decided to split.
+//
+//   AllowSplit && marker present  → split text by marker, send sequentially
+//                                   (media + buttons attach to the LAST
+//                                   chunk so they only appear once)
+//   AllowSplit && no marker       → send as-is
+//   !AllowSplit && marker present → collapse marker to newline first so the
+//                                   raw `<|split|>` token doesn't surface
+//                                   as literal text on stale system-prompt
+//                                   caches
+//   !AllowSplit && no marker      → send as-is
+//
+// Sequential dispatch is guaranteed by routeOutbound's single-goroutine
+// design — chunks arrive in order at the adapter.
+func (m *Manager) dispatchOutbound(ch Channel, msg bus.OutboundMessage, key string) {
+	hasMarker := strings.Contains(msg.Text, SplitMessageMarker)
+	if !hasMarker {
+		if err := ch.SendMessage(msg); err != nil {
+			slog.Error("send message failed", "key", key, "error", err)
+		}
+		return
+	}
+	if !msg.AllowSplit {
+		msg.Text = strings.ReplaceAll(msg.Text, SplitMessageMarker, "\n")
+		if err := ch.SendMessage(msg); err != nil {
+			slog.Error("send message failed", "key", key, "error", err)
+		}
+		return
+	}
+	chunks := SplitOutboundText(msg.Text)
+	for i, chunk := range chunks {
+		out := msg
+		out.Text = chunk
+		// Attach media + buttons + ReplyToMsgID + EditMsgID only to the
+		// LAST chunk. Otherwise a single attachment would either ride
+		// the first bubble (looks weird with text trailing it) or get
+		// re-sent on every chunk (definitely wrong).
+		if i < len(chunks)-1 {
+			out.MediaItems = nil
+			out.MediaPaths = nil
+			out.Buttons = nil
+			out.ReplyToMsgID = ""
+			out.EditMsgID = ""
+		}
+		if err := ch.SendMessage(out); err != nil {
+			slog.Error("send message failed", "key", key, "chunk", i, "error", err)
+			// Stop on first error — sending the remaining bubbles
+			// after a failure could look like a duplicate to the
+			// chatter once the platform recovers.
+			return
 		}
 	}
 }

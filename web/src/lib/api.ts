@@ -95,6 +95,31 @@ export interface AgentDetail {
   temperature?: number;
   maxToolIterations?: number;
   thinking?: string;
+  // promptMode is what the backend currently has saved on the
+  // agents.defaults row. Empty / undefined = no override (runtime
+  // falls back to "agent"). See AgentUpdatePayload.promptMode for
+  // the allowed values. The built-in tool set the LLM sees is a
+  // function of this mode — there's no separate allowlist field by
+  // design. Extend tools via Plugin or MCP, not per-agent toggles.
+  promptMode?: string;
+  // splitReplies is the per-agent multi-bubble override. Applies to
+  // every IM channel uniformly — when on, the agent may emit the
+  // SplitMessageMarker between bubbles and the dispatcher honors it.
+  // null / undefined / false-ish = single bubble per reply (default).
+  splitReplies?: boolean | null;
+  // autoPersist is the per-agent "remember the chatter automatically"
+  // toggle. When on, every N turns the runtime fires an LLM-driven
+  // distill pass that appends extracted facts to USER.md (chatter
+  // profile) and MEMORY.md (long-term notes). Mainly needed in chatbot
+  // mode — that mode's curated tool allowlist excludes write_file, so
+  // this is the only path the agent has to remember a chatter across
+  // sessions.
+  autoPersist?: boolean | null;
+  // plugins is the per-agent hook-plugin enable overlay: pluginID →
+  // enabled. Missing keys fall back to the system-wide enable state
+  // (visible via /api/plugins). null/undefined means "no per-agent
+  // override at all".
+  plugins?: Record<string, boolean> | null;
   soul?: string;
   skills?: string[];
   tools?: string[];
@@ -203,7 +228,13 @@ export interface ConfigResponse {
   sandbox?: {
     enabled: boolean;
     backend?: string;
+    // Legacy single-slot image field; read-only fallback. The per-
+    // backend fields below are authoritative when set so switching
+    // backends in the UI preserves each backend's last-entered value.
     image?: string;
+    dockerImage?: string;
+    e2bTemplate?: string;
+    boxliteSnapshot?: string;
     e2bKey?: string;
     boxliteUrl?: string;
     boxliteClientId?: string;
@@ -1156,6 +1187,32 @@ export async function getAgentStatus(
   return { status: res.status, agent: (data?.agent as AgentDetail) || null };
 }
 
+// AgentRegisteredTool is what /api/agents/{id}/tools/registered returns
+// per tool: name (the canonical identifier the allowlist uses),
+// description (one-liner for the picker UI), and source (where the tool
+// came from: builtin / mcp / plugin). Stable order is guaranteed by the
+// backend so dashboard renders are deterministic.
+export interface AgentRegisteredTool {
+  name: string;
+  description: string;
+  source: "builtin" | "mcp" | "plugin" | string;
+}
+
+// listAgentRegisteredTools fetches the live tool registry for an agent.
+// Drives the Tools tab's allowlist checkbox picker so operators can
+// click rather than type names from memory. Returns null on auth failure
+// or when the agent isn't loaded (the backend 404s in that case).
+export async function listAgentRegisteredTools(
+  id: string,
+): Promise<AgentRegisteredTool[] | null> {
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(id)}/tools/registered`,
+  );
+  if (!res.ok) return null;
+  const data = await res.json();
+  return (data?.tools as AgentRegisteredTool[]) || [];
+}
+
 export async function createAgent(agent: Partial<AgentDetail>) {
   const res = await apiFetch("/api/agents", {
     method: "POST",
@@ -1189,6 +1246,30 @@ export interface AgentUpdatePayload {
   // Toggle whether chatters using this agent inherit the owner's
   // model + provider configuration. Omit to leave unchanged.
   shareModelConfig?: boolean;
+  // PromptMode selects how heavily the framework system prompt
+  // participates: "agent" (full, default), "chatbot" (slim — drops
+  // task-delegation / tool-use discipline / workspace-update so
+  // companion / role-play personas stay in character), "customize"
+  // (only the date anchor + bootstrap files — author writes the whole
+  // system prompt themselves via SOUL.md / IDENTITY.md). Pass "" to clear.
+  promptMode?: "" | "agent" | "chatbot" | "customize";
+  // Multi-bubble per-agent override (applies to all IM channels).
+  // Tri-state: omit to leave the saved value alone; pass true/false to
+  // set explicit; pass `splitRepliesReset: true` to delete the override
+  // so default behavior (single bubble) applies.
+  splitReplies?: boolean;
+  splitRepliesReset?: boolean;
+  // Auto-persist per-agent override. Same tri-state semantics as
+  // splitReplies. When true, every N turns the runtime runs a small
+  // LLM call that distills the conversation into USER.md (chatter
+  // profile) and MEMORY.md (long-term facts) — see Agent.autoPersist.
+  autoPersist?: boolean;
+  autoPersistReset?: boolean;
+  // Per-agent plugin enable overrides (patch semantics — keys not in
+  // the map are preserved). Pass pluginsReset:true to clear ALL
+  // per-agent overrides and fall back to system-wide enable state.
+  plugins?: Record<string, boolean>;
+  pluginsReset?: boolean;
 }
 
 export async function updateAgent(id: string, agent: AgentUpdatePayload) {
@@ -1198,6 +1279,26 @@ export async function updateAgent(id: string, agent: AgentUpdatePayload) {
     body: JSON.stringify(agent),
   });
   return res.json();
+}
+
+// HookPlugin is the metadata shape returned by /api/plugins/hook —
+// read-only listing of hook-type plugins available on this install.
+// Operators pick which to enable per-agent on the Context page.
+export interface HookPlugin {
+  id: string;
+  name?: string;
+  description?: string;
+  version?: string;
+}
+
+export async function listHookPlugins(): Promise<HookPlugin[]> {
+  try {
+    const res = await apiFetch("/api/plugins/hook");
+    if (!res.ok) return [];
+    return (await res.json()) as HookPlugin[];
+  } catch {
+    return [];
+  }
 }
 
 export interface AgentFileConfig {

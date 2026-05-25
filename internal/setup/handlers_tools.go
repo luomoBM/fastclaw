@@ -39,6 +39,10 @@ var builtinCatalog = []categoryCatalog{
 			{Name: "exa", Label: "Exa", NeedsKey: true, Models: []string{"auto", "neural", "keyword"}},
 			{Name: "brave", Label: "Brave Search", NeedsKey: true, Models: []string{"web"}},
 			{Name: "searxng", Label: "SearxNG (self-hosted)", NeedsURL: true, Models: []string{"default"}},
+			// "none" is a sentinel: when picked, web_search is not exposed
+			// to the model at all. There's no external backend — the model
+			// uses its own native search if it has one.
+			{Name: "none", Label: "None (rely on model's native search)", Models: []string{"default"}},
 		},
 	},
 	{
@@ -53,6 +57,33 @@ var builtinCatalog = []categoryCatalog{
 			{Name: "direct", Label: "Direct (built-in)", Models: []string{"default"}},
 			{Name: "jina", Label: "Jina Reader", NeedsKey: true, Models: []string{"default"}},
 			{Name: "firecrawl", Label: "Firecrawl", NeedsKey: true, Models: []string{"default"}},
+		},
+	},
+	{
+		Name:  "image_gen",
+		Label: "Image Generation",
+		Providers: []providerCatalog{
+			{Name: "openai", Label: "OpenAI", NeedsKey: true, Models: []string{"gpt-image-1", "dall-e-3"}},
+			{Name: "replicate", Label: "Replicate", NeedsKey: true, Models: []string{"flux-schnell", "flux-dev", "flux-pro", "sdxl", "ideogram"}},
+			{Name: "fal", Label: "Fal", NeedsKey: true, Models: []string{"flux-dev", "flux-schnell", "flux-pro"}},
+			// "none" is a sentinel: when picked, image_gen is not exposed
+			// to the model at all. The model falls back to its own native
+			// image-generation capability if it has one.
+			{Name: "none", Label: "None (rely on model's native image gen)", Models: []string{"default"}},
+		},
+	},
+	{
+		Name:  "tts",
+		Label: "Text-to-Speech",
+		Providers: []providerCatalog{
+			{Name: "openai", Label: "OpenAI", NeedsKey: true, Models: []string{"tts-1", "tts-1-hd"}},
+			{Name: "elevenlabs", Label: "ElevenLabs", NeedsKey: true, Models: []string{"eleven_multilingual_v2", "eleven_turbo_v2_5", "eleven_flash_v2_5"}},
+			{Name: "fish", Label: "Fish Audio", NeedsKey: true, Models: []string{"s1", "speech-1.5", "speech-1.6"}},
+			{Name: "minimax", Label: "MiniMax", NeedsKey: true, Models: []string{"speech-02-hd", "speech-02-turbo"}},
+			// "none" is a sentinel: when picked, tts is not exposed to the
+			// model at all. The model falls back to its own native audio
+			// capability if it has one.
+			{Name: "none", Label: "None (rely on model's native audio)", Models: []string{"default"}},
 		},
 	},
 }

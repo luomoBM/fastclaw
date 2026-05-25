@@ -30,7 +30,6 @@ import {
   Plus,
   Trash2,
   Send,
-  MessageSquare,
   CheckCircle2,
   ExternalLink,
   Loader2,

@@ -90,6 +90,49 @@ func TestRecoverToolCallsFromContent(t *testing.T) {
 			name:       "tag-shaped but no name attribute — skip",
 			in:         `<invoke><parameter name="x">y</parameter></invoke>`,
 			wantCalls:  0,
+			wantResLen: -1, // residual is unchanged input; not asserting length
+		},
+		{
+			// The shape from a real DeepSeek/Qwen detokenization leak:
+			// special tokens like `<｜tool_calls｜>` get rendered as ASCII
+			// with extra spacing. Recovery must normalize them first.
+			name: "leaked DSML-pipe tokens — recovered",
+			in: `< | | DSML | | tool_calls>` +
+				`< | | DSML | | invoke name="exec">` +
+				`<parameter name="command" string="true">which node &amp;&amp; which npx 2&gt;&amp;1</parameter>` +
+				`<parameter name="timeout" string="false">10</parameter>` +
+				`</ | | DSML | | invoke>` +
+				`</ | | DSML | | tool_calls>`,
+			wantCalls:  1,
+			wantName:   "exec",
+			wantArgs:   map[string]any{"command": "which node &amp;&amp; which npx 2&gt;&amp;1", "timeout": float64(10)},
+			wantResLen: 0,
+		},
+		{
+			name: "leaked fullwidth-pipe tokens — recovered",
+			in: `<｜tool_calls｜>` +
+				`<｜invoke name="read_file"｜>` +
+				`<parameter name="path" string="true">IDENTITY.md</parameter>` +
+				`<｜/invoke｜>` +
+				`<｜/tool_calls｜>`,
+			wantCalls:  1,
+			wantName:   "read_file",
+			wantArgs:   map[string]any{"path": "IDENTITY.md"},
+			wantResLen: 0,
+		},
+		{
+			// No recoverable invoke inside, but leaked wrappers must still
+			// be scrubbed so the UI doesn't render `< | | DSML | …>` text.
+			name:       "leaked wrappers without invoke — scrubbed to empty",
+			in:         `< | | DSML | | tool_calls></ | | DSML | | tool_calls>`,
+			wantCalls:  0,
+			wantResLen: 0,
+		},
+		{
+			name:       "leaked wrappers with preamble — preamble preserved",
+			in:         `Let me check. <|tool_calls|></|tool_calls|>`,
+			wantCalls:  0,
+			wantResLen: len("Let me check."),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -98,7 +141,15 @@ func TestRecoverToolCallsFromContent(t *testing.T) {
 				t.Fatalf("got %d calls, want %d (calls=%+v)", len(calls), tc.wantCalls, calls)
 			}
 			if tc.wantCalls == 0 {
-				if residual != tc.in {
+				// When the test pins a residual length, the case is
+				// asserting on the scrub path (leaked-token noise was
+				// removed even though no calls were recovered). Otherwise
+				// the no-recovery path must leave content untouched.
+				if tc.wantResLen >= 0 {
+					if len(residual) != tc.wantResLen {
+						t.Fatalf("0-call scrub: residual length = %d (%q), want %d", len(residual), residual, tc.wantResLen)
+					}
+				} else if residual != tc.in {
 					t.Fatalf("no-recovery path should leave content untouched: got %q, want %q", residual, tc.in)
 				}
 				return

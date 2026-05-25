@@ -145,6 +145,13 @@ func runGateway(port int) error {
 		return fmt.Errorf("create gateway: %w", err)
 	}
 
+	// Remove credential-bearing env vars from the process environment
+	// now that boot config has been read. Closes the /proc/<pid>/environ
+	// path that a shell-having LLM could otherwise use to recover the
+	// daemon's storage DSN and object-store keys. See
+	// config.ScrubBootSecrets for the trade-off note.
+	config.ScrubBootSecrets()
+
 	authResolver, err := auth.NewResolver(gw.Store())
 	if err != nil {
 		return fmt.Errorf("create auth resolver: %w", err)

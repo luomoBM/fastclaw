@@ -19,6 +19,9 @@ const Category = "tts"
 func RegisterAll(r *toolproviders.Registry) {
 	r.Register(&OpenAI{})
 	r.Register(&MiniMax{})
+	r.Register(&ElevenLabs{})
+	r.Register(&Fish{})
+	r.Register(&None{})
 }
 
 type args struct {

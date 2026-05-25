@@ -2,11 +2,13 @@ package plugin
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,6 +16,23 @@ import (
 )
 
 const shutdownTimeout = 5 * time.Second
+
+// defaultChatSendDelay is the small async delay applied before pushing
+// a plugin's chat.send into bus.Outbound — see the comment at the
+// chat.send case in handleNotification for the ordering rationale.
+const defaultChatSendDelay = 50 * time.Millisecond
+
+func pluginChatSendDelay() time.Duration {
+	v := os.Getenv("FASTCLAW_PLUGIN_CHAT_SEND_DELAY_MS")
+	if v == "" {
+		return defaultChatSendDelay
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil || ms < 0 {
+		return defaultChatSendDelay
+	}
+	return time.Duration(ms) * time.Millisecond
+}
 
 // Manifest is the plugin.json descriptor.
 type Manifest struct {
@@ -353,6 +372,68 @@ func (m *Manager) handleNotification(pluginID string, n Notification) {
 		}
 
 		slog.Info("plugin: inbound message", "plugin", pluginID, "channel", channel, "chat_id", params.ChatID)
+
+	case MethodChatSend:
+		var params ChatSendParams
+		if err := json.Unmarshal(n.Params, &params); err != nil {
+			slog.Warn("plugin: invalid chat.send", "plugin", pluginID, "error", err)
+			return
+		}
+		if params.Channel == "" || params.ChatID == "" {
+			slog.Warn("plugin: chat.send missing channel/chatId", "plugin", pluginID)
+			return
+		}
+		items := make([]bus.MediaItem, 0, len(params.Media))
+		for _, m := range params.Media {
+			data, err := base64.StdEncoding.DecodeString(m.BytesB64)
+			if err != nil {
+				slog.Warn("plugin: chat.send media base64 decode failed",
+					"plugin", pluginID, "filename", m.Filename, "error", err)
+				continue
+			}
+			items = append(items, bus.MediaItem{
+				Filename:    m.Filename,
+				ContentType: m.ContentType,
+				Bytes:       data,
+			})
+		}
+		out := bus.OutboundMessage{
+			Channel:    params.Channel,
+			AccountID:  params.AccountID,
+			AgentID:    params.AgentID,
+			ChatID:     params.ChatID,
+			Text:       params.Text,
+			MediaItems: items,
+		}
+		// Ordering vs the agent's main reply: PostTurn hook fires
+		// while the agent loop is still finishing, so when a plugin
+		// reacts to PostTurn and calls chat.send right away, the
+		// gateway hasn't yet pushed the agent's reply onto
+		// bus.Outbound. Without the delay below, a fast plugin can
+		// win the race and the chatter sees the plugin's follow-up
+		// bubble BEFORE the agent's actual reply.
+		//
+		// The gateway's bus.Outbound enqueue is sub-millisecond once
+		// HandleMessage returns. A short async delay here is enough
+		// to let it win in practice. Async so the plugin's stdout
+		// reader isn't blocked. Tunable via FASTCLAW_PLUGIN_CHAT_SEND_DELAY_MS;
+		// set 0 to disable the delay entirely.
+		delay := pluginChatSendDelay()
+		go func() {
+			if delay > 0 {
+				time.Sleep(delay)
+			}
+			select {
+			case m.bus.Outbound <- out:
+				slog.Info("plugin: chat.send dispatched",
+					"plugin", pluginID, "channel", out.Channel,
+					"chat_id", out.ChatID, "text_len", len(out.Text),
+					"media_count", len(out.MediaItems))
+			default:
+				slog.Warn("plugin: chat.send dropped — bus.Outbound full",
+					"plugin", pluginID, "channel", out.Channel, "chat_id", out.ChatID)
+			}
+		}()
 
 	default:
 		slog.Debug("plugin: unhandled notification", "plugin", pluginID, "method", n.Method)

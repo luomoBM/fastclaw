@@ -54,6 +54,13 @@ const (
 	MethodHookRegister   = "hook.register"
 	MethodHookFire       = "hook.fire"
 	MethodMessageInbound = "message.inbound"
+	// MethodChatSend: plugin → fastclaw notification that delivers a
+	// new outbound message to a specific chat. Used by hook plugins
+	// (post-turn TTS, translation, etc.) to add follow-up content to
+	// the same chat the agent just replied to. Unlike message.inbound
+	// (which spawns another agent turn), this skips the agent and goes
+	// straight to the bus outbound path.
+	MethodChatSend = "chat.send"
 )
 
 // InitializeParams is sent with the initialize method.
@@ -149,9 +156,17 @@ type HookRegisterResult struct {
 }
 
 // HookFireParams is sent with hook.fire.
+//
+// Channel / AccountID give the plugin the bus routing triple needed to
+// echo a follow-up message back to the same chat via chat.send. They
+// were added when the chat.send method shipped — older plugins that
+// only read AgentName / ChatID / UserID keep working since the new
+// fields are additive.
 type HookFireParams struct {
 	Point      string             `json:"point"`
 	AgentName  string             `json:"agentName"`
+	Channel    string             `json:"channel,omitempty"`
+	AccountID  string             `json:"accountId,omitempty"`
 	ChatID     string             `json:"chatId"`
 	UserID     string             `json:"userId,omitempty"`
 	Messages   []HookMessage      `json:"messages,omitempty"`
@@ -159,6 +174,37 @@ type HookFireParams struct {
 	ToolName   string             `json:"toolName,omitempty"`
 	ToolArgs   string             `json:"toolArgs,omitempty"`
 	ToolResult string             `json:"toolResult,omitempty"`
+}
+
+// ChatSendParams: plugin → fastclaw push of an outbound message to a
+// specific chat. The plugin manager constructs a bus.OutboundMessage
+// from these fields and pushes it onto bus.Outbound — same path a
+// channel adapter or the agent loop would use. Distinct from
+// message.inbound (which simulates a new user inbound and triggers
+// an agent turn): chat.send delivers TO the user without invoking
+// the agent again.
+//
+// Used by PostTurn hook plugins to add follow-up content (audio,
+// translations, summaries, etc.) to the same chat the agent just
+// replied to. Plugin echoes the Channel / AccountID / ChatID it
+// received in the prior hook.fire's HookFireParams.
+type ChatSendParams struct {
+	Channel   string          `json:"channel"`
+	AccountID string          `json:"accountId,omitempty"`
+	ChatID    string          `json:"chatId"`
+	AgentID   string          `json:"agentId,omitempty"` // used by web SSE routing
+	Text      string          `json:"text,omitempty"`
+	Media     []ChatSendMedia `json:"media,omitempty"`
+}
+
+// ChatSendMedia is one attachment in a ChatSendParams. BytesB64 is the
+// file's bytes base64-encoded (so JSON-RPC can ship binary over
+// stdin/stdout). ContentType is optional — the channel adapter will
+// sniff from the filename / bytes when empty.
+type ChatSendMedia struct {
+	Filename    string `json:"filename"`
+	ContentType string `json:"contentType,omitempty"`
+	BytesB64    string `json:"bytesB64"`
 }
 
 // HookMessage is a simplified message for hook communication.

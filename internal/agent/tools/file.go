@@ -483,6 +483,12 @@ func makeReadFile(r *Registry) ToolFunc {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
 
+		// Identity-file confidentiality gate. A chatter who asks "show me
+		// your SOUL.md" must not get the verbatim persona spec back.
+		if r.identityFileBlocked(args.Path) {
+			return IdentityFileRefusal, nil
+		}
+
 		// Mirror makeWriteFile's routing: userRoot-destined paths go to the
 		// workspace store when one is configured.
 		if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(args.Path) {
@@ -568,6 +574,12 @@ func makeWriteFile(r *Registry) ToolFunc {
 			return "", fmt.Errorf("write_file: %w", err)
 		}
 
+		// Identity-file confidentiality gate — also blocks a chatter
+		// from REWRITING the agent's persona via prompt injection.
+		if r.identityFileBlocked(args.Path) {
+			return IdentityFileRefusal, nil
+		}
+
 		// When a workspace store is configured, route userRoot-destined
 		// writes through it. Identity files (systemRoot) still hit the
 		// filesystem because the memory store already covers their
@@ -649,6 +661,11 @@ func makeEditFile(r *Registry) ToolFunc {
 		}
 		if err := validateFileTargetPath(args.Path); err != nil {
 			return "", fmt.Errorf("edit_file: %w", err)
+		}
+
+		// Identity-file confidentiality gate.
+		if r.identityFileBlocked(args.Path) {
+			return IdentityFileRefusal, nil
 		}
 
 		// Mirror makeWriteFile's routing precedence: workspace store first
@@ -861,6 +878,12 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
 			return "", fmt.Errorf("parse args: %w", err)
 		}
+		// Identity-file confidentiality gate — same as the host path.
+		// Runs BEFORE the systemFileStore lookup so a chatter never
+		// reaches the DB row at all.
+		if r.identityFileBlocked(args.Path) {
+			return IdentityFileRefusal, nil
+		}
 		// Identity files (SOUL.md, IDENTITY.md, …) are routed by basename
 		// (lenient) instead of the strict isSingleSegmentSystemFile that
 		// routeFor uses. Need to be checked separately for reads so an
@@ -953,6 +976,9 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		}
 		if err := validateFileTargetPath(args.Path); err != nil {
 			return "", fmt.Errorf("write_file: %w", err)
+		}
+		if r.identityFileBlocked(args.Path) {
+			return IdentityFileRefusal, nil
 		}
 		switch r.routeFor(args.Path, OpWrite) {
 		case RouteSystemStore:
@@ -1087,6 +1113,9 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		}
 		if err := validateFileTargetPath(args.Path); err != nil {
 			return "", fmt.Errorf("edit_file: %w", err)
+		}
+		if r.identityFileBlocked(args.Path) {
+			return IdentityFileRefusal, nil
 		}
 
 		// editSandboxRMW is the read-modify-write fallback through the

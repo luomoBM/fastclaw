@@ -227,6 +227,11 @@ func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb
 		// Same dataStore guard as cron because both features need the
 		// relational store; agents without one degrade quietly.
 		ag.WireGoals(m.opts.dataStore)
+		// Stamp on Agent too so runtime checks (e.g. the autoPersist
+		// cadence gate that counts session_messages instead of relying
+		// on an in-memory counter that restart-clears) can hit the
+		// store directly without re-plumbing through Manager.
+		ag.dataStore = m.opts.dataStore
 	}
 	// Stamp agentID even when no workspaceStore is wired (single-user
 	// local mode), so usage metering can record per-agent rollups.

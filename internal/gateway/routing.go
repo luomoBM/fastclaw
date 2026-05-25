@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
@@ -47,13 +48,32 @@ func (g *Gateway) processInbound(ctx context.Context) {
 			}
 			msg.OwnerUserID = ownerID
 
-			if msg.PeerKind != "group" {
-				g.routeDM(ctx, msg)
+			// Dedup runs BEFORE chatter resolution so a duplicate
+			// inbound doesn't pay the EnsureAppUser cost (and doesn't
+			// spuriously bump that user's last-seen if we ever add
+			// such tracking). Covers both DM and group — see
+			// isDuplicate for the per-kind keying.
+			if g.isDuplicate(msg) {
+				slog.Info("dropping duplicate inbound",
+					"channel", msg.Channel, "chat_id", msg.ChatID,
+					"message_id", msg.MessageID, "peer_kind", msg.PeerKind,
+					"account", msg.AccountID)
 				continue
 			}
-			if g.isDuplicate(msg) {
-				slog.Info("dropping duplicate group message",
-					"channel", msg.Channel, "chat_id", msg.ChatID, "message_id", msg.MessageID)
+
+			// Normalize msg.UserID into a fastclaw `u_xxx` id. IM channels
+			// (wechat, telegram, line, discord, feishu, slack) emit the raw
+			// platform-side identifier, which doesn't match the key that
+			// per-chatter data (USER.md, MEMORY.md, per-user skills) is
+			// stored under — so without translation the agent ends up with
+			// an empty chatter profile every turn. See resolveChatter for
+			// the lazy-mint semantics.
+			if chatterID := g.resolveChatter(ctx, ownerID, msg); chatterID != "" {
+				msg.UserID = chatterID
+			}
+
+			if msg.PeerKind != "group" {
+				g.routeDM(ctx, msg)
 				continue
 			}
 			slog.Info("group message accepted",
@@ -101,6 +121,63 @@ func (g *Gateway) resolveChannelOwner(ctx context.Context, msg bus.InboundMessag
 		}
 	}
 	return ""
+}
+
+// resolveChatter normalizes msg.UserID into a fastclaw `u_xxx` id. IM
+// channels deliver the platform-side identifier (wechat openid, telegram
+// numeric id, …) and the agent loop then keys per-chatter files (USER.md,
+// MEMORY.md, per-user skills) under that raw string — which never matches
+// the u_xxx rows the dashboard wrote. Translating once at the routing seam
+// keeps every downstream consumer of msg.UserID aligned without having to
+// teach each one about the IM-side namespace.
+//
+// Resolution:
+//   - empty UserID → "" (caller leaves the slot empty; chatterUserID will
+//     fall back to the agent owner).
+//   - already `u_`-prefixed → assume it's already canonical, leave alone.
+//   - channel owner is an app_user (has apikey_id) → lazy-mint an
+//     app_user keyed by (apikey_id, "<channel>:<msg.UserID>") so every
+//     distinct IM sender gets a stable u_xxx of their own. Channel name
+//     is prefixed so a numeric id colliding across two channel types
+//     (telegram chat 123, line user 123) can't merge into one row.
+//   - channel owner is a regular user (no apikey_id) → treat as a single-
+//     user dogfood/personal bot and pin the chatter to the owner. This
+//     preserves the simple "I registered my own wechat to my own agent"
+//     flow without forcing the owner to start over with a fresh empty
+//     USER.md every conversation.
+//
+// Returns "" when the original msg.UserID should be kept unchanged
+// (empty input, already canonical, or any error path) — the caller treats
+// "" as "no rewrite".
+func (g *Gateway) resolveChatter(ctx context.Context, ownerID string, msg bus.InboundMessage) string {
+	if msg.UserID == "" {
+		return ""
+	}
+	if strings.HasPrefix(msg.UserID, "u_") {
+		return ""
+	}
+	if g.store == nil || g.accounts == nil {
+		return ""
+	}
+	owner, err := g.store.GetUser(ctx, ownerID)
+	if err != nil {
+		slog.Warn("resolveChatter: owner lookup failed",
+			"owner", ownerID, "channel", msg.Channel, "error", err)
+		return ""
+	}
+	if owner.APIKeyID == "" {
+		// Personal / dogfood install — every IM sender is treated as the
+		// channel owner so the operator's own USER.md applies.
+		return ownerID
+	}
+	extID := msg.Channel + ":" + msg.UserID
+	acc, err := g.accounts.EnsureAppUser(ctx, owner.APIKeyID, extID, "")
+	if err != nil {
+		slog.Warn("resolveChatter: EnsureAppUser failed",
+			"apikey", owner.APIKeyID, "ext", extID, "error", err)
+		return ""
+	}
+	return acc.ID
 }
 
 // trySteer diverts msg into target's currently in-flight turn instead of

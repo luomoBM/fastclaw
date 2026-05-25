@@ -144,6 +144,58 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateTokenUsageAddProvider(ctx); err != nil {
 		return fmt.Errorf("migrate token_usage_daily.provider: %w", err)
 	}
+	if err := d.migrateSessionsAddChatterUserID(ctx); err != nil {
+		return fmt.Errorf("migrate sessions chatter_user_id: %w", err)
+	}
+	return nil
+}
+
+// migrateSessionsAddChatterUserID retrofits a chatter_user_id column
+// onto sessions / session_messages / session_events. user_id continues
+// to mean "UserSpace owner" (channel owner) so admin views that list
+// "all sessions on my bots" keep working unchanged; chatter_user_id
+// holds the actual conversation participant, which differs from
+// user_id whenever an IM channel routes per-sender app_users into a
+// single channel-owner UserSpace.
+//
+// Empty default + partial indexes preserve existing query plans for
+// rows written before this column existed. Readers that want the
+// chatter should COALESCE(NULLIF(chatter_user_id,''), user_id) — the
+// fallback is exactly right for the web channel (user_id was already
+// the chatter there) and matches the pre-fix behavior on IM (where
+// every chatter was mis-attributed to the channel owner anyway).
+func (d *DBStore) migrateSessionsAddChatterUserID(ctx context.Context) error {
+	for _, t := range []string{"sessions", "session_messages", "session_events"} {
+		exists, err := d.tableExists(ctx, t)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		has, err := d.tableHasColumn(ctx, t, "chatter_user_id")
+		if err != nil {
+			return err
+		}
+		if !has {
+			if _, err := d.db.ExecContext(ctx,
+				fmt.Sprintf(`ALTER TABLE %s ADD COLUMN chatter_user_id TEXT NOT NULL DEFAULT ''`, t)); err != nil {
+				return fmt.Errorf("add column on %s: %w", t, err)
+			}
+		}
+	}
+	// Partial indexes — only rows with a non-empty chatter populate the
+	// index, so legacy rows don't bloat it.
+	indexSQL := []string{
+		`CREATE INDEX IF NOT EXISTS idx_sessions_by_chatter ON sessions (chatter_user_id, agent_id, updated_at DESC) WHERE chatter_user_id <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_session_messages_by_chatter ON session_messages (chatter_user_id, agent_id, session_key, seq) WHERE chatter_user_id <> ''`,
+		`CREATE INDEX IF NOT EXISTS idx_session_events_by_chatter ON session_events (chatter_user_id, agent_id, session_key, seq) WHERE chatter_user_id <> ''`,
+	}
+	for _, stmt := range indexSQL {
+		if _, err := d.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create chatter index: %w (sql: %s)", err, stmt)
+		}
+	}
 	return nil
 }
 
@@ -1192,6 +1244,15 @@ func (d *DBStore) migrationSQL() []string {
 			messages TEXT NOT NULL DEFAULT '[]',
 			message_count INTEGER NOT NULL DEFAULT 0,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			-- chatter_user_id is the actual conversation participant. For
+			-- web / dashboard chats it equals user_id (= the logged-in
+			-- user). For IM channels with per-sender app_users it's the
+			-- minted chatter row; user_id remains the channel-owner /
+			-- UserSpace owner for backward-compat with admin views that
+			-- list "all sessions on my bots". Empty on rows written
+			-- before this column existed — readers should COALESCE to
+			-- user_id in that case.
+			chatter_user_id TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (user_id, agent_id, session_key)
 		)`,
 		// Index creation is moved to migrateSessionsAddChannelTriple so
@@ -1226,6 +1287,10 @@ func (d *DBStore) migrationSQL() []string {
 			-- synthetic prompts out of user-visible / searchable views.
 			origin TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			-- chatter_user_id mirrors sessions.chatter_user_id — see that
+			-- comment for semantics. Stored per row so a per-chatter
+			-- query doesn't have to join through sessions.
+			chatter_user_id TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (user_id, agent_id, session_key, seq)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_messages_lookup ON session_messages (user_id, agent_id, session_key, seq)`,
@@ -1246,6 +1311,9 @@ func (d *DBStore) migrationSQL() []string {
 				type TEXT NOT NULL,
 				data TEXT NOT NULL DEFAULT '',
 				created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+				-- chatter_user_id mirrors sessions.chatter_user_id — see
+				-- that comment for semantics.
+				chatter_user_id TEXT NOT NULL DEFAULT '',
 				PRIMARY KEY (user_id, agent_id, session_key, seq)
 			)`,
 		`CREATE INDEX IF NOT EXISTS idx_session_events_lookup ON session_events (user_id, agent_id, session_key, seq)`,
@@ -1925,23 +1993,29 @@ func (d *DBStore) SaveSession(ctx context.Context, userID, agentID, sessionKey s
 	msgsData, _ := json.Marshal(session.Messages)
 	now := time.Now().UTC()
 	count := len(session.Messages)
+	// Per-turn chatter (= the actual conversation participant) is plumbed
+	// via ctx so this signature stays backward compatible. Empty when no
+	// upstream caller tagged ctx — readers fall back to user_id.
+	chatterID := ChatterUserIDFromContext(ctx)
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
-			`INSERT INTO sessions (user_id, agent_id, session_key, channel, account_id, chat_id, project_id, messages, message_count, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			`INSERT INTO sessions (user_id, agent_id, session_key, channel, account_id, chat_id, project_id, messages, message_count, updated_at, chatter_user_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 				ON CONFLICT (user_id, agent_id, session_key) DO UPDATE
-				SET messages=$8, message_count=$9, updated_at=$10`,
+				SET messages=$8, message_count=$9, updated_at=$10,
+				    chatter_user_id = CASE WHEN $11 <> '' THEN $11 ELSE sessions.chatter_user_id END`,
 			userID, agentID, sessionKey, session.Channel, session.AccountID, session.ChatID, session.ProjectID,
-			string(msgsData), count, now)
+			string(msgsData), count, now, chatterID)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO sessions (user_id, agent_id, session_key, channel, account_id, chat_id, project_id, messages, message_count, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO sessions (user_id, agent_id, session_key, channel, account_id, chat_id, project_id, messages, message_count, updated_at, chatter_user_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (user_id, agent_id, session_key) DO UPDATE SET
-			  messages=excluded.messages, message_count=excluded.message_count, updated_at=excluded.updated_at`,
+			  messages=excluded.messages, message_count=excluded.message_count, updated_at=excluded.updated_at,
+			  chatter_user_id = CASE WHEN excluded.chatter_user_id <> '' THEN excluded.chatter_user_id ELSE sessions.chatter_user_id END`,
 		userID, agentID, sessionKey, session.Channel, session.AccountID, session.ChatID, session.ProjectID,
-		string(msgsData), count, now)
+		string(msgsData), count, now, chatterID)
 	return err
 }
 
@@ -2080,27 +2154,28 @@ func (d *DBStore) AppendSessionMessage(ctx context.Context, userID, agentID, ses
 	if ts.IsZero() {
 		ts = time.Now().UTC()
 	}
+	chatterID := ChatterUserIDFromContext(ctx)
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
 			`INSERT INTO session_messages
-				(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at)
-			SELECT $1, $2, $3, COALESCE(MAX(seq), -1) + 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14
+				(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id)
+			SELECT $1, $2, $3, COALESCE(MAX(seq), -1) + 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
 				FROM session_messages
 				WHERE user_id = $1 AND agent_id = $2 AND session_key = $3`,
 			userID, agentID, sessionKey,
 			msg.Role, msg.Content, string(contentParts), string(toolCalls),
-			msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts)
+			msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts, chatterID)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO session_messages
-			(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at)
-		SELECT ?, ?, ?, COALESCE(MAX(seq), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id)
+		SELECT ?, ?, ?, COALESCE(MAX(seq), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 			FROM session_messages
 			WHERE user_id = ? AND agent_id = ? AND session_key = ?`,
 		userID, agentID, sessionKey,
 		msg.Role, msg.Content, string(contentParts), string(toolCalls),
-		msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts,
+		msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts, chatterID,
 		userID, agentID, sessionKey)
 	return err
 }
@@ -2121,6 +2196,7 @@ func (d *DBStore) AppendSessionEvent(ctx context.Context, userID, agentID, sessi
 	}
 	defer tx.Rollback()
 	var seq int64
+	chatterID := ChatterUserIDFromContext(ctx)
 	if d.dialect == "postgres" {
 		if err := tx.QueryRowContext(ctx,
 			`SELECT COALESCE(MAX(seq), -1) + 1 FROM session_events
@@ -2129,9 +2205,9 @@ func (d *DBStore) AppendSessionEvent(ctx context.Context, userID, agentID, sessi
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO session_events (user_id, agent_id, session_key, seq, type, data, created_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-			userID, agentID, sessionKey, seq, eventType, string(data), time.Now().UTC()); err != nil {
+			`INSERT INTO session_events (user_id, agent_id, session_key, seq, type, data, created_at, chatter_user_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+			userID, agentID, sessionKey, seq, eventType, string(data), time.Now().UTC(), chatterID); err != nil {
 			return 0, err
 		}
 	} else {
@@ -2142,9 +2218,9 @@ func (d *DBStore) AppendSessionEvent(ctx context.Context, userID, agentID, sessi
 			return 0, err
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO session_events (user_id, agent_id, session_key, seq, type, data, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			userID, agentID, sessionKey, seq, eventType, string(data), time.Now().UTC()); err != nil {
+			`INSERT INTO session_events (user_id, agent_id, session_key, seq, type, data, created_at, chatter_user_id)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			userID, agentID, sessionKey, seq, eventType, string(data), time.Now().UTC(), chatterID); err != nil {
 			return 0, err
 		}
 	}
@@ -2247,6 +2323,34 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// CountChatterUserMessages returns the count of user-role messages
+// this chatter has accumulated under the agent across all sessions.
+// Used by the autoPersist cadence gate as a durable counter — see the
+// interface doc on Store for why we don't reuse the in-memory turnCount.
+//
+// Filter is strictly on chatter_user_id (no fallback to user_id). Old
+// rows written before the chatter_user_id column existed have it set
+// to '' and are not counted; those predate per-chatter resolution and
+// folding them in would over-count (they're keyed by channel owner,
+// not the actual chatter). New conversations write chatter_user_id
+// correctly so this is only a concern for sessions migrated from
+// pre-fix daemon runs.
+func (d *DBStore) CountChatterUserMessages(ctx context.Context, agentID, chatterUserID string) (int, error) {
+	if chatterUserID == "" {
+		return 0, nil
+	}
+	var n int
+	err := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT COUNT(*) FROM session_messages
+			WHERE agent_id = %s AND chatter_user_id = %s AND role = 'user'`,
+			d.ph(1), d.ph(2)),
+		agentID, chatterUserID).Scan(&n)
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (d *DBStore) RenameSession(ctx context.Context, userID, agentID, sessionKey, title string) error {

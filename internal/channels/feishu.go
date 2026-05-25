@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -303,7 +304,18 @@ func (l *Feishu) HandleWebhook(body []byte) (responseBody []byte, status int, er
 		if token == "" {
 			token = env.Header.Token
 		}
-		if l.verificationToken != "" && token != l.verificationToken {
+		// Fail closed when no verification token is configured. The
+		// webhook URL is public; without a shared secret to compare
+		// against, anybody who guesses /api/feishu/webhook/<appId>
+		// can drive the bot. Operators must set the verification
+		// token in the Feishu Developer Console *and* paste it into
+		// fastclaw connect dialog. Constant-time compare on the
+		// match to avoid timing leaks on the token.
+		if l.verificationToken == "" {
+			return nil, http.StatusUnauthorized,
+				errors.New("feishu webhook rejected: no verification token configured — set it in the Feishu console and fastclaw connect dialog")
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(l.verificationToken)) != 1 {
 			return nil, http.StatusUnauthorized, errors.New("verification token mismatch")
 		}
 		challenge := env.Challenge
@@ -319,8 +331,17 @@ func (l *Feishu) HandleWebhook(body []byte) (responseBody []byte, status int, er
 		return out, http.StatusOK, nil
 	}
 
-	// Real event. Validate token, then dispatch.
-	if l.verificationToken != "" && env.Header.Token != l.verificationToken {
+	// Real event. Validate token, then dispatch. Same fail-closed
+	// posture as url_verification above: an unset token used to mean
+	// "skip the check", which made the public webhook URL
+	// indistinguishable from "anybody who knows my app_id can post
+	// fabricated user messages here". Constant-time compare to keep
+	// the token out of timing-attack reach.
+	if l.verificationToken == "" {
+		return nil, http.StatusUnauthorized,
+			errors.New("feishu webhook rejected: no verification token configured — set it in the Feishu console and fastclaw connect dialog")
+	}
+	if subtle.ConstantTimeCompare([]byte(env.Header.Token), []byte(l.verificationToken)) != 1 {
 		return nil, http.StatusUnauthorized, errors.New("verification token mismatch")
 	}
 

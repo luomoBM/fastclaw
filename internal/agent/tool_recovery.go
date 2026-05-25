@@ -19,6 +19,12 @@ import (
 // assistant message from the now-recovered fields instead of replaying
 // the bad XML payload back into the model's context.
 //
+// Even when no calls are recoverable, if recoverToolCallsFromContent
+// scrubbed leaked special-token noise (DeepSeek/Qwen `<｜…｜>` style
+// delimiters that detokenize as visible `<| … |>` / `< | DSML | … >`
+// garbage), we still replace resp.Content with the scrubbed version so
+// the UI doesn't render the leaked tokens.
+//
 // Logs once at info level with the agent + model + recovered tool names
 // so an operator can see how often the path triggers and for which
 // (model, prompt) combinations — without this signal the recovery
@@ -30,6 +36,12 @@ func (a *Agent) maybeRecoverToolCalls(resp *provider.Response) {
 	}
 	recovered, residual := recoverToolCallsFromContent(resp.Content)
 	if len(recovered) == 0 {
+		if residual != resp.Content {
+			slog.Info("scrubbed_leaked_tool_tokens",
+				"agent", a.name, "model", a.model)
+			resp.Content = residual
+			resp.RawAssistant = nil
+		}
 		return
 	}
 	names := make([]string, 0, len(recovered))
@@ -70,18 +82,36 @@ func (a *Agent) maybeRecoverToolCalls(resp *provider.Response) {
 // then fall through to the normal "model didn't ask for a tool" branch
 // without the recovery path adding any cost.
 func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
-	if !strings.Contains(content, "<invoke") {
+	// Fast path: skip when there's nothing tool-call-shaped at all.
+	// We trigger on either the normal <invoke marker or the leaked
+	// special-token shape (`<|`, `<｜`, `< | DSML`, etc.) so DeepSeek/
+	// Qwen detokenization garbage gets at least scrubbed even when no
+	// real invoke is present to recover.
+	if !strings.Contains(content, "<invoke") && !tagLeakHintRE.MatchString(content) {
 		return nil, content
 	}
-	matches := invokeRE.FindAllStringSubmatchIndex(content, -1)
+	// Collapse leaked-token noise (`<｜tool_calls｜>`, `< | | DSML | |
+	// invoke …>`, closing variants) into plain `<tag …>` shapes the
+	// parser already understands. No-op when the content is clean.
+	normalized := leakedTagRE.ReplaceAllString(content, `<${1}${2}${3}>`)
+
+	matches := invokeRE.FindAllStringSubmatchIndex(normalized, -1)
 	if len(matches) == 0 {
-		return nil, content
+		// Nothing recoverable. If normalization changed the content we
+		// still scrub wrapper tags from the residual so the UI doesn't
+		// render the leaked-token garbage — the model "called" something
+		// we couldn't reconstruct, but at least the chat reads clean.
+		if normalized == content {
+			return nil, content
+		}
+		scrubbed := strings.TrimSpace(stripRE.ReplaceAllString(normalized, ""))
+		return nil, scrubbed
 	}
 	calls := make([]provider.ToolCall, 0, len(matches))
 	for i, m := range matches {
 		// m: [whole-lo, whole-hi, name-lo, name-hi, body-lo, body-hi]
-		name := content[m[2]:m[3]]
-		body := content[m[4]:m[5]]
+		name := normalized[m[2]:m[3]]
+		body := normalized[m[4]:m[5]]
 		args := parseInvokeParameters(body)
 		argJSON, err := json.Marshal(args)
 		if err != nil {
@@ -101,13 +131,17 @@ func recoverToolCallsFromContent(content string) ([]provider.ToolCall, string) {
 		})
 	}
 	if len(calls) == 0 {
-		return nil, content
+		if normalized == content {
+			return nil, content
+		}
+		scrubbed := strings.TrimSpace(stripRE.ReplaceAllString(normalized, ""))
+		return nil, scrubbed
 	}
 	// Strip the recovered XML out of the content. We pull every
 	// <invoke> block, plus the common outer wrappers (tool_calls,
 	// function_calls, DSML) so the residual text is just the model's
 	// human-readable preamble — if any — without dangling tags.
-	stripped := stripRE.ReplaceAllString(content, "")
+	stripped := stripRE.ReplaceAllString(normalized, "")
 	stripped = strings.TrimSpace(stripped)
 	return calls, stripped
 }
@@ -135,6 +169,40 @@ var parameterRE = regexp.MustCompile(`(?s)<parameter\s+name="([^"]+)"(?:\s+strin
 //     wrappers some models add (open AND close tags), so the residual
 //     content doesn't keep a dangling `</tool_calls>`.
 var stripRE = regexp.MustCompile(`(?s)<invoke\s+name="[^"]+"\s*>.*?</invoke>|</?(?:tool_calls|function_calls|DSML)\s*/?>`)
+
+// tagLeakHintRE flags content worth running the leaked-token normalizer
+// on. We match either a normal `<invoke` (the original recovery
+// trigger) or the leaked special-token prefix shape (`<|`, `<｜`,
+// `</|`, `< | …`, etc.) so DeepSeek/Qwen detokenization garbage that
+// doesn't contain a recoverable <invoke> still gets scrubbed.
+var tagLeakHintRE = regexp.MustCompile(`<invoke|<\s*/?\s*[|｜]`)
+
+// leakedTagRE collapses leaked tool-call delimiters back into the plain
+// `<tag …>` / `</tag>` shape the recovery parser understands. Some
+// open-source models (DeepSeek-V3/R1, Qwen variants) use special tokens
+// like `<｜tool_calls｜>` / `<｜DSML｜>` for tool-call framing; when the
+// tokenizer round-trip fails or a downstream layer renders those tokens
+// as text, the user sees shapes like:
+//
+//	<｜tool_calls｜>
+//	<|tool_calls|>
+//	< | | DSML | | invoke name="exec">
+//	</ | | DSML | | invoke>
+//	<｜/invoke｜>
+//
+// The `/` for a closing tag may sit either right after `<` or inside
+// the leaked noise (depending on which side of the pipe the model put
+// it), so we let either noise group consume it.
+//
+// Captures:
+//   $1 = optional `/` for closing tags
+//   $2 = real tag name (invoke / parameter / tool_calls / function_calls / DSML)
+//   $3 = attributes that follow the tag name (e.g. ` name="exec"`)
+//
+// Replacement `<${1}${2}${3}>` reconstructs `<invoke name="exec">` etc.
+// Clean inputs like `<DSML>` / `<invoke name="x">` round-trip unchanged
+// because all the noise groups are zero-width.
+var leakedTagRE = regexp.MustCompile(`<(?:[|｜\s]|DSML)*(/?)(?:[|｜\s]|DSML)*(invoke|parameter|tool_calls|function_calls|DSML)([^>]*?)[|｜\s]*>`)
 
 // parseInvokeParameters walks the parameters inside one invoke body and
 // returns the assembled arguments map. Unknown/malformed parameters are

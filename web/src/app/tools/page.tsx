@@ -145,6 +145,7 @@ export default function ToolsPage() {
           </div>
         ) : activeCat ? (
           <CategoryPanel
+            key={activeCat.name}
             catalog={activeCat}
             providers={providers}
             setProvider={updateProvider}
@@ -279,7 +280,15 @@ function CategoryPanel({
                 </SelectContent>
               </Select>
             </div>
-            {selected && (
+            {selected && selected.name === "none" ? (
+              <p className="text-xs text-muted-foreground pt-1">
+                No external backend. To take effect, make{" "}
+                <code className="font-mono">none/default</code> the only entry
+                in the fallback chain below — the <code className="font-mono">{catalog.name}</code>{" "}
+                tool will then be hidden from agents, and the model will fall
+                back to whatever native search capability it has (or do without).
+              </p>
+            ) : selected && (
               <ProviderFields
                 provider={selected}
                 settings={providers[selected.name] || {}}
@@ -291,7 +300,7 @@ function CategoryPanel({
       )}
 
       {/* Fallback chain editor */}
-      <ChainEditor catalog={catalog} tools={tools} setTools={setTools} />
+      <ChainEditor catalog={catalog} providers={providers} tools={tools} setTools={setTools} />
     </div>
   );
 }
@@ -344,21 +353,22 @@ function ProviderFields({
       {provider.models.length > 1 && (
         <div className="space-y-2">
           <Label>Default model</Label>
-          <Select value={defaultModel} onValueChange={(v) => setOption("model", v || "")}>
-            <SelectTrigger>
-              <SelectValue placeholder="Pick a default model" />
-            </SelectTrigger>
-            <SelectContent>
-              {provider.models.map((m) => (
-                <SelectItem key={m} value={m}>
-                  {m}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <Input
+            value={defaultModel}
+            onChange={(e) => setOption("model", e.target.value)}
+            placeholder={provider.models[0]}
+            className="font-mono text-sm"
+          />
           <p className="text-[10px] text-muted-foreground">
             Used when the chain reference omits a model (e.g. just{" "}
-            <code className="font-mono">{provider.name}</code>).
+            <code className="font-mono">{provider.name}</code>). Suggested:{" "}
+            {provider.models.map((m, i) => (
+              <span key={m}>
+                {i > 0 && ", "}
+                <code className="font-mono">{m}</code>
+              </span>
+            ))}
+            .
           </p>
         </div>
       )}
@@ -460,22 +470,39 @@ function AdvancedOptionsEditor({
 
 function ChainEditor({
   catalog,
+  providers,
   tools,
   setTools,
 }: {
   catalog: ToolCategoryCatalog;
+  providers: Record<string, ToolProviderSettings>;
   tools: ToolCategorySettings;
   setTools: (patch: Partial<ToolCategorySettings>) => void;
 }) {
+  // Each provider contributes at most one chain option, using whichever
+  // model the admin actually configured in the Default model input.
+  // Providers with a single catalog model (e.g. the None sentinel, or
+  // built-ins that don't expose a model knob) are auto-configured with
+  // that one option so they remain pickable without the admin having
+  // to type anything. Providers with multiple models and no typed
+  // default are skipped — keeping the dropdown short and avoiding chain
+  // entries that reference models the admin hasn't actively chosen.
   const refOptions = useMemo(() => {
     const opts: { value: string; label: string }[] = [];
     for (const p of catalog.providers) {
-      for (const m of p.models) {
-        opts.push({ value: `${p.name}/${m}`, label: `${p.label} — ${m}` });
+      const typed = providers[p.name]?.options?.model?.trim();
+      let model = "";
+      if (typed) {
+        model = typed;
+      } else if (p.models.length === 1) {
+        model = p.models[0];
+      } else {
+        continue;
       }
+      opts.push({ value: `${p.name}/${model}`, label: `${p.label} — ${model}` });
     }
     return opts;
-  }, [catalog]);
+  }, [catalog, providers]);
 
   const autoFallback = tools.autoFallback !== false;
   const chain = [tools.primary, ...(tools.fallbacks || [])].filter(Boolean) as string[];

@@ -14,6 +14,7 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 )
 
 // Session holds the message history for one conversation thread within
@@ -38,6 +39,15 @@ type Session struct {
 	// rows it's read back via Manager.Get and late-bound here so the
 	// next save preserves it.
 	projectID string
+	// chatterUserID is the per-turn conversation participant — distinct
+	// from userID (UserSpace owner = channel binder) whenever an IM
+	// channel routes a per-sender app_user into a channel-owner
+	// UserSpace. Set per-turn by the agent loop via SetChatter so the
+	// ctx() embeds it for DBStore session writes (sessions.chatter_user_id /
+	// session_messages.chatter_user_id / session_events.chatter_user_id).
+	// Empty when the caller hasn't bound a chatter — writes leave the
+	// column '' and readers fall back to user_id.
+	chatterUserID string
 
 	// Steering: turnDepth counts in-flight HandleMessage turns for this
 	// session (a counter, not a bool, so re-entrant/overlapping turns
@@ -59,11 +69,33 @@ func (s *Session) SessionKey() string { return s.sessionKey }
 // ctx returns a context tagged with this Session's user so the store layer
 // can scope SQL by user_id. Falls back to context.Background() when no
 // user is set; the store will then default to config.DefaultUserID.
+//
+// Also embeds the per-turn chatter (when set) so DBStore session writes
+// (sessions.chatter_user_id / session_messages.chatter_user_id /
+// session_events.chatter_user_id) can record the actual conversation
+// participant. user_id stays = UserSpace owner; chatter is the
+// additional dimension. Both tags are independent — empty chatter
+// just leaves the column ''.
 func (s *Session) ctx() context.Context {
-	if s.userID == "" {
-		return context.Background()
+	ctx := context.Background()
+	if s.userID != "" {
+		ctx = config.WithUserID(ctx, s.userID)
 	}
-	return config.WithUserID(context.Background(), s.userID)
+	if s.chatterUserID != "" {
+		ctx = store.WithChatterUserID(ctx, s.chatterUserID)
+	}
+	return ctx
+}
+
+// SetChatter binds the per-turn conversation participant to this
+// Session so the next Append / SaveSession write stamps the
+// chatter_user_id column. Called by the agent loop at the top of each
+// turn from the resolved chatterUID. Passing "" clears it (the next
+// write goes back to '' which readers fall back to user_id for).
+func (s *Session) SetChatter(uid string) {
+	s.mu.Lock()
+	s.chatterUserID = uid
+	s.mu.Unlock()
 }
 
 // Manager manages sessions for one (user, agent). Sessions are keyed

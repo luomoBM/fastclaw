@@ -147,6 +147,44 @@ func applyObjectStoreEnv(cfg *Config) {
 	}
 }
 
+// ScrubBootSecrets removes credential-bearing env vars from the
+// process environment AFTER bootstrap config has been read. Call once
+// from the daemon entry point after gateway construction.
+//
+// Why: every shell command the agent runs inherits the daemon's env
+// by default. Even with subprocess-level scrubbing (see tools/env_scrub.go),
+// a subprocess can read /proc/<daemon_pid>/environ as the same UID
+// and recover anything still set on the parent. Unsetting at the
+// parent closes that path.
+//
+// Trade-off: the runtime hot-reload paths in gateway.go
+// (readObjectStoreCfg / readSystemSandboxCfg) re-call LoadEnv and
+// would see empty values for these keys after scrub. That's
+// intentional — env is treated as a one-time bootstrap override,
+// not a live config source. Operators wanting to rotate credentials
+// at runtime should edit the DB-stored config via admin UI.
+func ScrubBootSecrets() {
+	keys := []string{
+		"FASTCLAW_STORAGE_DSN",
+		"FASTCLAW_OBJECT_STORE_TYPE",
+		"FASTCLAW_OBJECT_STORE_LOCAL_ROOT",
+		"FASTCLAW_OBJECT_STORE_REGION",
+		"FASTCLAW_OBJECT_STORE_BUCKET",
+		"FASTCLAW_OBJECT_STORE_PREFIX",
+		"FASTCLAW_OBJECT_STORE_ACCESSKEY",
+		"FASTCLAW_OBJECT_STORE_SECRETKEY",
+		"FASTCLAW_OBJECT_STORE_ACCOUNTID",
+		"FASTCLAW_OBJECT_STORE_ENDPOINT",
+		"FASTCLAW_OBJECT_STORE_USESSL",
+		"FASTCLAW_OBJECT_STORE_ALIYUN_INTERNAL",
+		"BOXLITE_API_KEY",
+		"E2B_API_KEY",
+	}
+	for _, k := range keys {
+		_ = os.Unsetenv(k)
+	}
+}
+
 // ApplyToConfig overlays env-derived values onto a runtime Config. Used
 // by gateway boot to layer FASTCLAW_OBJECT_STORE_* on top of the DB-
 // stored object-store namespace.

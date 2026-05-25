@@ -228,7 +228,6 @@ func registerFeishuChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chan
 }
 
 func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, st store.Store, hot bool) error {
-	splitReplies := readWeChatSplitRepliesSetting(st)
 	// WeChat is multi-account by design — every QR scan mints a new
 	// (botToken, ilink_user_id, baseURL) triple keyed under a fresh
 	// accountID. The legacy "no Accounts map → single bot from
@@ -244,7 +243,6 @@ func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, 
 		if err != nil {
 			return err
 		}
-		wc.SetSplitReplies(splitReplies)
 		// On confirmed token-expiry the adapter exits; clean up the
 		// configs row so the next process restart doesn't re-register
 		// a known-dead bot (which would log the same warning again on
@@ -308,24 +306,3 @@ func purgeWeChatAccount(st store.Store, rowID, deadAccount string) error {
 	return st.SaveConfig(ctx, rec)
 }
 
-// readWeChatSplitRepliesSetting fetches the system-scope
-// channels.wechat.splitReplies toggle. Returns false on any miss
-// (no store, no row, malformed payload) so the default — single-bubble
-// replies — applies whenever the operator hasn't explicitly opted in.
-func readWeChatSplitRepliesSetting(st store.Store) bool {
-	if st == nil {
-		return false
-	}
-	rec, err := st.GetConfigByName(context.Background(), store.KindSetting, "", "", "channels.wechat")
-	if err != nil || rec == nil || len(rec.Data) == 0 {
-		return false
-	}
-	v, ok := rec.Data["splitReplies"]
-	if !ok {
-		return false
-	}
-	if b, ok := v.(bool); ok {
-		return b
-	}
-	return false
-}

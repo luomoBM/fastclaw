@@ -10,6 +10,7 @@ import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Down
 import Link from "next/link";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkBreaks from "remark-breaks";
 import { ExternalAnchor } from "@/components/markdown-link";
 
 // react-markdown's default urlTransform strips any protocol not in the
@@ -116,7 +117,7 @@ function renderContentWithDataImages(
           );
         }
         return (
-          <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} urlTransform={urlTransformFn} components={{ a: ExternalAnchor }}>
+          <ReactMarkdown key={i} remarkPlugins={[remarkGfm, remarkBreaks]} urlTransform={urlTransformFn} components={{ a: ExternalAnchor }}>
             {p.text}
           </ReactMarkdown>
         );
@@ -211,6 +212,23 @@ const CHAT_PROSE_CLASS =
   "prose-table:my-2 prose-table:text-[14px] " +
   "prose-th:py-1 prose-th:px-2 prose-td:py-1 prose-td:px-2 " +
   "prose-hr:my-3";
+
+// Wire token the agent emits to request a multi-bubble reply — must
+// match channels.SplitMessageMarker in internal/channels/base.go. On
+// IM channels the dispatcher (manager.dispatchOutbound) splits the
+// outbound text on this marker into separate platform messages; the
+// web UI renders one bubble per split chunk so the experience matches.
+const SPLIT_MARKER = "<|split|>";
+
+// splitOnMarker breaks `s` on SPLIT_MARKER, trims each chunk, and
+// drops the empty ones. Used at render time so a streamed assistant
+// reply containing the marker becomes multiple bubbles without any
+// upstream content-event rewriting.
+function splitOnMarker(s: string): string[] {
+  if (!s.includes(SPLIT_MARKER)) return [s];
+  const parts = s.split(SPLIT_MARKER).map((p) => p.trim()).filter((p) => p.length > 0);
+  return parts.length > 0 ? parts : [s];
+}
 
 // Single-segment identity filenames that route to the agent's home dir
 // (not the workspace) — exclude from the "Your files" panel.
@@ -2030,6 +2048,28 @@ export function ChatScreen() {
                   }
                   continue;
                 }
+                // Agent bubbles may carry the `<|split|>` marker the
+                // LLM emits for multi-bubble output (mirrors IM channel
+                // behavior). Expand into one bubble per chunk so the
+                // marker never surfaces as literal text. Attach files /
+                // metadata only to the last chunk to match the IM
+                // dispatcher's "attach to last chunk" rule.
+                if (msg.role === "agent" && msg.content.includes(SPLIT_MARKER)) {
+                  const parts = splitOnMarker(msg.content);
+                  parts.forEach((part, idx) => {
+                    const isLast = idx === parts.length - 1;
+                    elements.push(
+                      renderRegularBubble({
+                        ...msg,
+                        id: `${msg.id}-s${idx}`,
+                        content: part,
+                        files: isLast ? msg.files : undefined,
+                        metadata: isLast ? msg.metadata : undefined,
+                      }),
+                    );
+                  });
+                  continue;
+                }
                 elements.push(renderRegularBubble(msg));
               }
               return elements;
@@ -2123,7 +2163,7 @@ export function ChatScreen() {
                             (attachedImages.get(msg.id)?.length ?? 0) > 0,
                             makeUrlTransform(selectedAgent, sessionId),
                           ) ?? (
-                            <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={makeUrlTransform(selectedAgent, sessionId)} components={{ a: ExternalAnchor }}>
+                            <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} urlTransform={makeUrlTransform(selectedAgent, sessionId)} components={{ a: ExternalAnchor }}>
                               {msg.content}
                             </ReactMarkdown>
                           )}
@@ -2676,7 +2716,7 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId, nested = false, 
         <div className="bg-muted rounded-2xl rounded-bl-md px-4 py-2.5">
           <div className={CHAT_PROSE_CLASS}>
             {renderContentWithDataImages(msg.content, surfacedSrcs, false, makeUrlTransform(agentId, sessionId)) ?? (
-              <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={makeUrlTransform(agentId, sessionId)} components={{ a: ExternalAnchor }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} urlTransform={makeUrlTransform(agentId, sessionId)} components={{ a: ExternalAnchor }}>
                 {msg.content}
               </ReactMarkdown>
             )}

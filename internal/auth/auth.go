@@ -286,9 +286,17 @@ const EndUserHeader = "X-Fastclaw-End-User"
 var ErrUnauthorized = errors.New("unauthorized")
 
 // extract returns the bearer token (if any) and session cookie SID (if
-// any) from a request. A `?token=` query param is also accepted for the
-// rare cases (image previews, downloads) where setting headers isn't
-// possible — same security posture as Authorization: Bearer.
+// any) from a request. A `?token=` query param is also accepted, but
+// ONLY on the narrow set of paths that legitimately need it — file
+// downloads (which the browser can't add an Authorization header to
+// when rendered via <img> / <a download>) and the chat SSE
+// subscription (EventSource has no header API). Everywhere else the
+// query-param fallback is denied: tokens in URLs leak via Referer,
+// browser history, reverse-proxy access logs, and observability
+// pipelines. Header-only enforcement on /v1/* and the rest of /api/*
+// closes that leak surface; CLI scripts that previously built
+// `?token=` URLs for those endpoints must switch to
+// `Authorization: Bearer <token>` (every HTTP client supports it).
 func extract(r *http.Request) (bearer, sid string) {
 	if c, err := r.Cookie(SessionCookieName); err == nil {
 		sid = c.Value
@@ -297,10 +305,41 @@ func extract(r *http.Request) (bearer, sid string) {
 		if t := strings.TrimPrefix(h, "Bearer "); t != h {
 			bearer = t
 		}
-	} else if t := r.URL.Query().Get("token"); t != "" {
+	} else if t := r.URL.Query().Get("token"); t != "" && queryTokenAllowed(r) {
 		bearer = t
 	}
 	return bearer, sid
+}
+
+// queryTokenAllowed gates the `?token=` bearer fallback to a
+// narrow allowlist of paths whose clients have no other way to
+// attach an Authorization header.
+//
+// Allowed:
+//   - GET /api/agents/<id>/files/...        — workspace file download
+//   - GET /api/agents/<id>/files.zip        — workspace archive
+//   - GET /api/agents/<id>/system-files/<n> — identity-file fetch (rare)
+//   - GET /api/chat/subscribe               — EventSource SSE stream
+//
+// Everything else (/v1/*, /api/chat, /api/agents/<id> JSON, …) must
+// use the Authorization header. Deliberately *not* a prefix match
+// on /api/agents/<id>/files since some workspace endpoints under
+// that prefix accept POST/PUT bodies — limit to GET so a write
+// path can never authenticate via a logged URL.
+func queryTokenAllowed(r *http.Request) bool {
+	if r.Method != http.MethodGet {
+		return false
+	}
+	p := r.URL.Path
+	switch {
+	case strings.HasPrefix(p, "/api/agents/") && strings.Contains(p, "/files"):
+		return true
+	case strings.HasPrefix(p, "/api/agents/") && strings.Contains(p, "/system-files/"):
+		return true
+	case p == "/api/chat/subscribe":
+		return true
+	}
+	return false
 }
 
 // Middleware enforces auth on every wrapped route. 401 on no/invalid

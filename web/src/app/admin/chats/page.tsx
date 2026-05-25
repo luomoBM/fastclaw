@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   MessagesSquare,
   ChevronLeft,
@@ -8,6 +8,8 @@ import {
   Bot,
   User as UserIcon,
   ExternalLink,
+  Loader2,
+  RefreshCw,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -27,25 +29,33 @@ const PAGE_SIZE = 30;
 export default function AdminChatsPage() {
   const [sessions, setSessions] = useState<AdminChatSessionEntry[]>([]);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [page, setPage] = useState(1);
 
-  useEffect(() => {
-    let aborted = false;
-    (async () => {
-      try {
-        const list = await adminListChats();
-        if (aborted) return;
-        setSessions(list);
-        setError("");
-      } catch (e) {
-        if (aborted) return;
-        setError(e instanceof Error ? e.message : "Failed to load chats");
-      }
-    })();
-    return () => {
-      aborted = true;
-    };
+  // load is shared by the initial mount effect and the refresh button.
+  // The mount path passes initial=true so it owns the full-page spinner
+  // (sessions still empty); manual refreshes use the smaller in-button
+  // spinner instead so the existing rows stay visible while the fetch
+  // is in flight.
+  const load = useCallback(async (initial: boolean) => {
+    if (initial) setLoading(true);
+    else setRefreshing(true);
+    try {
+      const list = await adminListChats();
+      setSessions(list);
+      setError("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load chats");
+    } finally {
+      if (initial) setLoading(false);
+      else setRefreshing(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void load(true);
+  }, [load]);
 
   // Newest first — backend doesn't guarantee order across (user, agent)
   // pairs because it concatenates per-agent lists.
@@ -62,13 +72,23 @@ export default function AdminChatsPage() {
 
   return (
     <div className="p-6 space-y-6 max-w-5xl mx-auto">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight">Chats</h2>
           <p className="text-sm text-muted-foreground mt-1">
             All conversations across every agent on the platform.
           </p>
         </div>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void load(false)}
+          disabled={loading || refreshing}
+          title="Refresh chats"
+        >
+          <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
+          Refresh
+        </Button>
       </div>
 
       {error && (
@@ -79,7 +99,14 @@ export default function AdminChatsPage() {
         </Card>
       )}
 
-      {sorted.length === 0 ? (
+      {loading ? (
+        <div className="rounded-lg border border-border bg-card">
+          <div className="flex flex-col items-center justify-center py-16">
+            <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+            <p className="mt-3 text-xs text-muted-foreground/60">Loading chats…</p>
+          </div>
+        </div>
+      ) : sorted.length === 0 ? (
         <div className="rounded-lg border border-border bg-card">
           <div className="flex flex-col items-center justify-center py-16">
             <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10 mb-4">

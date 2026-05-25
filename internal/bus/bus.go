@@ -104,6 +104,14 @@ type OutboundMessage struct {
 	EditMsgID    string             // edit existing message instead of sending new
 	MediaPaths   []string           // file paths to attach (from MEDIA: protocol; host-mounted backends only)
 	MediaItems   []MediaItem        // pre-resolved attachments — channel uploads bytes directly
+	// AllowSplit, when true on a WeChat-bound message, lets the adapter
+	// honor SplitMessageMarker and emit multiple bubbles. False (default)
+	// collapses the marker to a newline so a stray marker doesn't leak
+	// as literal text. Stamped by the originating Agent based on its
+	// effective splitReplies setting (per-agent override OR system
+	// default) — see internal/agent/loop.go. Harmless on non-WeChat
+	// channels: they ignore the field.
+	AllowSplit bool
 }
 
 // MessageBus is an async message queue backed by Go channels.

@@ -58,7 +58,7 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	authenticated := false
-	var wsUserID string
+	var wsIdent auth.Identity
 
 	for {
 		_, raw, err := conn.ReadMessage()
@@ -94,7 +94,14 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				s.wsRespondError(conn, frame.ID, "authentication failed")
 				continue
 			}
-			wsUserID = ident.UserID
+			// Stash the full resolved identity — type + ACL + everything
+			// — so later frames (`agents.list`, future verbs) reuse the
+			// same authorization context the HTTP path uses. The previous
+			// `auth.Identity{UserID, AuthMethod:"apikey"}` rebuild dropped
+			// APIKeyType and APIKeyAgents, so CanAccessAgent's apikey
+			// branch returned false for every agent and the list came
+			// back empty regardless of scope.
+			wsIdent = ident
 			authenticated = true
 			s.wsRespondOK(conn, frame.ID, json.RawMessage(`{}`))
 
@@ -104,13 +111,12 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			space, err := s.resolver.UserSpaceFor(wsUserID)
+			space, err := s.resolver.UserSpaceFor(wsIdent.UserID)
 			if err != nil {
 				s.wsRespondError(conn, frame.ID, "user space unavailable: "+err.Error())
 				continue
 			}
-			ident := auth.Identity{UserID: wsUserID, AuthMethod: "apikey"}
-			payload, _ := json.Marshal(map[string]any{"agents": buildAgentList(space, ident)})
+			payload, _ := json.Marshal(map[string]any{"agents": buildAgentList(space, wsIdent)})
 			s.wsRespondOK(conn, frame.ID, payload)
 
 		default:
