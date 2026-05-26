@@ -240,6 +240,11 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 			am.Content, _ = json.Marshal("")
 		}
 
+		if len(am.Content) == 0 && m.Role == "assistant" {
+			// Empty assistant history rows carry no replayable signal and
+			// Anthropic-compatible endpoints reject them as `content: null`.
+			continue
+		}
 		out = append(out, am)
 	}
 

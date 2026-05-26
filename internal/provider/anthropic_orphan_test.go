@@ -153,6 +153,28 @@ func TestToAnthropicMessagesOrphanAssistantRawOnly(t *testing.T) {
 	}
 }
 
+func TestToAnthropicMessagesDropsEmptyAssistantHistory(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "before"},
+		{Role: "assistant"},
+		{Role: "user", Content: "after"},
+	}
+
+	_, out := toAnthropicMessages(msgs)
+
+	if len(out) != 2 {
+		t.Fatalf("expected empty assistant to be dropped, got %d messages: %+v", len(out), out)
+	}
+	for _, am := range out {
+		if am.Role == "assistant" {
+			t.Fatalf("empty assistant survived: %+v", am)
+		}
+		if string(am.Content) == "null" || len(am.Content) == 0 {
+			t.Fatalf("message has null/empty content (would 422): %+v", am)
+		}
+	}
+}
+
 func allText(out []anthropicMessage) string {
 	var sb strings.Builder
 	for _, am := range out {
