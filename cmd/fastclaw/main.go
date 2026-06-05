@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -190,14 +191,16 @@ func runGateway(port int) error {
 	if bindMode == "" {
 		bindMode = "loopback"
 	}
+	if err := checkHTTPPort(port, bindMode); err != nil {
+		return err
+	}
 	slog.Info("gateway starting", "port", port, "bind", bindMode)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	webErrCh := make(chan error, 1)
 	go func() {
-		if err := webSrv.Run(ctx); err != nil {
-			slog.Error("web server error", "error", err)
-		}
+		webErrCh <- webSrv.Run(ctx)
 	}()
 
 	url := fmt.Sprintf("http://localhost:%d", port)
@@ -207,7 +210,40 @@ func runGateway(port int) error {
 		go openBrowser(url)
 	}
 
-	return gw.Run()
+	gwErrCh := make(chan error, 1)
+	go func() {
+		gwErrCh <- gw.RunContext(ctx)
+	}()
+
+	select {
+	case err := <-webErrCh:
+		cancel()
+		gwErr := <-gwErrCh
+		if err != nil {
+			return err
+		}
+		return gwErr
+	case err := <-gwErrCh:
+		cancel()
+		webErr := <-webErrCh
+		if err != nil {
+			return err
+		}
+		return webErr
+	}
+}
+
+func checkHTTPPort(port int, bindMode string) error {
+	host := "127.0.0.1"
+	if bindMode == "all" {
+		host = "0.0.0.0"
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("setup: listen %s: %w", addr, err)
+	}
+	return ln.Close()
 }
 
 func countUsersSafe(gw *gateway.Gateway) (int, error) {

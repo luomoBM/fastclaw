@@ -522,19 +522,31 @@ func (g *Gateway) IsCloudMode() bool { return true }
 // On Unix, SIGHUP triggers a hot reload of every cached UserSpace so the
 // next request picks up store mutations made by the CLI or another peer.
 func (g *Gateway) Run() error {
-	ctx, cancel := context.WithCancel(context.Background())
+	return g.RunContext(context.Background())
+}
+
+// RunContext is Run with an external cancellation source. The CLI uses it
+// to shut down channels/cron/plugin workers when the sibling web server
+// fails to bind, instead of leaving a headless channel-polling process alive.
+func (g *Gateway) RunContext(parent context.Context) error {
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
 	stopCh := make(chan os.Signal, 1)
 	signal.Notify(stopCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(stopCh)
 	go func() {
-		sig := <-stopCh
-		slog.Info("received signal, shutting down", "signal", sig)
-		cancel()
+		select {
+		case sig := <-stopCh:
+			slog.Info("received signal, shutting down", "signal", sig)
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
 
 	reloadCh := make(chan os.Signal, 1)
 	notifyReloadSignal(reloadCh)
+	defer signal.Stop(reloadCh)
 	go func() {
 		for {
 			select {
@@ -732,7 +744,7 @@ func registerChannelsFromStore(st store.Store, mb *bus.MessageBus, chanMgr *chan
 }
 
 // allChannelRows returns every channel row regardless of ownership —
-// system rows ('','') plus per-user, per-agent, and per-(user, agent)
+// system rows ("","") plus per-user, per-agent, and per-(user, agent)
 // rows. The boot path needs the union so each owner's adapter is
 // hot-started; per-row routing is decided later at message-receipt
 // time via LookupChannelByCredential.

@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -64,6 +65,9 @@ func Start(port int) error {
 	st, _ := GetStatus()
 	if st != nil && st.Running {
 		return fmt.Errorf("daemon already running (PID %d)", st.PID)
+	}
+	if err := checkPortFree(port); err != nil {
+		return err
 	}
 
 	pidFile, logFile, logDir, err := Paths()
@@ -315,4 +319,13 @@ func isProcessAlive(pid int) bool {
 	// Signal 0 checks if process exists without actually signaling
 	err = signalProcess(proc, "CHECK")
 	return err == nil
+}
+
+func checkPortFree(port int) error {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("gateway port %d is already in use: %w", port, err)
+	}
+	return ln.Close()
 }
