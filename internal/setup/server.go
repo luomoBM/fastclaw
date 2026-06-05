@@ -43,11 +43,11 @@ type AgentHandle interface {
 	// the next turn cold-starts at the new bind-mount path.
 	MoveWebChatSession(ctx context.Context, sessionId, projectID string) error
 	ReloadWorkspaceFiles()
-	// WriteSessionAttachments materializes user-uploaded image bytes (data
+	// WriteSessionAttachments materializes user-uploaded bytes (data
 	// URLs / HTTPS URLs) into the agent's session workspace so skills can
 	// read them via /workspace/<filename>. Returns the relative filenames
-	// in input order; per-image errors are skipped.
-	WriteSessionAttachments(ctx context.Context, sessionID, projectID string, urls []string) []string
+	// in input order; per-item errors are skipped.
+	WriteSessionAttachments(ctx context.Context, sessionID, projectID string, atts []agent.Attachment) []string
 	// RegisteredTools returns the live tool registry projection — what
 	// this agent currently has loaded (built-ins + MCP + plugin tools).
 	// Used by the Tools tab to render the allowlist checkbox picker.
@@ -304,7 +304,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /api/line/webhook/{accountId}", s.handleLINEWebhook)
 
 	// Skills
-	mux.HandleFunc("GET /api/skills", s.handleListSkills)
+	mux.HandleFunc("GET /api/skills", auth(s.handleListSkills))
 	mux.HandleFunc("GET /api/skills/search", auth(s.handleSearchSkills))
 	mux.HandleFunc("POST /api/skills/install", auth(s.handleInstallSkill))
 	mux.HandleFunc("POST /api/skills/upload", auth(s.handleUploadSkill))
@@ -351,7 +351,7 @@ func (s *Server) Run(ctx context.Context) error {
 	mux.HandleFunc("PUT /api/agents/{id}/cron/{jobId}", auth(s.handleToggleAgentCronJob))
 
 	// Tasks
-	mux.HandleFunc("GET /api/tasks", auth(s.handleListTasks))
+	mux.HandleFunc("GET /api/tasks", admin(s.handleListTasks))
 
 	// Apikeys (per-user, with agent multi-select).
 	mux.HandleFunc("GET /api/apikeys", auth(s.handleListAPIKeys))

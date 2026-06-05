@@ -826,20 +826,61 @@ type chatRequest struct {
 	// web's image_url content parts never reach the agent (empty slice
 	// → no ContentParts persisted → history reload shows no image, and
 	// vision LLMs see only the text breadcrumb).
-	Images    []string       `json:"images,omitempty"`
-	ImageURLs []string       `json:"imageUrls,omitempty"`
-	Params    map[string]any `json:"params,omitempty"`
+	Images    []string `json:"images,omitempty"`
+	ImageURLs []string `json:"imageUrls,omitempty"`
+	// Attachments is the typed, general-purpose attachment field. Each
+	// entry can carry an optional Name which is sanitized and used as
+	// the on-disk filename so the LLM sees `report.pdf` instead of
+	// `image_3jk7l_0.pdf`. Unlike Images / ImageURLs, entries here are
+	// NOT inlined as vision content parts — they only land in
+	// /workspace and reach the LLM via the `[Attached: /workspace/X]`
+	// breadcrumb. Use Images / ImageURLs (not Attachments) when you
+	// want the bytes shown directly to a vision model.
+	Attachments []attachmentRequest `json:"attachments,omitempty"`
+	Params      map[string]any      `json:"params,omitempty"`
 }
 
-// allImages flattens both legacy field names into a single ordered
-// slice (Images first, then ImageURLs). De-dup is intentionally skipped
-// — clients send one or the other, never both.
-func (r chatRequest) allImages() []string {
-	if len(r.ImageURLs) == 0 {
-		return r.Images
+// attachmentRequest is the wire form of a single attachment. URL is the
+// data: or http(s) URL; Name is the optional caller-supplied filename.
+type attachmentRequest struct {
+	URL  string `json:"url"`
+	Name string `json:"name,omitempty"`
+}
+
+// allAttachments flattens the three input shapes (Images, ImageURLs,
+// Attachments) into one ordered slice for materialization into
+// /workspace. Order: Images → ImageURLs → Attachments. Clients
+// normally pick one; mixing is allowed and not de-dup'd.
+func (r chatRequest) allAttachments() []agent.Attachment {
+	n := len(r.Images) + len(r.ImageURLs) + len(r.Attachments)
+	if n == 0 {
+		return nil
 	}
-	if len(r.Images) == 0 {
-		return r.ImageURLs
+	out := make([]agent.Attachment, 0, n)
+	for _, u := range r.Images {
+		out = append(out, agent.Attachment{URL: u})
+	}
+	for _, u := range r.ImageURLs {
+		out = append(out, agent.Attachment{URL: u})
+	}
+	for _, a := range r.Attachments {
+		out = append(out, agent.Attachment{URL: a.URL, Name: a.Name})
+	}
+	return out
+}
+
+// inlineImageURLs returns just the URLs that should be inlined as
+// vision content parts (PhotoURLs → image_url content blocks). Only
+// the legacy image-only fields qualify: Images and ImageURLs are by
+// contract caller-asserted images, so wrapping them as image_url is
+// safe. The newer Attachments field is general-purpose (pdf / zip /
+// txt are all legal), and feeding a non-image URL to provider vision
+// channels fails the whole turn upstream (Anthropic returns 400 for
+// `{type:image, source:{type:url, url:<pdf>}}`). Attachments reach
+// the LLM via the `[Attached: /workspace/<file>]` breadcrumb instead.
+func (r chatRequest) inlineImageURLs() []string {
+	if len(r.Images) == 0 && len(r.ImageURLs) == 0 {
+		return nil
 	}
 	out := make([]string, 0, len(r.Images)+len(r.ImageURLs))
 	out = append(out, r.Images...)
@@ -899,7 +940,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "agent not found"})
 		return
 	}
-	images := req.allImages()
+	atts := req.allAttachments()
 	msgText := req.Message
 	if !req.preMaterialized() {
 		// Resolve the chat's project so attachments land in
@@ -907,10 +948,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// failure → empty pid → loose-chat scope (the historical
 		// behavior).
 		projectID := s.resolveSessionProject(r.Context(), r, ag.Name(), req.SessionID)
-		paths := ag.WriteSessionAttachments(r.Context(), req.SessionID, projectID, images)
+		paths := ag.WriteSessionAttachments(r.Context(), req.SessionID, projectID, atts)
 		msgText = annotateMessageWithAttachments(req.Message, paths)
 	}
-	reply := ag.HandleWebChat(r.Context(), req.SessionID, req.ProjectID, s.effectiveUserID(r), msgText, images, req.Params)
+	reply := ag.HandleWebChat(r.Context(), req.SessionID, req.ProjectID, s.effectiveUserID(r), msgText, req.inlineImageURLs(), req.Params)
 	jsonResponse(w, http.StatusOK, map[string]any{"reply": reply})
 }
 
@@ -986,11 +1027,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	// the wire immediately, not held until the response closes.
 	w.Header().Set("X-Accel-Buffering", "no")
 	flusher.Flush()
-	images := req.allImages()
+	atts := req.allAttachments()
+	imageURLs := req.inlineImageURLs()
 	msgText := req.Message
 	if !req.preMaterialized() {
 		projectID := s.resolveSessionProject(r.Context(), r, ag.Name(), req.SessionID)
-		paths := ag.WriteSessionAttachments(r.Context(), req.SessionID, projectID, images)
+		paths := ag.WriteSessionAttachments(r.Context(), req.SessionID, projectID, atts)
 		msgText = annotateMessageWithAttachments(req.Message, paths)
 	}
 
@@ -1021,7 +1063,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		// events param stays nil — emitEvent now fans out via the
 		// streamCtx attached above (persist + hub). The legacy channel
 		// path is no longer needed for this handler.
-		_ = ag.HandleWebChatStream(agentCtx, req.SessionID, req.ProjectID, uid, msgText, images, req.Params, nil)
+		_ = ag.HandleWebChatStream(agentCtx, req.SessionID, req.ProjectID, uid, msgText, imageURLs, req.Params, nil)
 	}()
 
 	// Heartbeat keeps proxies (nginx 60s default, Cloudflare 100s, ELB

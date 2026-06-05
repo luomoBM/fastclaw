@@ -52,6 +52,65 @@ type chatCompletionRequest struct {
 	// (Anthropic ~5MB/image, OpenAI ~20MB) — fastclaw does not enforce
 	// its own ceiling, the upstream provider returns the rejection.
 	Images []string `json:"images,omitempty"`
+	// ImageURLs is an accepted alias for Images. The web-facing chat
+	// endpoint historically calls this field `imageUrls`; allowing it
+	// here means a caller writing one client against both endpoints
+	// doesn't get silently dropped attachments when they pick the
+	// wrong name.
+	ImageURLs []string `json:"imageUrls,omitempty"`
+	// Attachments is the typed, general-purpose attachment field. Each
+	// entry can carry an optional Name which is sanitized and used as
+	// the on-disk filename so the LLM sees `report.pdf` instead of
+	// `image_3jk7l_0.pdf`. Unlike Images / ImageURLs, entries here are
+	// NOT inlined as vision content parts — they only land in
+	// /workspace and reach the LLM via the `[Attached: /workspace/X]`
+	// breadcrumb. Use Images / ImageURLs (not Attachments) when you
+	// want the bytes shown directly to a vision model.
+	Attachments []attachmentRequest `json:"attachments,omitempty"`
+}
+
+// attachmentRequest is the wire form of a single attachment.
+type attachmentRequest struct {
+	URL  string `json:"url"`
+	Name string `json:"name,omitempty"`
+}
+
+// allAttachments flattens the three input shapes (Images, ImageURLs,
+// Attachments) into one ordered slice for materialization into
+// /workspace. Clients normally pick one; mixing is allowed.
+func (r chatCompletionRequest) allAttachments() []agent.Attachment {
+	n := len(r.Images) + len(r.ImageURLs) + len(r.Attachments)
+	if n == 0 {
+		return nil
+	}
+	out := make([]agent.Attachment, 0, n)
+	for _, u := range r.Images {
+		out = append(out, agent.Attachment{URL: u})
+	}
+	for _, u := range r.ImageURLs {
+		out = append(out, agent.Attachment{URL: u})
+	}
+	for _, a := range r.Attachments {
+		out = append(out, agent.Attachment{URL: a.URL, Name: a.Name})
+	}
+	return out
+}
+
+// inlineImageURLs returns just the URLs eligible for vision inline
+// (PhotoURLs → image_url content blocks). Only Images and ImageURLs
+// qualify — by contract they're caller-asserted images. The general
+// Attachments field is excluded: feeding a PDF / zip URL through the
+// vision channel returns HTTP 400 from upstream providers and sinks
+// the whole turn. Attachments reach the LLM via the
+// `[Attached: /workspace/<file>]` breadcrumb instead.
+func (r chatCompletionRequest) inlineImageURLs() []string {
+	if len(r.Images) == 0 && len(r.ImageURLs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(r.Images)+len(r.ImageURLs))
+	out = append(out, r.Images...)
+	out = append(out, r.ImageURLs...)
+	return out
 }
 
 type chatMessage struct {
@@ -205,7 +264,8 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// know session_key — so attachments always land in the loose-chat
 	// scope. When/if we expose project addressing here, look up the
 	// session row and pass its project_id instead of "".
-	attachmentPaths := ag.WriteSessionAttachments(r.Context(), sessionKey, "", req.Images)
+	atts := req.allAttachments()
+	attachmentPaths := ag.WriteSessionAttachments(r.Context(), sessionKey, "", atts)
 	if len(attachmentPaths) > 0 {
 		var b strings.Builder
 		for _, p := range attachmentPaths {
@@ -232,7 +292,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Text:      userText,
 		PeerKind:  "dm",
 		Params:    req.Params,
-		PhotoURLs: req.Images,
+		PhotoURLs: req.inlineImageURLs(),
 	}
 
 	slog.Info("chat completion request",

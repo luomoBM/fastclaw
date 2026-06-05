@@ -9,21 +9,54 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
-// WriteSessionAttachments materializes user-attached image bytes into the
-// agent's session workspace so skills (image-tool, etc.) can read them as
-// /workspace/<filename>. Each url is one of:
-//   - data URL:  "data:image/png;base64,iVBORw..."
-//   - HTTPS URL: "https://example.com/photo.jpg"
+// maxAttachmentBytes caps a single attachment regardless of whether it
+// arrived as a data URL (in-memory base64) or an HTTPS URL (streamed
+// fetch). 25 MB matches Anthropic's per-image envelope and prevents a
+// pathological data URL from sinking the gateway.
+const maxAttachmentBytes = 25 * 1024 * 1024
+
+// maxAttachmentNameLen caps caller-supplied filenames after sanitization.
+// 96 is roughly the longest a filename can be before terminals start
+// wrapping in chat bubbles, and well clear of any path-length limits.
+const maxAttachmentNameLen = 96
+
+// Attachment is one item the caller wants materialized into /workspace
+// for the current turn. URL is required (data URL or http(s) URL); Name
+// is optional and, when given, is sanitized and used as the on-disk
+// filename so the LLM sees something readable like `quarterly.pdf`
+// instead of `image_3jk7l_0.pdf`.
 //
-// Per-image errors are logged and skipped — a single bad URL must not sink
-// the whole turn. Returns the relative filenames (e.g. "in_<ts>_0.png") in
-// input order, omitting any that failed.
+// Same-Name semantics:
+//   - Within one turn: a second attachment with the same Name is
+//     disambiguated as `<stem>-<idx><ext>` (token-spliced if that also
+//     collides). No silent loss.
+//   - Across turns: re-uploading the same Name overwrites the prior
+//     file in /workspace. This matches the "drag the same name onto a
+//     folder" mental model and avoids unbounded `notes-1.md`,
+//     `notes-2.md`, … buildup. Callers that need to preserve old
+//     versions must vary the Name themselves.
+type Attachment struct {
+	URL  string
+	Name string
+}
+
+// WriteSessionAttachments materializes user-attached bytes into the
+// agent's session workspace so skills (image-tool, file readers, etc.)
+// can reach them via /workspace/<filename>. Each URL is one of:
+//   - data URL:  "data:image/png;base64,iVBORw..."
+//   - HTTPS URL: "https://example.com/report.pdf"
+//
+// Per-item errors are logged and skipped — a single bad URL must not
+// sink the whole turn. Returns the relative filenames in input order,
+// omitting any that failed.
 //
 // Why three writes:
 //
@@ -39,8 +72,8 @@ import (
 // Docker doesn't need the third write (bind mount makes host writes show
 // up instantly), but calling it is harmless. The host write is also
 // harmless for E2B (gateway-local bytes nobody reads).
-func (a *Agent) WriteSessionAttachments(ctx context.Context, sessionID, projectID string, urls []string) []string {
-	if len(urls) == 0 {
+func (a *Agent) WriteSessionAttachments(ctx context.Context, sessionID, projectID string, atts []Attachment) []string {
+	if len(atts) == 0 {
 		return nil
 	}
 	var paths []string
@@ -56,13 +89,19 @@ func (a *Agent) WriteSessionAttachments(ctx context.Context, sessionID, projectI
 	if len(token) > 5 {
 		token = token[len(token)-5:]
 	}
-	for i, u := range urls {
-		data, ext, err := decodeAttachment(ctx, u)
+	// Track names assigned in this batch so two attachments with the
+	// same caller-provided Name don't clobber each other. Cross-turn
+	// collisions are intentionally left to overwrite — re-uploading
+	// `notes.md` should replace, not accumulate `notes-1.md` forever.
+	used := make(map[string]struct{}, len(atts))
+	for i, att := range atts {
+		data, ext, err := decodeAttachment(ctx, att.URL)
 		if err != nil {
 			slog.Warn("attachment decode failed", "agent", a.name, "session", sessionID, "index", i, "error", err)
 			continue
 		}
-		name := fmt.Sprintf("image_%s_%d%s", token, i, ext)
+		name := buildAttachmentName(att.Name, token, i, ext, used)
+		used[name] = struct{}{}
 
 		// 1. Host workspace dir (covers no-sandbox + docker via bind mount)
 		if a.workspacePath != "" {
@@ -125,13 +164,12 @@ func decodeAttachment(ctx context.Context, u string) ([]byte, string, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	const maxBytes = 25 * 1024 * 1024 // 25 MB ceiling — same envelope as Anthropic's per-image limit
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAttachmentBytes+1))
 	if err != nil {
 		return nil, "", err
 	}
-	if len(body) > maxBytes {
-		return nil, "", fmt.Errorf("attachment exceeds %d bytes", maxBytes)
+	if len(body) > maxAttachmentBytes {
+		return nil, "", fmt.Errorf("attachment exceeds %d bytes", maxAttachmentBytes)
 	}
 	ext := extFromMIME(resp.Header.Get("Content-Type"))
 	if ext == "" {
@@ -177,6 +215,9 @@ func decodeDataURL(u string) ([]byte, string, error) {
 		}
 		data = []byte(decoded)
 	}
+	if len(data) > maxAttachmentBytes {
+		return nil, "", fmt.Errorf("attachment exceeds %d bytes", maxAttachmentBytes)
+	}
 	ext := extFromMIME(mime)
 	if ext == "" {
 		ext = ".bin"
@@ -190,6 +231,7 @@ func extFromMIME(ct string) string {
 		ct = ct[:i]
 	}
 	switch strings.TrimSpace(strings.ToLower(ct)) {
+	// Images
 	case "image/png":
 		return ".png"
 	case "image/jpeg", "image/jpg":
@@ -202,8 +244,113 @@ func extFromMIME(ct string) string {
 		return ".heic"
 	case "image/svg+xml":
 		return ".svg"
+	// Documents — landing as the real extension matters even for models
+	// that can't natively read the bytes, because the LLM picks its
+	// tool based on the extension. `.bin` makes it reach for
+	// file/identify; `.pdf` makes it reach for the right reader.
+	case "application/pdf":
+		return ".pdf"
+	case "text/plain":
+		return ".txt"
+	case "text/markdown", "text/x-markdown":
+		return ".md"
+	case "text/csv":
+		return ".csv"
+	case "text/html":
+		return ".html"
+	case "application/json":
+		return ".json"
+	case "application/xml", "text/xml":
+		return ".xml"
+	case "application/zip":
+		return ".zip"
 	}
 	return ""
+}
+
+// buildAttachmentName turns the caller's optional Name into a safe
+// on-disk filename. If Name is empty (or sanitizes to empty), we fall
+// back to the historical `image_<token>_<i><ext>` shape so existing
+// callers see no behavior change. If Name is present, we keep it
+// (sanitized), append the MIME-derived ext when the user omitted one,
+// and disambiguate within-batch duplicates by suffixing `-<i>`.
+func buildAttachmentName(raw, token string, idx int, ext string, used map[string]struct{}) string {
+	clean := sanitizeAttachmentName(raw)
+	if clean == "" {
+		return fmt.Sprintf("image_%s_%d%s", token, idx, ext)
+	}
+	if path.Ext(clean) == "" && ext != "" {
+		clean += ext
+	}
+	if _, dup := used[clean]; !dup {
+		return clean
+	}
+	stem := strings.TrimSuffix(clean, path.Ext(clean))
+	tail := path.Ext(clean)
+	// First disambiguation: `<stem>-<idx><ext>`. Usually unique, but
+	// can collide if the user explicitly named an earlier attachment
+	// `report-2.pdf` and a later one with the same Name happens to
+	// land at idx=2.
+	candidate := fmt.Sprintf("%s-%d%s", stem, idx, tail)
+	if _, dup := used[candidate]; !dup {
+		return candidate
+	}
+	// Final fallback: splice in the per-turn token. token is unique
+	// per WriteSessionAttachments call, so `<stem>-<token>-<idx><ext>`
+	// is collision-free within the batch.
+	return fmt.Sprintf("%s-%s-%d%s", stem, token, idx, tail)
+}
+
+// sanitizeAttachmentName strips path separators, parent-dir tokens,
+// control characters, and leading dots from a caller-supplied filename.
+// Returns "" if nothing usable remains so the caller can fall back.
+// Uses path.Base (not filepath.Base) so Windows-style paths from the
+// browser are handled identically on a Linux gateway.
+func sanitizeAttachmentName(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	// Normalize Windows separators to / so path.Base reliably extracts
+	// the last component regardless of which side of the wire we run on.
+	raw = strings.ReplaceAll(raw, `\`, "/")
+	raw = path.Base(raw)
+	// `path.Base("..") == ".."`; reject explicitly.
+	if raw == "." || raw == ".." {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range raw {
+		switch {
+		case r < 0x20, r == 0x7f:
+			// control char — drop
+		case r == '/', r == '\\', r == ':', r == 0:
+			// path separator / drive prefix / NUL — drop
+		default:
+			b.WriteRune(r)
+		}
+	}
+	out := strings.TrimSpace(b.String())
+	out = strings.TrimLeft(out, ".") // hidden-dotfile prefix is rarely intended
+	if len(out) > maxAttachmentNameLen {
+		// Truncate from the stem so we preserve the extension. Byte-
+		// slicing on UTF-8 would chop multi-byte runes (CJK filenames
+		// are 3 bytes/char) and yield invalid UTF-8 on disk, so back
+		// off to the nearest rune boundary at or below the byte budget.
+		ext := path.Ext(out)
+		stem := strings.TrimSuffix(out, ext)
+		keep := maxAttachmentNameLen - len(ext)
+		if keep < 1 {
+			keep = 1
+		}
+		if len(stem) > keep {
+			for keep > 0 && !utf8.RuneStart(stem[keep]) {
+				keep--
+			}
+			stem = stem[:keep]
+		}
+		out = stem + ext
+	}
+	return out
 }
 
 func contentTypeFromExt(ext string) string {
@@ -220,6 +367,22 @@ func contentTypeFromExt(ext string) string {
 		return "image/heic"
 	case ".svg":
 		return "image/svg+xml"
+	case ".pdf":
+		return "application/pdf"
+	case ".txt":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".csv":
+		return "text/csv"
+	case ".html":
+		return "text/html"
+	case ".json":
+		return "application/json"
+	case ".xml":
+		return "application/xml"
+	case ".zip":
+		return "application/zip"
 	}
 	return ""
 }
