@@ -397,14 +397,29 @@ func (s *Server) handleCreateScopedChannel(w http.ResponseWriter, r *http.Reques
 		BotToken: req.BotToken,
 		AppToken: req.AppToken,
 	}
-	if err := scope.SaveChannelByScope(r.Context(), s.dataStore, sc, scopeID, req.Type, credKey, req.Enabled, cc); err != nil {
+	// Write to the channels table (sole authoritative store).
+	chUID, chAID := scope.OwnershipFromScope(sc, scopeID)
+	ch := &store.ChannelRecord{
+		UserID:    chUID,
+		AgentID:   chAID,
+		Type:      req.Type,
+		AccountID: credKey,
+		Enabled:   req.Enabled,
+		BotToken:  cc.BotToken,
+	}
+	chData, _ := json.Marshal(cc)
+	var dm map[string]interface{}
+	_ = json.Unmarshal(chData, &dm)
+	delete(dm, "enabled")
+	ch.Data = dm
+	if err := s.dataStore.SaveChannel(r.Context(), ch); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	s.invalidateScope(sc, scopeID)
 	if req.Enabled {
-		if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), req.Type, credKey); rec != nil {
-			s.hotRegisterChannel(*rec)
+		if looked, _ := s.dataStore.LookupChannel(r.Context(), req.Type, credKey); looked != nil {
+			s.hotRegisterChannelRecord(*looked)
 		}
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
@@ -446,14 +461,28 @@ func (s *Server) handleUpdateScopedChannel(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	if err := scope.SaveChannelByScope(r.Context(), s.dataStore, rec.LegacyScope(), rec.LegacyScopeID(), rec.Name, credKey, enabled, cc); err != nil {
+	// Write to the channels table (sole authoritative store).
+	ch := &store.ChannelRecord{
+		UserID:    rec.UserID,
+		AgentID:   rec.AgentID,
+		Type:      rec.Name,
+		AccountID: credKey,
+		Enabled:   enabled,
+		BotToken:  cc.BotToken,
+	}
+	chData, _ := json.Marshal(cc)
+	var dm map[string]interface{}
+	_ = json.Unmarshal(chData, &dm)
+	delete(dm, "enabled")
+	ch.Data = dm
+	if err := s.dataStore.SaveChannel(r.Context(), ch); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
 	s.invalidateScope(rec.LegacyScope(), rec.LegacyScopeID())
 	if enabled {
-		if updated, _ := s.dataStore.LookupChannelByCredential(r.Context(), rec.Name, credKey); updated != nil {
-			s.hotRegisterChannel(*updated)
+		if updated, _ := s.dataStore.LookupChannel(r.Context(), rec.Name, credKey); updated != nil {
+			s.hotRegisterChannelRecord(*updated)
 		}
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
@@ -472,19 +501,28 @@ func (s *Server) handleDeleteScopedChannel(w http.ResponseWriter, r *http.Reques
 	if !s.authorizeScope(w, r, rec.LegacyScope(), rec.LegacyScopeID(), scopeWrite) {
 		return
 	}
-	if err := s.dataStore.DeleteConfig(r.Context(), id); err != nil {
-		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
-	}
+	// Best-effort: also delete from configs table for backward compat.
+	_ = s.dataStore.DeleteConfig(r.Context(), id)
+
 	s.invalidateScope(rec.LegacyScope(), rec.LegacyScopeID())
-	// Best-effort: stop the bot adapter from receiving outbound routes.
-	// We don't know its accountID without decoding rec, so derive from
-	// the row we just looked up (rec is still valid here).
+	// Delete from the channels table (authoritative) and hot-unregister.
 	cc := decodeChannelConfigFromRecord(rec)
 	for accountID := range cc.Accounts {
+		if ch, err := s.dataStore.LookupChannel(r.Context(), rec.Name, accountID); err == nil && ch != nil {
+			if err := s.dataStore.DeleteChannel(r.Context(), ch.ID); err != nil {
+				jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
 		s.hotUnregisterChannel(rec.Name, accountID)
 	}
 	if len(cc.Accounts) == 0 {
+		if ch, err := s.dataStore.LookupChannel(r.Context(), rec.Name, rec.CredentialKey); err == nil && ch != nil {
+			if err := s.dataStore.DeleteChannel(r.Context(), ch.ID); err != nil {
+				jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+		}
 		s.hotUnregisterChannel(rec.Name, "")
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
@@ -518,6 +556,15 @@ func decodeChannelConfigFromRecord(rec *store.ConfigRecord) config.ChannelConfig
 // stricter "global uniqueness" semantics for callers that don't have
 // that context handy.
 func (s *Server) assertChannelCredentialUnique(r *http.Request, channelType, credKey, excludeID string, callerUserID, callerAgentID string) error {
+	return s.assertChannelCredentialUniqueOpt(r, channelType, credKey, excludeID, callerUserID, callerAgentID, false)
+}
+
+// assertChannelCredentialUniqueOpt is like assertChannelCredentialUnique but
+// accepts autoReplace: when true and the conflicting row belongs to the same
+// user, the old row is deleted automatically so the caller can proceed with
+// saving the new binding. This lets the dashboard "move" a bot from one agent
+// to another without forcing the user to disconnect manually first.
+func (s *Server) assertChannelCredentialUniqueOpt(r *http.Request, channelType, credKey, excludeID string, callerUserID, callerAgentID string, autoReplace bool) error {
 	if credKey == "" {
 		return nil
 	}
@@ -533,6 +580,27 @@ func (s *Server) assertChannelCredentialUnique(r *http.Request, channelType, cre
 	if existing.UserID == callerUserID &&
 		existing.AgentID == callerAgentID &&
 		existing.Name == channelType {
+		return nil
+	}
+	// Auto-replace: the caller is presenting the bot token (proof of
+	// ownership of the credential), so unconditionally tear down the old
+	// binding and let the new one take its place. The uniqueness check
+	// exists to prevent inbound-dispatcher races, not for authorization.
+	if autoReplace {
+		slog.Info("[channel-unique] auto-replacing old binding",
+			"existing.ID", existing.ID, "existing.UserID", existing.UserID, "existing.AgentID", existing.AgentID,
+			"callerUserID", callerUserID, "callerAgentID", callerAgentID)
+		cc := decodeChannelConfigFromRecord(existing)
+		if err := s.dataStore.DeleteConfig(r.Context(), existing.ID); err != nil {
+			return fmt.Errorf("failed to auto-disconnect old binding: %w", err)
+		}
+		s.invalidateOwner(existing.UserID, existing.AgentID)
+		for accountID := range cc.Accounts {
+			s.hotUnregisterChannel(existing.Name, accountID)
+		}
+		if len(cc.Accounts) == 0 {
+			s.hotUnregisterChannel(existing.Name, "")
+		}
 		return nil
 	}
 	// Surface where the conflict actually lives so the operator knows
@@ -622,6 +690,39 @@ func (s *Server) hotRegisterChannel(rec store.ConfigRecord) {
 			slog.Warn("hot-register channel failed", "type", rec.Name, "error", err)
 		}
 	}
+}
+
+// hotRegisterChannelRecord asks the gateway to start a channel adapter
+// from a ChannelRecord. Best-effort — falls back to hotRegisterChannel
+// via a synthesized ConfigRecord when the resolver doesn't implement the
+// new interface (e.g. older test stubs).
+func (s *Server) hotRegisterChannelRecord(rec store.ChannelRecord) {
+	if s.userResolver == nil {
+		return
+	}
+	type chanRecordRegistrar interface {
+		RegisterChannel(rec store.ChannelRecord) error
+	}
+	if r, ok := s.userResolver.(chanRecordRegistrar); ok {
+		if err := r.RegisterChannel(rec); err != nil {
+			slog.Warn("hot-register channel record failed", "type", rec.Type, "error", err)
+		}
+		return
+	}
+	// Fallback: synthesize a ConfigRecord for legacy resolvers.
+	cfgRec := store.ConfigRecord{
+		ID:            rec.ID,
+		Kind:          store.KindChannel,
+		UserID:        rec.UserID,
+		AgentID:       rec.AgentID,
+		Name:          rec.Type,
+		Enabled:       rec.Enabled,
+		CredentialKey: rec.AccountID,
+		Data:          rec.Data,
+		CreatedAt:     rec.CreatedAt,
+		UpdatedAt:     rec.UpdatedAt,
+	}
+	s.hotRegisterChannel(cfgRec)
 }
 
 // hotUnregisterChannel — paired with hotRegisterChannel for delete paths.

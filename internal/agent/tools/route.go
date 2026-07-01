@@ -98,10 +98,11 @@ func (r *Registry) routeFor(path string, op Operation) RouteTarget {
 	// Rule 2: local with sandbox configured → sandbox-first. Host disk is
 	// reachable only via explicit host-scope paths (the operator's
 	// Documents, an absolute /Users/<u>/... that's clearly NOT
-	// sandbox-internal, fastclaw-internal subtrees for upgrade ops).
+	// sandbox-internal). FastClaw internals must not be exposed through
+	// chat-facing file tools; operator maintenance should use host_exec.
 	if sandboxOK {
 		if isFastClawInternalPath(path) {
-			return RouteHostFS
+			return RouteSandbox
 		}
 		if isExplicitHostScope(path) {
 			return RouteHostFS
@@ -173,9 +174,8 @@ func isFastClawInternalPath(path string) bool {
 		return true
 	}
 	if filepath.IsAbs(path) {
-		if home, err := os.UserHomeDir(); err == nil {
-			fastclawDir := filepath.Join(home, ".fastclaw")
-			if path == fastclawDir || strings.HasPrefix(path, fastclawDir+string(filepath.Separator)) {
+		for _, root := range fastClawInternalRoots() {
+			if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
 				return true
 			}
 		}
@@ -183,12 +183,24 @@ func isFastClawInternalPath(path string) bool {
 	return false
 }
 
+func fastClawInternalRoots() []string {
+	roots := []string{}
+	if h := os.Getenv("FASTCLAW_HOME"); h != "" {
+		roots = append(roots, filepath.Clean(h))
+	}
+	roots = append(roots, filepath.Clean("/root/.fastclaw"))
+	if home, err := os.UserHomeDir(); err == nil {
+		roots = append(roots, filepath.Join(home, ".fastclaw"))
+	}
+	return roots
+}
+
 // isSandboxOnlyPath reports whether path only exists inside the sandbox
 // container — typically a bind-mount target. Host has the bind-source at
 // a different location, so naive host expansion would always 404.
 //
 //   - ~/.agents/...    : npx skills' install dir (bind-mounted from
-//                        ~/.fastclaw/users/<uid>/skills/)
+//     ~/.fastclaw/users/<uid>/skills/)
 //   - /root/.agents/.. : same, via the sandbox-resolved absolute path
 func isSandboxOnlyPath(path string) bool {
 	if strings.HasPrefix(path, "~/.agents") || strings.HasPrefix(path, "/root/.agents") {

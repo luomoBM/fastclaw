@@ -32,6 +32,7 @@ const (
 	RoleSuperAdmin = "super_admin"
 	RoleUser       = "user"
 	RoleAppUser    = "app_user"
+	RoleChannelUser = "channel_user"
 )
 
 // Statuses.
@@ -214,7 +215,7 @@ func (a *Accounts) Authenticate(ctx context.Context, login, password string) (*A
 	// would still fail-closed, but checking explicitly keeps the
 	// failure mode unambiguous and avoids burning bcrypt cycles on
 	// every probe.
-	if rec.PasswordHash == "" || rec.Role == RoleAppUser {
+	if rec.PasswordHash == "" || rec.Role == RoleAppUser || rec.Role == RoleChannelUser {
 		return nil, ErrInvalidCredentials
 	}
 	if err := bcrypt.CompareHashAndPassword([]byte(rec.PasswordHash), []byte(password)); err != nil {
@@ -329,22 +330,23 @@ func (a *Accounts) SetPassword(ctx context.Context, id, newPassword string) erro
 	return a.store.UpdateUser(ctx, rec)
 }
 
-// EnsureAppUser returns the fastclaw user representing (apikeyID, externalID),
+// EnsureAppUser returns the fastclaw user representing (ownerUserID, externalID),
 // creating one with role=app_user the first time it's seen. Idempotent:
-// later calls with the same pair return the existing row. The caller is
-// expected to be the api_key owner — Mint does not authenticate, that's
-// the auth middleware's job. Username/email are synthesized from the
-// pair and namespaced ("ext:<apikeyID>:<externalID>") so they don't
-// collide with real human signups but still satisfy the UNIQUE
-// constraints on those columns.
-func (a *Accounts) EnsureAppUser(ctx context.Context, apikeyID, externalID, displayName string) (*Account, error) {
-	apikeyID = strings.TrimSpace(apikeyID)
+// later calls with the same pair return the existing row.
+//
+// ownerUserID is the user who owns this app_user — typically the user
+// who created the API key that provisioned it. Stored in owner_user_id.
+//
+// apiKeyID is the specific API key used (stored in apikey_id for audit).
+// Pass "" when not applicable.
+func (a *Accounts) EnsureAppUser(ctx context.Context, ownerUserID, externalID, displayName, apiKeyID string) (*Account, error) {
+	ownerUserID = strings.TrimSpace(ownerUserID)
 	externalID = strings.TrimSpace(externalID)
-	if apikeyID == "" || externalID == "" {
-		return nil, errors.New("users.EnsureAppUser: apikeyID and externalID are required")
+	if ownerUserID == "" || externalID == "" {
+		return nil, errors.New("users.EnsureAppUser: ownerUserID and externalID are required")
 	}
 	// Fast path — already provisioned.
-	if rec, err := a.store.GetUserByExternal(ctx, apikeyID, externalID); err == nil {
+	if rec, err := a.store.GetUserByExternal(ctx, ownerUserID, externalID); err == nil {
 		return toAccount(rec), nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -353,28 +355,64 @@ func (a *Accounts) EnsureAppUser(ctx context.Context, apikeyID, externalID, disp
 	if err != nil {
 		return nil, err
 	}
-	// Synthesize unique username/email tokens. The downstream app
-	// is the source of truth for the human-readable identity; we
-	// only need *something* unique to satisfy the schema.
-	syn := apikeyID + ":" + externalID
 	rec := &store.UserRecord{
 		ID:           id,
-		Username:     "ext:" + syn,
-		Email:        syn + "@external.fastclaw.local",
+		Username:     id,
+		Email:        id + "@app_user",
 		PasswordHash: "",
 		DisplayName:  displayName,
 		Role:         RoleAppUser,
 		Status:       StatusActive,
-		APIKeyID:     apikeyID,
+		OwnerUserID:  ownerUserID,
+		APIKeyID:     apiKeyID,
 		ExternalID:   externalID,
 		AgentQuota:   -1,
 	}
 	if err := a.store.CreateUser(ctx, rec); err != nil {
-		// Race: another concurrent request minted the same pair
-		// between our GetUserByExternal and CreateUser. Re-read
-		// and return that row instead of bubbling the unique
-		// violation up to the caller.
-		if again, qerr := a.store.GetUserByExternal(ctx, apikeyID, externalID); qerr == nil {
+		if again, qerr := a.store.GetUserByExternal(ctx, ownerUserID, externalID); qerr == nil {
+			return toAccount(again), nil
+		}
+		return nil, err
+	}
+	return toAccount(rec), nil
+}
+
+// EnsureChatter returns the fastclaw user representing an IM channel
+// end-user under (ownerUserID, externalID), creating one with
+// role=chatter the first time it's seen. Idempotent.
+//
+// ownerUserID is the channel owner — the user/app_user whose agent
+// the chatter is talking to. This determines the isolation boundary:
+// same owner → shared memory; different owner → separate chatter.
+func (a *Accounts) EnsureChatter(ctx context.Context, ownerUserID, externalID, displayName string) (*Account, error) {
+	ownerUserID = strings.TrimSpace(ownerUserID)
+	externalID = strings.TrimSpace(externalID)
+	if ownerUserID == "" || externalID == "" {
+		return nil, errors.New("users.EnsureChatter: ownerUserID and externalID are required")
+	}
+	if rec, err := a.store.GetUserByExternal(ctx, ownerUserID, externalID); err == nil {
+		return toAccount(rec), nil
+	} else if !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	id, err := newID("u_")
+	if err != nil {
+		return nil, err
+	}
+	rec := &store.UserRecord{
+		ID:           id,
+		Username:     id,
+		Email:        id + "@channel_user",
+		PasswordHash: "",
+		DisplayName:  displayName,
+		Role:         RoleChannelUser,
+		Status:       StatusActive,
+		OwnerUserID:  ownerUserID,
+		ExternalID:   externalID,
+		AgentQuota:   -1,
+	}
+	if err := a.store.CreateUser(ctx, rec); err != nil {
+		if again, qerr := a.store.GetUserByExternal(ctx, ownerUserID, externalID); qerr == nil {
 			return toAccount(again), nil
 		}
 		return nil, err

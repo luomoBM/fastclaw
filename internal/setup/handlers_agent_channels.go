@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -14,7 +15,6 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
-	"github.com/fastclaw-ai/fastclaw/internal/scope"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 )
 
@@ -32,13 +32,14 @@ import (
 //   - "user"  — the caller's own per-user overlay on this agent
 //     (only the caller sees + can mutate it)
 type channelOut struct {
-	Type        string `json:"type"`
-	AccountID   string `json:"accountId"`
-	BotUsername string `json:"botUsername,omitempty"`
-	BotToken    string `json:"botToken"` // masked
-	Enabled     bool   `json:"enabled"`
-	UpdatedAt   string `json:"updatedAt,omitempty"`
-	Source      string `json:"source,omitempty"`
+	Type           string `json:"type"`
+	AccountID      string `json:"accountId"`
+	BotUsername     string `json:"botUsername,omitempty"`
+	BotToken       string `json:"botToken"` // masked
+	Enabled        bool   `json:"enabled"`
+	SharedIdentity bool   `json:"sharedIdentity"`
+	UpdatedAt      string `json:"updatedAt,omitempty"`
+	Source         string `json:"source,omitempty"`
 }
 
 // resolveChannelBindingScope authorizes a connect/disconnect call and
@@ -129,24 +130,16 @@ func (s *Server) handleListAgentChannels(w http.ResponseWriter, r *http.Request)
 	caller := s.effectiveUserID(r)
 	_ = rec // kept around in case future logic gates on agent ownership again
 
-	// Channel rows always carry the binder's user_id + the target
-	// agent_id, so the caller's view is "what I bound to this agent" —
-	// (user_id=caller, agent_id=id). The first ListConfigs covers the
-	// owner's own bindings on their agent and a non-owner's per-(user,
-	// agent) overlay alike.
-	//
-	// We additionally pull (user_id='', agent_id=id) for legacy
-	// installs whose pre-refactor "scope=agent" rows escaped the
-	// migration backfill (e.g. an agent without a user_id at the
-	// time). New rows are never written there.
+	// Try the new channels table first. If it has rows for this agent,
+	// use them exclusively; otherwise fall back to the configs table.
 	out := make([]channelOut, 0)
 	if caller != "" {
-		if rows, err := s.dataStore.ListConfigs(r.Context(), store.KindChannel, caller, id); err == nil {
-			out = append(out, flattenChannelRows(rows, "agent", "", "")...)
+		if chRows, err := s.dataStore.ListChannels(r.Context(), caller, id); err == nil && len(chRows) > 0 {
+			out = append(out, flattenChannelRecords(chRows, "agent")...)
 		}
 	}
-	if rows, err := s.dataStore.ListConfigs(r.Context(), store.KindChannel, "", id); err == nil {
-		out = append(out, flattenChannelRows(rows, "agent", "", "")...)
+	if chRows, err := s.dataStore.ListChannels(r.Context(), "", id); err == nil && len(chRows) > 0 {
+		out = append(out, flattenChannelRecords(chRows, "agent")...)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"channels": out})
 }
@@ -198,6 +191,46 @@ func flattenChannelRows(rows []store.ConfigRecord, source string, _, _ string, f
 				Enabled:     rec.Enabled,
 				UpdatedAt:   rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Source:      source,
+			})
+		}
+	}
+	return out
+}
+
+// flattenChannelRecords builds channelOut entries from ChannelRecord rows.
+func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelOut {
+	out := make([]channelOut, 0, len(rows))
+	for _, rec := range rows {
+		cc := config.ChannelConfig{}
+		if blob, err := json.Marshal(rec.Data); err == nil {
+			_ = json.Unmarshal(blob, &cc)
+		}
+		if len(cc.Accounts) == 0 {
+			out = append(out, channelOut{
+				Type:           rec.Type,
+				AccountID:      rec.AccountID,
+				BotToken:       maskAPIKey(rec.BotToken),
+				Enabled:        rec.Enabled,
+				SharedIdentity: rec.SharedIdentity,
+				UpdatedAt:      rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+				Source:         source,
+			})
+			continue
+		}
+		for accountID, acct := range cc.Accounts {
+			tok := acct.BotToken
+			if tok == "" {
+				tok = rec.BotToken
+			}
+			out = append(out, channelOut{
+				Type:           rec.Type,
+				AccountID:      accountID,
+				BotUsername:     accountID,
+				BotToken:       maskAPIKey(tok),
+				Enabled:        rec.Enabled,
+				SharedIdentity: rec.SharedIdentity,
+				UpdatedAt:      rec.UpdatedAt.Format("2006-01-02T15:04:05Z07:00"),
+				Source:         source,
 			})
 		}
 	}
@@ -256,11 +289,11 @@ func (s *Server) handleConnectAgentTelegram(w http.ResponseWriter, r *http.Reque
 	// fallback (credentialKeyFor) silently dropped every inbound
 	// message because no row matched.
 	credKey := username
-	if err := s.assertChannelCredentialUnique(r, "telegram", credKey, "", uid, aid); err != nil {
+	if err := s.assertChannelCredentialUniqueOpt(r, "telegram", credKey, "", uid, aid, true); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := scope.SaveChannel(r.Context(), s.dataStore, uid, aid, "telegram", credKey, true, cc); err != nil {
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "telegram", username, true, cc); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -279,13 +312,67 @@ func (s *Server) handleConnectAgentTelegram(w http.ResponseWriter, r *http.Reque
 	}
 
 	s.invalidateOwner(uid, aid)
-	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "telegram", credKey); rec != nil {
-		s.hotRegisterChannel(*rec)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "telegram", username); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"ok":          true,
 		"botUsername": username,
 	})
+}
+
+// handleUpdateAgentChannel patches channel-level settings (currently
+// only shared_identity). The channel is identified by (type, accountId)
+// within the agent's channels.
+//
+//	PATCH /api/agents/{id}/channels/{type}/{accountId}
+//	Body: {"sharedIdentity": true}
+func (s *Server) handleUpdateAgentChannel(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	agentID := r.PathValue("id")
+	channelType := r.PathValue("type")
+	accountID := r.PathValue("accountId")
+	uid, aid, ok := s.resolveChannelBindingScope(w, r, agentID)
+	if !ok {
+		return
+	}
+
+	var req struct {
+		SharedIdentity *bool `json:"sharedIdentity"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Find the channel row.
+	chs, err := s.dataStore.ListChannels(r.Context(), uid, aid)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	var target *store.ChannelRecord
+	for i := range chs {
+		if chs[i].Type == channelType && chs[i].AccountID == accountID {
+			target = &chs[i]
+			break
+		}
+	}
+	if target == nil {
+		jsonResponse(w, http.StatusNotFound, map[string]any{"error": "channel not found"})
+		return
+	}
+
+	if req.SharedIdentity != nil {
+		target.SharedIdentity = *req.SharedIdentity
+	}
+	if err := s.dataStore.SaveChannel(r.Context(), target); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleDisconnectAgentChannel(w http.ResponseWriter, r *http.Request) {
@@ -300,39 +387,19 @@ func (s *Server) handleDisconnectAgentChannel(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	// Locate the channel row at the resolved scope (agent for owner /
-	// admin, user for non-owner overlay). Match by accountID inside the
-	// row's Accounts map.
-	rows, err := s.dataStore.ListConfigs(r.Context(), store.KindChannel, uid, aid)
+	// Locate the channel row from the channels table.
+	chRows, err := s.dataStore.ListChannels(r.Context(), uid, aid)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	for _, rec := range rows {
-		if rec.Name != channelType {
+	for _, ch := range chRows {
+		if ch.Type != channelType || ch.AccountID != accountID {
 			continue
 		}
-		cc := decodeChannelConfigFromRecord(&rec)
-		_, hasAcct := cc.Accounts[accountID]
-		// When the row has no Accounts map, treat it as the legacy
-		// single-bot shape; accountID must be empty to match.
-		if !hasAcct && !(len(cc.Accounts) == 0 && accountID == "") {
-			continue
-		}
-		if hasAcct {
-			delete(cc.Accounts, accountID)
-		}
-		// If nothing left, drop the row; otherwise rewrite it.
-		if len(cc.Accounts) == 0 && (cc.BotToken == "" || hasAcct) {
-			if err := s.dataStore.DeleteConfig(r.Context(), rec.ID); err != nil {
-				jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
-		} else {
-			if err := scope.SaveChannelByScope(r.Context(), s.dataStore, rec.LegacyScope(), rec.LegacyScopeID(), rec.Name, rec.CredentialKey, rec.Enabled, cc); err != nil {
-				jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-				return
-			}
+		if err := s.dataStore.DeleteChannel(r.Context(), ch.ID); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
 		}
 		// Drop the matching binding too.
 		if err := s.removeBinding(r, "", "", id, channelType, accountID); err != nil {
@@ -455,11 +522,11 @@ func (s *Server) handleConnectAgentDiscord(w http.ResponseWriter, r *http.Reques
 		Accounts: map[string]config.AccountConfig{userID: {BotToken: token}},
 	}
 	credKey := userID
-	if err := s.assertChannelCredentialUnique(r, "discord", credKey, "", uid, aid); err != nil {
+	if err := s.assertChannelCredentialUniqueOpt(r, "discord", credKey, "", uid, aid, true); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := scope.SaveChannel(r.Context(), s.dataStore, uid, aid, "discord", credKey, true, cc); err != nil {
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "discord", userID, true, cc); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -471,8 +538,8 @@ func (s *Server) handleConnectAgentDiscord(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	s.invalidateOwner(uid, aid)
-	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "discord", credKey); rec != nil {
-		s.hotRegisterChannel(*rec)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "discord", userID); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"ok":          true,
@@ -591,11 +658,11 @@ func (s *Server) handleConnectAgentSlack(w http.ResponseWriter, r *http.Request)
 		Accounts: map[string]config.AccountConfig{teamID: {BotToken: botToken}},
 	}
 	credKey := teamID
-	if err := s.assertChannelCredentialUnique(r, "slack", credKey, "", uid, aid); err != nil {
+	if err := s.assertChannelCredentialUniqueOpt(r, "slack", credKey, "", uid, aid, true); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := scope.SaveChannel(r.Context(), s.dataStore, uid, aid, "slack", credKey, true, cc); err != nil {
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "slack", teamID, true, cc); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -607,8 +674,8 @@ func (s *Server) handleConnectAgentSlack(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.invalidateOwner(uid, aid)
-	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "slack", credKey); rec != nil {
-		s.hotRegisterChannel(*rec)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "slack", teamID); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"ok":        true,
@@ -873,10 +940,10 @@ func (s *Server) persistWeChatAccount(r *http.Request, userID, agentIDArg, agent
 		},
 	}
 	credKey := creds.ILinkBotID
-	if err := s.assertChannelCredentialUnique(r, "wechat", credKey, "", userID, agentIDArg); err != nil {
+	if err := s.assertChannelCredentialUniqueOpt(r, "wechat", credKey, "", userID, agentIDArg, true); err != nil {
 		return err
 	}
-	if err := scope.SaveChannel(r.Context(), s.dataStore, userID, agentIDArg, "wechat", credKey, true, cc); err != nil {
+	if err := s.saveChannelRecord(r.Context(), userID, agentIDArg, "wechat", creds.ILinkBotID, true, cc); err != nil {
 		return err
 	}
 	if err := s.appendBinding(r, "", "", config.Binding{
@@ -886,8 +953,8 @@ func (s *Server) persistWeChatAccount(r *http.Request, userID, agentIDArg, agent
 		return err
 	}
 	s.invalidateOwner(userID, agentIDArg)
-	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "wechat", credKey); rec != nil {
-		s.hotRegisterChannel(*rec)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "wechat", creds.ILinkBotID); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
 	}
 	return nil
 }
@@ -1036,11 +1103,11 @@ func (s *Server) handleConnectAgentFeishu(w http.ResponseWriter, r *http.Request
 		},
 	}
 	credKey := appID
-	if err := s.assertChannelCredentialUnique(r, "feishu", credKey, "", uid, aid); err != nil {
+	if err := s.assertChannelCredentialUniqueOpt(r, "feishu", credKey, "", uid, aid, true); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := scope.SaveChannel(r.Context(), s.dataStore, uid, aid, "feishu", credKey, true, cc); err != nil {
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "feishu", appID, true, cc); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -1052,8 +1119,8 @@ func (s *Server) handleConnectAgentFeishu(w http.ResponseWriter, r *http.Request
 		return
 	}
 	s.invalidateOwner(uid, aid)
-	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "feishu", credKey); rec != nil {
-		s.hotRegisterChannel(*rec)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "feishu", credKey); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
 	}
 	resp := map[string]any{
 		"ok":          true,
@@ -1148,11 +1215,11 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 		},
 	}
 	credKey := userID
-	if err := s.assertChannelCredentialUnique(r, "line", credKey, "", uid, aid); err != nil {
+	if err := s.assertChannelCredentialUniqueOpt(r, "line", credKey, "", uid, aid, true); err != nil {
 		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
 		return
 	}
-	if err := scope.SaveChannel(r.Context(), s.dataStore, uid, aid, "line", credKey, true, cc); err != nil {
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "line", userID, true, cc); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -1164,8 +1231,8 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.invalidateOwner(uid, aid)
-	if rec, _ := s.dataStore.LookupChannelByCredential(r.Context(), "line", credKey); rec != nil {
-		s.hotRegisterChannel(*rec)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "line", credKey); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
 		"ok":          true,
@@ -1193,4 +1260,62 @@ func lineWebhookPathFor(r *http.Request, userID string) string {
 		host = h
 	}
 	return scheme + "://" + host + "/api/line/webhook/" + userID
+}
+
+// saveChannelRecord writes a ChannelRecord to the channels table.
+// The channels table is the sole authoritative store for channel data.
+func (s *Server) saveChannelRecord(ctx context.Context, userID, agentID, channelType, accountID string, enabled bool, cc config.ChannelConfig) error {
+	if s.dataStore == nil {
+		return nil
+	}
+	data := channelConfigToData(cc)
+	ch := &store.ChannelRecord{
+		UserID:    userID,
+		AgentID:   agentID,
+		Type:      channelType,
+		AccountID: accountID,
+		Enabled:   enabled,
+		BotToken:  cc.BotToken,
+		Data:      data,
+	}
+	// Extract per-account fields when available.
+	if acct, ok := cc.Accounts[accountID]; ok {
+		if ch.BotToken == "" {
+			ch.BotToken = acct.BotToken
+		}
+		ch.BaseURL = acct.BaseURL
+		ch.PlatformUserID = acct.UserID
+	}
+	if err := s.dataStore.SaveChannel(ctx, ch); err != nil {
+		slog.Error("saveChannelRecord failed",
+			"type", channelType, "account", accountID, "error", err)
+		return fmt.Errorf("save channel record: %w", err)
+	}
+	return nil
+}
+
+// channelConfigToData converts a ChannelConfig to a JSON data map,
+// mirroring scope.channelToData but without the import cycle.
+func channelConfigToData(c config.ChannelConfig) map[string]interface{} {
+	blob, _ := json.Marshal(c)
+	var m map[string]interface{}
+	_ = json.Unmarshal(blob, &m)
+	delete(m, "enabled")
+	return m
+}
+
+// deleteChannelRecord removes a row from the channels table. Non-fatal
+// if it fails — the configs row is still authoritative.
+func (s *Server) deleteChannelRecord(ctx context.Context, channelType, accountID string) {
+	if s.dataStore == nil {
+		return
+	}
+	ch, err := s.dataStore.LookupChannel(ctx, channelType, accountID)
+	if err != nil || ch == nil {
+		return
+	}
+	if err := s.dataStore.DeleteChannel(ctx, ch.ID); err != nil {
+		slog.Warn("deleteChannelRecord failed (non-fatal)",
+			"type", channelType, "account", accountID, "error", err)
+	}
 }

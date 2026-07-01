@@ -8,11 +8,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
+	webfetchprovider "github.com/fastclaw-ai/fastclaw/internal/toolproviders/webfetch"
 )
 
 type webFetchArgs struct {
@@ -25,8 +25,6 @@ const (
 	fetchTimeout   = 30 * time.Second
 	fetchUserAgent = "FastClaw/1.0 (AI Agent Web Fetcher)"
 )
-
-var htmlTagRe = regexp.MustCompile(`<[^>]*>`)
 
 // safeFetchClient is an http.Client whose dialer rejects private,
 // loopback, link-local, multicast, and CGNAT addresses — the SSRF
@@ -109,14 +107,23 @@ func init() {
 }
 
 const webFetchDescription = "Fetch a single known URL and return its plain text. " +
+	"Use this only after you already know the exact target page URL. " +
 	"If the user's message itself contains a URL or bare domain " +
 	"(e.g. 'idoubi.ai', 'https://example.com/cv'), fetch THAT URL " +
 	"directly — prepend https:// for bare domains — instead of " +
-	"running web_search first. DO NOT guess URLs from memory: " +
+	"running web_search first. For search intent like 'search/find/look up', " +
+	"'nearby', 'events', 'news', 'reviews', 'weather', 'latest', or any request " +
+	"where you do not already have a concrete page URL, call web_search first. " +
+	"Never web_fetch search result pages such as google.com/search, bing.com/search, " +
+	"baidu.com/s, or duckduckgo.com/?q=; use web_search for those queries instead. " +
+	"DO NOT guess URLs from memory: " +
 	"your training data has stale paths and you will burn rounds " +
 	"on 404s. When the user described a page in natural language " +
 	"with no URL, run web_search first to discover the URL, then " +
-	"web_fetch that exact URL. If web_search isn't available, " +
+	"web_fetch that exact URL. If web_fetch on a concrete page fails with " +
+	"401/403/429, captcha, anti-bot, or JavaScript-required output, use the " +
+	"camoufox-cli skill in the sandbox against the same URL instead of retrying " +
+	"web_fetch. If web_search isn't available, " +
 	"prefer well-known stable hosts (en.wikipedia.org, github.com), " +
 	"not date-stamped article URLs. A URL that returned 4xx/5xx " +
 	"earlier in this turn will be refused if you retry it."
@@ -266,19 +273,25 @@ func webFetchTool(ctx context.Context, r *Registry, rawArgs json.RawMessage) (st
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
 
-	// Read body with a limit to prevent memory issues
-	limitReader := io.LimitReader(resp.Body, int64(maxLen*3)) // read more than needed since HTML is verbose
+	// Read body with a limit to prevent memory issues. WeChat articles
+	// need a bounded larger window because the readable #js_content node
+	// can appear after a long script/config prelude.
+	limitReader := io.LimitReader(resp.Body, webfetchprovider.FetchReadLimit(args.URL, maxLen))
 	body, err := io.ReadAll(limitReader)
 	if err != nil {
 		return "", fmt.Errorf("read body: %w", err)
 	}
 
-	// Strip HTML tags
-	text := stripHTML(string(body))
+	// Strip HTML tags, using site-specific article extraction when needed.
+	text := webfetchprovider.HTMLToText(args.URL, string(body))
 
-	// Truncate to max length
+	// Truncate to max length (UTF-8 safe: back up to a valid rune boundary).
 	if len(text) > maxLen {
-		text = text[:maxLen] + "\n[...truncated]"
+		cut := maxLen
+		for cut > 0 && cut < len(text) && text[cut]&0xC0 == 0x80 {
+			cut-- // skip continuation bytes so we don't split a multi-byte rune
+		}
+		text = text[:cut] + "\n[...truncated]"
 	}
 
 	return text, nil
@@ -298,34 +311,4 @@ func assertHTTPScheme(rawURL string) error {
 		return fmt.Errorf("scheme %q not allowed; use http or https", u.Scheme)
 	}
 	return nil
-}
-
-// stripHTML removes HTML tags and cleans up whitespace.
-func stripHTML(html string) string {
-	// Remove script and style elements entirely
-	scriptRe := regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`)
-	html = scriptRe.ReplaceAllString(html, "")
-	styleRe := regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`)
-	html = styleRe.ReplaceAllString(html, "")
-
-	// Remove HTML tags
-	text := htmlTagRe.ReplaceAllString(html, " ")
-
-	// Decode common HTML entities
-	text = strings.ReplaceAll(text, "&amp;", "&")
-	text = strings.ReplaceAll(text, "&lt;", "<")
-	text = strings.ReplaceAll(text, "&gt;", ">")
-	text = strings.ReplaceAll(text, "&quot;", "\"")
-	text = strings.ReplaceAll(text, "&#39;", "'")
-	text = strings.ReplaceAll(text, "&nbsp;", " ")
-
-	// Collapse whitespace
-	spaceRe := regexp.MustCompile(`[ \t]+`)
-	text = spaceRe.ReplaceAllString(text, " ")
-
-	// Collapse multiple newlines
-	nlRe := regexp.MustCompile(`\n{3,}`)
-	text = nlRe.ReplaceAllString(text, "\n\n")
-
-	return strings.TrimSpace(text)
 }

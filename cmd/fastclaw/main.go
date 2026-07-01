@@ -17,6 +17,8 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/daemon"
 	"github.com/fastclaw-ai/fastclaw/internal/gateway"
+	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
+	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/setup"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 )
@@ -63,11 +65,20 @@ func (a *apiResolver) EnsureAgent(ctx context.Context, userID, agentID string) e
 // chat turn.
 func (a *apiResolver) ReloadAgents() error { return a.gw.ReloadAgents() }
 
+// ReloadSandbox rebuilds the gateway-owned sandbox executor pool after
+// system-scope sandbox settings change, avoiding a manual process restart.
+func (a *apiResolver) ReloadSandbox() error { return a.gw.ReloadSandbox() }
+
 // RegisterChannelFromConfig hot-starts a freshly-saved channel row.
 // Called by setup handlers after they persist a new bot config so the
 // adapter starts polling without a process restart.
 func (a *apiResolver) RegisterChannelFromConfig(rec store.ConfigRecord) error {
 	return a.gw.RegisterChannelFromConfig(rec)
+}
+
+// RegisterChannel hot-starts a freshly-saved ChannelRecord.
+func (a *apiResolver) RegisterChannel(rec store.ChannelRecord) error {
+	return a.gw.RegisterChannel(rec)
 }
 
 func (a *apiResolver) UnregisterChannel(channelType, accountID string) {
@@ -105,6 +116,11 @@ func main() {
 	rootCmd.AddCommand(agentsCmd())
 	rootCmd.AddCommand(sessionCmd())
 	rootCmd.AddCommand(wechatCmd())
+	rootCmd.AddCommand(cronCmd())
+	rootCmd.AddCommand(channelsCmd())
+	rootCmd.AddCommand(toolsCmd())
+	rootCmd.AddCommand(usageCmd())
+	rootCmd.AddCommand(projectsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -185,7 +201,121 @@ func runGateway(port int) error {
 	gw.SetChatEvents(webSrv.ChatEventHub())
 
 	apiSrv := api.NewServer(&apiResolver{gw: gw}, authResolver, gwCfg)
+	apiSrv.SetMeter(gw.Usage())
+	apiSrv.SetQuotaStore(gw.QuotaStore())
 	webSrv.SetAPIServer(apiSrv)
+
+	// Coding-agent project runtime: long-lived dev-server sandbox +
+	// preview URL, layered on top of the existing project feature. Wired
+	// for the docker sandbox backend; other backends leave it nil and the
+	// /runtime endpoints return 503. Template scaffold/dev commands are
+	// env-overridable so fastclaw stays template-agnostic — the default
+	// targets a ShipAny image with the template baked at /template.
+	if home, herr := config.HomeDir(); herr == nil {
+		// backend + shared pool let the runtime host previews through the
+		// agent's pooled executor on non-docker backends (e2b/boxlite);
+		// docker keeps its dedicated-container path. Pool is nil when
+		// sandboxing is disabled, which keeps the docker path.
+		rtMgr := coderuntime.NewManager(
+			gw.Store(), home, env.Sandbox.Image,
+			&sandbox.Policy{}, os.Getenv("FASTCLAW_PREVIEW_BASE"),
+			env.Sandbox.Backend, gw.SandboxPool())
+		rtMgr.RegisterTemplate("shipany-tanstack", coderuntime.TemplateSpec{
+			DevPort: 3000,
+			// Default scaffold, validated end-to-end against
+			// thinkany/fastclaw-sandbox (node+npm, no pnpm):
+			//   1. copy the template EXCLUDING node_modules — the host
+			//      checkout's are platform-specific + huge; a fresh
+			//      in-container install is correct.
+			//   2. ensure pnpm (base image ships node+npm only).
+			//   3. verify-deps-before-run=false — pnpm 11 otherwise re-runs
+			//      `install` before every `dev`, which keeps failing on the
+			//      ignored-builds gate and aborts the dev server.
+			//   4. `install || true` — the ignored-builds gate exits non-zero
+			//      AFTER deps are on disk, so tolerate it.
+			//   5. `pnpm rebuild` — actually build esbuild/sharp so Vite runs.
+			// Override wholesale with FASTCLAW_SHIPANY_SCAFFOLD.
+			ScaffoldCmd: envOr("FASTCLAW_SHIPANY_SCAFFOLD",
+				"set -e; if [ -d /template ]; then tar -C /template "+
+					"--exclude=node_modules --exclude=.git --exclude=.output --exclude=dist "+
+					"-cf - . | tar -C /workspace -xf -; fi; cd /workspace; "+
+					"command -v pnpm >/dev/null 2>&1 || npm i -g pnpm; "+
+					// Point pnpm at the shared store volume so installs after the
+					// first reuse downloaded packages instead of re-fetching.
+					"pnpm config set store-dir /pnpm-store 2>/dev/null || true; "+
+					"pnpm config set verify-deps-before-run false; "+
+					"pnpm install || true; pnpm rebuild; "+
+					// Snapshot the pristine template as a git baseline so the UI
+					// can later show ONLY the files the agent changed (git status
+					// vs this commit). .gitignore already excludes node_modules /
+					// build output, so the diff stays clean.
+					"git config --global --add safe.directory '*' 2>/dev/null || true; "+
+					"git init -q 2>/dev/null || true; git add -A 2>/dev/null || true; "+
+					"git -c user.email=bot@fastclaw -c user.name=fastclaw commit -q -m baseline 2>/dev/null || true"),
+			// Self-heal pnpm before running: the base image ships node+npm
+			// only, and pnpm is installed globally (container FS, NOT the
+			// bind-mounted /workspace). On a wake/re-up the container is
+			// recreated but the workspace already has files, so scaffold is
+			// skipped and the global pnpm is gone — `pnpm dev` would then
+			// fail "pnpm: not found". Ensuring it here makes DevCmd robust
+			// across container recreation without re-running the scaffold.
+			// Self-heal pnpm + its run-time config before starting dev. Both
+			// live in the container FS (global pnpm install + ~/.pnpmrc), NOT
+			// the bind-mounted /workspace, so a wake/re-up that recreates the
+			// container loses them while scaffold is skipped (workspace
+			// non-empty). Without `verify-deps-before-run false`, pnpm 11
+			// re-runs a deps-status check before `dev` that fails against the
+			// volume-mounted node_modules and aborts the server.
+			// Self-heal pnpm, its config, AND deps before dev. All three live
+			// outside the bind-mounted /workspace (global pnpm in container
+			// FS; node_modules in a per-scope volume that Stop removes), so a
+			// re-up after Stop recreates the container with files present
+			// (scaffold skipped) but no deps — `pnpm dev` would then die with
+			// "vite: not found". Reinstalling when node_modules/.bin/vite is
+			// missing makes every boot self-correct (fast: the shared pnpm
+			// store volume hard-links, no re-download).
+			DevCmd: envOr("FASTCLAW_SHIPANY_DEV",
+				"command -v pnpm >/dev/null 2>&1 || npm i -g pnpm; "+
+					"pnpm config set verify-deps-before-run false 2>/dev/null || true; "+
+					"[ -x node_modules/.bin/vite ] || pnpm install || true; "+
+					"pnpm dev --host 0.0.0.0 --port 3000"),
+			// Local template checkout bind-mounted at /template (option C):
+			// set FASTCLAW_SHIPANY_TEMPLATE_DIR=~/code/shipany-tanstack to
+			// scaffold from disk without baking the image or cloning.
+			TemplateMount: os.Getenv("FASTCLAW_SHIPANY_TEMPLATE_DIR"),
+		})
+		// A second, lighter template demonstrating multi-template support:
+		// a plain Vite + React + TS starter. It needs no baked /template and
+		// no R2 source — it self-scaffolds with `npm create vite` — and shares
+		// the SAME sandbox image as shipany (Node toolchain), so it proves the
+		// "one e2b image, many templates differing only by ScaffoldCmd" model
+		// (no per-template image needed for same-stack templates). Vite's HMR
+		// client follows the page origin, so it works through both docker's
+		// host-port map and e2b's <port>-<id>.e2b.app proxy with no extra
+		// config. shipany-tanstack above is untouched.
+		rtMgr.RegisterTemplate("vite-react", coderuntime.TemplateSpec{
+			DevPort: 5173,
+			ScaffoldCmd: envOr("FASTCLAW_VITE_REACT_SCAFFOLD",
+				"set -e; cd /workspace; "+
+					"if [ ! -f package.json ]; then "+
+					"npm create vite@latest .fctmp -- --template react-ts && "+
+					"cp -a .fctmp/. ./ && rm -rf .fctmp; fi; "+
+					"npm install; "+
+					// Git baseline so the UI's changed-files view diffs against
+					// the pristine scaffold — same pattern as shipany above.
+					"git config --global --add safe.directory '*' 2>/dev/null || true; "+
+					"git init -q 2>/dev/null || true; git add -A 2>/dev/null || true; "+
+					"git -c user.email=bot@fastclaw -c user.name=fastclaw commit -q -m baseline 2>/dev/null || true"),
+			DevCmd: envOr("FASTCLAW_VITE_REACT_DEV",
+				"[ -x node_modules/.bin/vite ] || npm install; "+
+					"npm run dev -- --host 0.0.0.0 --port 5173"),
+		})
+		webSrv.SetRuntimeManager(rtMgr) // HTTP /runtime endpoints
+		gw.SetProjectRuntime(rtMgr)     // agent preview tools
+		slog.Info("project runtime enabled",
+			"previewBase", os.Getenv("FASTCLAW_PREVIEW_BASE"),
+			"templateDir", os.Getenv("FASTCLAW_SHIPANY_TEMPLATE_DIR"))
+	}
 
 	bindMode := gwCfg.Bind
 	if bindMode == "" {
@@ -244,6 +374,14 @@ func checkHTTPPort(port int, bindMode string) error {
 		return fmt.Errorf("setup: listen %s: %w", addr, err)
 	}
 	return ln.Close()
+}
+
+// envOr returns the value of env var key, or def when it's unset/empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func countUsersSafe(gw *gateway.Gateway) (int, error) {

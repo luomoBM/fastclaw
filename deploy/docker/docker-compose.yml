@@ -26,6 +26,11 @@ services:
     volumes:
       - fastclaw-data:/data/.fastclaw
     environment:
+      # Server default timezone (IANA name). This is the LAST fallback in
+      # the chain chatter pref → agent default → system default → TZ —
+      # without it the container runs UTC and agents whose chatters never
+      # set a timezone get UTC wall clocks and UTC-fired schedules.
+      TZ: "${TZ:-Asia/Shanghai}"
       # FASTCLAW_HOME — sqlite db path + sandbox root + skill cache live here
       FASTCLAW_HOME: /data/.fastclaw
       # Bind to all interfaces so the host port mapping works

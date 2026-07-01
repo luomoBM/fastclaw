@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -20,7 +21,9 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/mcp"
 	"github.com/fastclaw-ai/fastclaw/internal/privacy"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
+	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
+	"github.com/fastclaw-ai/fastclaw/internal/scope"
 	"github.com/fastclaw-ai/fastclaw/internal/session"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/toolproviders"
@@ -50,11 +53,11 @@ type Agent struct {
 	// even after the operator explicitly chose chatbot/customize.
 	// PromptMode also drives the per-turn tool filter via
 	// builtinAllowForMode below.
-	promptMode string
-	homePath        string // agent's home: SOUL.md, sessions, memory, skills
-	workspacePath   string // working dir where agent creates user files
-	homeDir         string // FastClaw root, ~/.fastclaw
-	ownerUserID     string // the user that owns this agent (for hook namespacing)
+	promptMode    string
+	homePath      string // agent's home: SOUL.md, sessions, memory, skills
+	workspacePath string // working dir where agent creates user files
+	homeDir       string // FastClaw root, ~/.fastclaw
+	ownerUserID   string // the user that owns this agent (for hook namespacing)
 	// admins is the per-channel allowlist of chatters who can run write-
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
@@ -104,6 +107,10 @@ type Agent struct {
 	// gateway wires it in via SetMeter at boot — local-only dev runs
 	// leave it nil and metering becomes a no-op via meterTokens().
 	meter usage.Meter
+	// quotaStore is the per-user billing quota store. When set, the
+	// agent loop checks the owner's quota before processing a turn.
+	// Nil means no quota enforcement (unlimited).
+	quotaStore usage.QuotaStore
 	// sandboxPool is the per-user (agent + session) sandbox pool. Set
 	// once at boot/hot-reload by attachSandboxToAgents; bindSession
 	// pulls a session-scoped executor from it at the top of every turn
@@ -117,6 +124,14 @@ type Agent struct {
 	// and hook are simply not registered, so a missing store silently
 	// degrades to "feature off" rather than crashing.
 	goalStore goal.Store
+
+	// projectRuntime, when non-nil, turns this agent into a coding agent:
+	// it can scaffold a project from a template, boot a dev server, and
+	// hand back a preview URL via the start_app_preview / app_preview_logs
+	// tools. Wired by attachProjectRuntimeToAgents at boot. Nil for
+	// ordinary agents, which then never see those tools and keep their
+	// per-chat file isolation. See SetProjectRuntime.
+	projectRuntime *coderuntime.Manager
 }
 
 // SetSandboxPool wires the per-(agent,session) executor pool. Called by
@@ -152,17 +167,35 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 // bindSession wires per-turn session state into the tool registry: the
 // session-scoped sandbox executor (when a pool is configured), the
 // sessionID workspace.Store calls use to namespace artifacts, and the
-// (channel, chatID) bus address so deferred-work tools (create_cron_job)
+// (channel, accountID, chatID) bus address so deferred-work tools (create_cron_job)
 // can stamp it onto persisted rows for later replay. Called at the top
 // of HandleMessage / HandleMessageStream before any tool runs.
 //
 // Mutating the shared registry across concurrent chats would race, but
 // the current invariant is one chat-in-flight per agent — the gateway
 // serializes per-agent turns. Documenting it here in case that changes.
-func (a *Agent) bindSession(ctx context.Context, channel, sessionID, projectID string) {
+func (a *Agent) bindSession(ctx context.Context, channel, accountID, sessionID, projectID string) {
 	a.registry.SetSessionID(sessionID)
 	a.registry.SetProjectID(projectID)
-	a.registry.SetMessageContext(channel, sessionID)
+	// Coding agents (those with a project runtime wired) treat a project
+	// as ONE shared app tree: file tools address the project root so the
+	// agent's edits land where the dev server serves. Only when actually
+	// inside a project; loose chats and non-coding agents are unaffected.
+	a.registry.SetCodingRootScope(a.projectRuntime != nil && projectID != "")
+	// If this scope already has a running app (a runtime record exists),
+	// redirect file tools into its app subfolder so edits keep landing
+	// where the dev server serves — across turns, not just the turn that
+	// called start_app_preview. EffectiveUserID is the owner here
+	// (chatter is bound later), which is correct for the web-direct case.
+	a.registry.SetCodingSubdir("")
+	if a.projectRuntime != nil {
+		if uid := a.registry.EffectiveUserID(); uid != "" {
+			if _, err := a.projectRuntime.Get(ctx, uid, a.name, projectID, sessionID); err == nil {
+				a.registry.SetCodingSubdir(coderuntime.AppSubdir)
+			}
+		}
+	}
+	a.registry.SetMessageContext(channel, accountID, sessionID)
 	if a.sandboxPool == nil {
 		return
 	}
@@ -307,15 +340,15 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		maxParallelToolCalls: rc.MaxParallelToolCalls,
 		thinking:             rc.Thinking,
 		promptMode:           rc.PromptMode,
-		homePath:        rc.Home,
-		workspacePath:   workspace,
-		homeDir:         homeDir,
-		admins:          rc.Admins,
-		skillsCfg:       rc.Skills,
-		globalSkillsCfg: globalSkillsCfg,
-		messageBus:      mb,
-		engine:          eng,
-		costTracker:     eng.costTracker,
+		homePath:             rc.Home,
+		workspacePath:        workspace,
+		homeDir:              homeDir,
+		admins:               rc.Admins,
+		skillsCfg:            rc.Skills,
+		globalSkillsCfg:      globalSkillsCfg,
+		messageBus:           mb,
+		engine:               eng,
+		costTracker:          eng.costTracker,
 	}
 
 	// Multi-bubble split-replies: per-agent only — system-level toggle
@@ -511,7 +544,7 @@ func (a *Agent) SteerWeb(sessionId, projectIDHint, text string) bool {
 // delivered (e.g. the group `\[name\]:` prefix). Returns false when no
 // turn is active so the caller falls back to taskQueue.Submit.
 func (a *Agent) SteerInbound(msg bus.InboundMessage, text string) bool {
-	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
 	return sess.PushSteerIfActive(provider.Message{
 		Role:      "user",
 		Content:   text,
@@ -580,7 +613,7 @@ func (a *Agent) SetGroupContext(gc *GroupContext) {
 // reads it as a bracketed sender label — the backslash escapes are well-
 // understood markdown source.
 func (a *Agent) InjectGroupMessage(ctx context.Context, msg bus.InboundMessage) {
-	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
 	label := msg.SenderName
 	if label == "" {
 		label = "Bot"
@@ -622,26 +655,51 @@ func (a *Agent) OwnerUserID() string { return a.ownerUserID }
 // invocation. Nil is fine — meterTokens() is a no-op when unset.
 func (a *Agent) SetMeter(m usage.Meter) { a.meter = m }
 
+// SetQuotaStore wires the billing quota store. Called by the gateway at
+// boot / hot-reload alongside SetMeter. Nil disables quota enforcement.
+func (a *Agent) SetQuotaStore(qs usage.QuotaStore) { a.quotaStore = qs }
+
+// checkQuota returns a non-empty rejection message when the agent's
+// owner has exceeded their billing quota. Returns "" when the request
+// should proceed (no quota, unlimited, or still under limit).
+func (a *Agent) checkQuota(ctx context.Context) string {
+	if a.quotaStore == nil || a.meter == nil {
+		return ""
+	}
+	status, err := usage.CheckQuota(ctx, a.quotaStore, a.meter, a.ownerUserID)
+	if err != nil || status.Allowed {
+		return ""
+	}
+	return fmt.Sprintf("Sorry, your usage quota has been exceeded (used %d/%d tokens, %d/%d requests). Your quota resets on %s. Please contact your service provider to upgrade your plan.",
+		status.TokensUsed, status.MonthlyTokenLimit,
+		status.RequestsUsed, status.MonthlyRequestLimit,
+		status.ResetsAt)
+}
+
 // meterTokens records one Chat call's token counts. Safe to call with
 // zero usage (still bumps request_count). Errors are logged but never
 // propagated — metering must not break the chat path. The agent's
 // configured model string carries the provider prefix when a per-agent
 // override is set; we split it so the meter stores provider and model
 // in their own columns rather than mashing them together.
-func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.Usage) {
+// durationMs is the wall-clock time of the LLM call; pass 0 when not
+// measured (the daily bucket doesn't use it, only the log table).
+func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.Usage, durationMs int64) {
 	if a.meter == nil {
 		return
 	}
 	prov, mdl := provider.SplitProviderModel(a.model)
-	err := a.meter.RecordTokens(ctx, a.ownerUserID, a.agentID, sessionKey, prov, mdl,
-		usage.Tokens{
-			Input:         u.InputTokens,
-			Output:        u.OutputTokens,
-			CacheRead:     u.CacheReadTokens,
-			CacheCreation: u.CacheCreationTokens,
-		})
-	if err != nil {
+	t := usage.Tokens{
+		Input:         u.InputTokens,
+		Output:        u.OutputTokens,
+		CacheRead:     u.CacheReadTokens,
+		CacheCreation: u.CacheCreationTokens,
+	}
+	if err := a.meter.RecordTokens(ctx, a.ownerUserID, a.agentID, sessionKey, prov, mdl, t); err != nil {
 		slog.Warn("meter record failed", "agent", a.name, "error", err)
+	}
+	if err := a.meter.RecordTokenLog(ctx, a.ownerUserID, a.agentID, sessionKey, prov, mdl, t, durationMs); err != nil {
+		slog.Warn("meter log failed", "agent", a.name, "error", err)
 	}
 }
 
@@ -662,6 +720,14 @@ func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.U
 // HandleMessage path. Providers that don't actually stream still work
 // — they just deliver one big chunk on Done.
 func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+	return a.streamChatToResponseWithOptions(ctx, messages, tools, true)
+}
+
+func (a *Agent) streamChatToResponseQuiet(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
+	return a.streamChatToResponseWithOptions(ctx, messages, tools, false)
+}
+
+func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []provider.Message, tools []provider.Tool, emitDeltas bool) (*provider.Response, error) {
 	sr, err := a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
 	if err != nil {
 		return nil, err
@@ -681,15 +747,17 @@ func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Me
 		}
 		if chunk.Content != "" {
 			contentBuilder.WriteString(chunk.Content)
-			// Push the incremental delta. The web chat panel
-			// appends it to the bubble in progress; consumers
-			// that only know about the legacy `content` event
-			// ignore unknown types and rely on the final
-			// emit (caller's responsibility) instead.
-			emitEvent(ctx, ChatEvent{
-				Type: "content_delta",
-				Data: map[string]any{"delta": chunk.Content},
-			})
+			if emitDeltas {
+				// Push the incremental delta. The web chat panel
+				// appends it to the bubble in progress; consumers
+				// that only know about the legacy `content` event
+				// ignore unknown types and rely on the final
+				// emit (caller's responsibility) instead.
+				emitEvent(ctx, ChatEvent{
+					Type: "content_delta",
+					Data: map[string]any{"delta": chunk.Content},
+				})
+			}
 		}
 		if chunk.Done {
 			toolCalls = chunk.ToolCalls
@@ -817,7 +885,7 @@ func (a *Agent) sessionHasActiveGoal(ctx context.Context, msg bus.InboundMessage
 	if a.goalStore == nil || a.sessions == nil {
 		return false
 	}
-	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
 	if sess == nil {
 		return false
 	}
@@ -1595,13 +1663,18 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	chatterUID := a.chatterUserID(msg)
 	ctx = sandbox.WithUserID(ctx, chatterUID)
 	ctx = store.WithChatterUserID(ctx, chatterUID)
-	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	ctx = store.WithChannel(ctx, msg.Channel)
+	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
 	// Session.ctx() builds its OWN context from session-held fields
 	// rather than inheriting the caller's ctx — without binding the
 	// chatter onto sess itself, the WithChatterUserID we just stamped
 	// above never reaches AppendSessionMessage / SaveSession and the
 	// chatter_user_id column stays empty.
 	sess.SetChatter(chatterUID)
+	{
+		prov, mdl := provider.SplitProviderModel(a.model)
+		sess.SetProviderModel(prov, mdl)
+	}
 	// Steering during plan drafting: plan mode has no ReAct loop to drain
 	// into, so a mid-draft steer is parked in history and answered on
 	// the user's next turn — which matches the plan-mode contract
@@ -1640,7 +1713,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	if catalog != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: catalog})
 	}
-	messages = append(messages, sess.GetMessages()...)
+	messages = append(messages, a.withMessageTimestampsForChatter(sess.GetMessages(), chatterUID)...)
 	if a.piiScrubEnabled {
 		messages = privacy.ScrubMessages(messages)
 	}
@@ -1652,7 +1725,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 		emitEvent(ctx, ChatEvent{Type: "done"})
 		return "Sorry, I couldn't draft the plan — the LLM call failed."
 	}
-	a.meterTokens(ctx, sess.Key(), resp.Usage)
+	a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 
 	planMeta := map[string]any{"planMode": true}
 	sess.Append(provider.Message{
@@ -1704,6 +1777,50 @@ func (a *Agent) flushLeftoverSteer(sess *session.Session) {
 	}
 }
 
+// llmRetry wraps an LLM call with retry logic for transient errors (network
+// glitches, server 5xx, EOF). Context cancellation / deadline exceeded are
+// treated as terminal — there's no point retrying when the caller has gone
+// away or the deadline has passed. Uses exponential backoff (1s, 4s, 9s)
+// across up to wechatLLMRetryAttempts calls.
+//
+// The label argument is used for structured logging (typically a.name).
+const llmRetryAttempts = 3
+
+func llmRetry(ctx context.Context, label string, fn func(context.Context) (*provider.Response, error)) (*provider.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= llmRetryAttempts; attempt++ {
+		resp, err := fn(ctx)
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("LLM call succeeded after retries",
+					"agent", label, "attempts", attempt)
+			}
+			return resp, nil
+		}
+		lastErr = err
+
+		// Context errors are terminal — don't retry.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, err
+		}
+
+		if attempt < llmRetryAttempts {
+			backoff := time.Duration(attempt*attempt) * time.Second // 1s, 4s, 9s
+			slog.Warn("LLM call failed, retrying",
+				"agent", label, "attempt", attempt,
+				"max", llmRetryAttempts, "backoff", backoff, "error", err)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil, errors.Join(lastErr, ctx.Err())
+			}
+		}
+	}
+	slog.Error("LLM call failed after all retries",
+		"agent", label, "attempts", llmRetryAttempts, "error", lastErr)
+	return nil, lastErr
+}
+
 // HandleMessage processes an inbound message through the ReAct loop.
 func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) string {
 	// Check for slash commands first. Empty reply means "handled but
@@ -1727,6 +1844,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			emitEvent(ctx, ChatEvent{Type: "done"})
 		}
 		return result.reply
+	}
+
+	// Quota gate: reject the turn early when the agent owner has
+	// exceeded their billing ceiling. Checked before plan-mode and
+	// the main ReAct loop so no LLM tokens are burned.
+	if rejection := a.checkQuota(ctx); rejection != "" {
+		emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": rejection}})
+		emitEvent(ctx, ChatEvent{Type: "done"})
+		return rejection
 	}
 
 	// Plan mode short-circuits the ReAct loop: tools off, the model
@@ -1765,6 +1891,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// continue to list "all sessions on my bots"; chatter_user_id
 	// records the actual participant for per-chatter queries.
 	ctx = store.WithChatterUserID(ctx, chatterUID)
+	ctx = store.WithChannel(ctx, msg.Channel)
 	// Per-turn channel context for the skill-refresh diagnostic. Lets
 	// us correlate the "skills summary refreshed" log emitted inside
 	// refreshSkillsFromStore with the channel the request arrived on,
@@ -1772,18 +1899,22 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	slog.Info("turn: refreshing skills",
 		"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID, "user", chatterUID)
 	a.refreshSkillsFromStore(chatterUID)
-	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
 	// Bind chatter onto sess. Session.ctx() builds its own
 	// context.Background-rooted ctx for store calls, so the
 	// WithChatterUserID we stamped onto the caller ctx above does NOT
 	// reach AppendSessionMessage / SaveSession on its own — sess has to
 	// carry the chatter itself.
 	sess.SetChatter(chatterUID)
+	{
+		prov, mdl := provider.SplitProviderModel(a.model)
+		sess.SetProviderModel(prov, mdl)
+	}
 	// Bind the registry to this chat's session so workspace.Store reads
 	// + writes get session-scoped paths and (when a sandbox pool is
 	// wired) the executor used by exec/read_file/list_dir is tied to a
 	// session-private container.
-	a.bindSession(ctx, msg.Channel, msg.ChatID, msg.ProjectID)
+	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 	// Flag whether this turn's chatter is the agent owner / channel
 	// admin. File tools use this to refuse identity-file reads from
 	// regular chatters (SOUL/IDENTITY/BOOTSTRAP/... leak as verbatim
@@ -1877,7 +2008,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, sessionMsgs...)
+	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -1953,22 +2084,30 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			})
 		}
 		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-		resp, err := a.streamChatToResponse(ctx, llmMessages, callTools)
+		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+			return a.streamChatToResponse(ctx, llmMessages, callTools)
+		})
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
-			slog.Error("LLM chat failed", "agent", a.name, "error", err)
+			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			return "Sorry, I encountered an error processing your request."
 		}
-		a.meterTokens(ctx, sess.Key(), resp.Usage)
+		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
+			if strings.TrimSpace(resp.Content) == "" {
+				emptyMsg := "model returned an empty response"
+				emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": emptyMsg}})
+				emitEvent(ctx, ChatEvent{Type: "done"})
+				return emptyMsg
+			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
@@ -2243,10 +2382,10 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		finalMessages = privacy.ScrubMessages(finalMessages)
 	}
 	finalContent := ""
-	finalResp, finalErr := a.streamChatToResponse(ctx, finalMessages, nil)
+	finalResp, finalErr := a.streamChatToResponseQuiet(ctx, finalMessages, nil)
 	if finalErr == nil {
-		finalContent = finalResp.Content
-		a.meterTokens(ctx, sess.Key(), finalResp.Usage)
+		finalContent = scrubLeakedToolCallContent(finalResp.Content)
+		a.meterTokens(ctx, sess.Key(), finalResp.Usage, 0)
 	}
 	if finalContent == "" {
 		// Synthesis call itself failed or returned empty — fall back to
@@ -2506,20 +2645,30 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		return provider.NewStreamReader(ch)
 	}
 
+	// Quota gate — mirrors the check in HandleMessage.
+	if rejection := a.checkQuota(ctx); rejection != "" {
+		return a.stringStream(rejection)
+	}
+
 	chatterUID := a.chatterUserID(msg)
 	ctx = sandbox.WithUserID(ctx, chatterUID)
 	// Tag ctx so DBStore session writes stamp chatter_user_id — see
 	// the HandleMessage path for the rationale.
 	ctx = store.WithChatterUserID(ctx, chatterUID)
+	ctx = store.WithChannel(ctx, msg.Channel)
 	slog.Info("turn: refreshing skills",
 		"agent", a.name, "channel", msg.Channel, "chat_id", msg.ChatID, "user", chatterUID)
 	a.refreshSkillsFromStore(chatterUID)
-	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
+	sess := a.sessions.Get(sessionTriple(msg, msg.ProjectID))
 	// Bind chatter onto sess so its ctx() embeds WithChatterUserID
 	// for DBStore session writes — Session.ctx() rebuilds ctx from its
 	// own fields, so the chatter has to live on sess itself.
 	sess.SetChatter(chatterUID)
-	a.bindSession(ctx, msg.Channel, msg.ChatID, msg.ProjectID)
+	{
+		prov, mdl := provider.SplitProviderModel(a.model)
+		sess.SetProviderModel(prov, mdl)
+	}
+	a.bindSession(ctx, msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 	a.registry.SetCallerIsAdmin(a.isAdminChatter(msg))
 	a.registry.SetGoalSessionKey(sess.SessionKey())
 	// Per-user file writes (USER.md / MEMORY.md) need to land in the
@@ -2573,7 +2722,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	if reminder := renderChatbotPersistenceReminder(a.promptMode, a.displayName, chatterMem.LoadUserFile(), chatterMem.LoadMemory()); reminder != "" {
 		messages = append(messages, provider.Message{Role: "system", Content: reminder})
 	}
-	messages = append(messages, sessionMsgs...)
+	messages = append(messages, a.withMessageTimestampsForChatter(sessionMsgs, chatterUID)...)
 
 	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
 
@@ -2591,16 +2740,18 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 		a.hooks.Run(ctx, hcBefore)
 
 		dumpLLMRequest(a.name, a.model, messages, toolDefs)
-		resp, err := a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+		resp, err := llmRetry(ctx, a.name, func(ctx context.Context) (*provider.Response, error) {
+			return a.provider.Chat(ctx, messages, toolDefs, a.model, a.maxTokens, a.temperature)
+		})
 
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
 		a.hooks.Run(ctx, hcAfter)
 
 		if err != nil {
-			slog.Error("LLM chat failed", "agent", a.name, "error", err)
+			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			return a.stringStream("Sorry, I encountered an error processing your request.")
 		}
-		a.meterTokens(ctx, sess.Key(), resp.Usage)
+		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
@@ -2656,7 +2807,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 						return
 					}
 				}
-				a.meterTokens(ctx, sess.Key(), streamUsage)
+				a.meterTokens(ctx, sess.Key(), streamUsage, 0)
 				msg := provider.Message{Role: "assistant", Content: full.String(), Thinking: thinking}
 				switch {
 				case len(rawAssistant) > 0:
@@ -2815,7 +2966,7 @@ func (a *Agent) streamFinalDeliveryAfterCap(ctx context.Context, inboundMsg bus.
 				return
 			}
 		}
-		a.meterTokens(ctx, sess.Key(), streamUsage)
+		a.meterTokens(ctx, sess.Key(), streamUsage, 0)
 		content := full.String()
 		if content == "" {
 			content = fmt.Sprintf("I've reached the maximum number of tool iterations (%d) and couldn't synthesize a final response. The work above represents what I gathered before hitting the limit.", a.maxToolIterations)
@@ -2940,20 +3091,20 @@ func (a *Agent) RegisteredTools() []tools.ToolInfo {
 // support / role-play products:
 //
 //   - image_gen     : self-generated images (registered only if a
-//                     provider is configured; absence is fine)
+//     provider is configured; absence is fine)
 //   - tts           : voice messages (same conditional registration)
 //   - write_file    : persist USER.md / MEMORY.md when the LLM learns
-//                     something worth keeping. Routing in
-//                     systemFileUserID sends USER.md/MEMORY.md to the
-//                     per-chatter row, so each chatter accrues their
-//                     own profile / memory. Path resolution rejects
-//                     arbitrary paths via identityFileBlocked +
-//                     workspace scoping, so this isn't a general
-//                     "let the chatbot write anywhere" hole — just
-//                     the canonical per-chatter notes.
+//     something worth keeping. Routing in
+//     systemFileUserID sends USER.md/MEMORY.md to the
+//     per-chatter row, so each chatter accrues their
+//     own profile / memory. Path resolution rejects
+//     arbitrary paths via identityFileBlocked +
+//     workspace scoping, so this isn't a general
+//     "let the chatbot write anywhere" hole — just
+//     the canonical per-chatter notes.
 //   - edit_file     : same rationale; preferred over write_file when
-//                     surgically updating MEMORY.md so the model
-//                     doesn't accidentally clobber prior entries.
+//     surgically updating MEMORY.md so the model
+//     doesn't accidentally clobber prior entries.
 //
 // Notably absent: `read_file` / `list_dir` — chatbot mode shouldn't
 // browse the filesystem; USER.md / MEMORY.md content is already loaded
@@ -2980,15 +3131,27 @@ func (a *Agent) RegisteredTools() []tools.ToolInfo {
 // (cron-triggered greetings, multi-recipient broadcasts) should fall
 // back to `agent` mode or write a plugin.
 //
-// Also absent: exec, web_fetch / web_search, scheduling, delegation
-// — all agent-loop machinery that doesn't belong in a chat persona's
-// voice. Add new built-ins here only when they're universally useful
-// for chatbot products; everything else belongs in a plugin.
+// Still absent: scheduling (create_cron_job), delegation (delegate_task),
+// start_app_preview — agent-loop machinery that doesn't belong in a
+// chat persona. Add new built-ins here only when they're universally
+// useful for chatbot products; everything else belongs in a plugin.
 var chatbotBuiltinAllowlist = []string{
 	"image_gen",
 	"tts",
 	"write_file",
 	"edit_file",
+	// set_timezone keeps "their local time" right for chat (greetings,
+	// "晚安" timing) — chatbots need it as much as full agents do.
+	"set_timezone",
+	// Web tools let the chatbot answer real-time questions (weather,
+	// news, prices, etc.) without requiring full agent mode.
+	"web_search",
+	"web_fetch",
+	// exec + load_skill let the chatbot invoke installed skills
+	// (e.g. image generation, data lookup). Skills are the primary
+	// extension mechanism — without exec the chatbot can't run them.
+	"exec",
+	"load_skill",
 }
 
 // builtinAllowForMode returns the built-in tool name allowlist for the
@@ -3009,6 +3172,58 @@ func builtinAllowForMode(mode string) []string {
 // WorkspacePath returns the agent's working directory for user-facing files.
 func (a *Agent) WorkspacePath() string {
 	return a.workspacePath
+}
+
+// chatterLocation resolves the effective timezone for a chatter via
+// scope prefs (chatter pref → agent default → system default). Server-
+// local when no relational store is wired or nothing is configured —
+// the legacy single-tenant behavior. Passed to the ContextBuilder as
+// the tzResolver so the system prompt's date line renders in the
+// chatter's wall clock; the cron tool runs the same resolution at
+// job-creation time.
+func (a *Agent) chatterLocation(chatterUID string) *time.Location {
+	// USER.md is the chatter-authoritative source: the deployment clock is
+	// UTC and inbound timestamps are UTC, so the only place the chatter's
+	// real timezone lives is what they (or the agent) recorded in their
+	// profile — "东八区", "UTC+8", "Asia/Shanghai". Parse it and let it win
+	// over the DB prefs, so editing USER.md is enough to fix the clock
+	// without also having to run set_timezone.
+	if a.memory != nil {
+		if profile := a.memory.WithUserID(chatterUID).LoadUserFile(); profile != "" {
+			if loc := scope.LocationFromText(profile); loc != nil {
+				return loc
+			}
+		}
+	}
+	if a.dataStore == nil {
+		return time.Local
+	}
+	tz := scope.Timezone(context.Background(), a.dataStore, chatterUID, a.agentID)
+	return scope.LoadLocationOrLocal(tz)
+}
+
+// withMessageTimestamps returns a COPY of msgs where each user message is
+// prefixed with its send time in the chatter's timezone, e.g.
+// "[2026-06-13 22:15 Fri] …". This is what lets the model reason about
+// time across a conversation — tell today from earlier days, and not say
+// "good night" at midday. The originals are never mutated (the prefix is
+// a read-time view for the LLM, not stored history), so the session store
+// stays clean and the next turn doesn't double-prefix. The system prompt
+// (context.go dateLine) tells the model what the bracketed prefix means.
+func (a *Agent) withMessageTimestampsForChatter(msgs []provider.Message, chatterUID string) []provider.Message {
+	if len(msgs) == 0 {
+		return msgs
+	}
+	loc := a.chatterLocation(chatterUID)
+	out := make([]provider.Message, len(msgs))
+	for i, m := range msgs {
+		if m.Role == "user" && m.Timestamp > 0 && m.Content != "" {
+			t := time.UnixMilli(m.Timestamp).In(loc)
+			m.Content = "[" + t.Format("2006-01-02 15:04 Mon") + "] " + m.Content
+		}
+		out[i] = m
+	}
+	return out
 }
 
 // UpdateConfig updates the agent's runtime config (model, temperature, etc.)
@@ -3049,6 +3264,15 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 // as the per-user skills bucket key and the sandbox bind-mount target,
 // so two different chatters of the same agent each see their own
 // personal skill set and write installs into their own host dir.
+// sessionTriple returns the (channel, accountID, chatID, projectID)
+// arguments for sessions.Get. When SharedIdentity is enabled on the
+// inbound message, the triple is replaced with a virtual one so all
+// channels converge on the same session.
+func sessionTriple(msg bus.InboundMessage, projectID string) (string, string, string, string) {
+	ch, acc, cid := msg.SessionTriple()
+	return ch, acc, cid, projectID
+}
+
 func (a *Agent) chatterUserID(msg bus.InboundMessage) string {
 	if msg.UserID != "" {
 		return msg.UserID
@@ -3132,8 +3356,14 @@ func (a *Agent) ReloadWorkspaceFiles() {
 	// name/soul" greeting).
 	if a.memoryStore != nil {
 		a.ctxBuilder.store = a.memoryStore
-		a.ctxBuilder.agentID = a.name
+		a.ctxBuilder.agentID = a.agentID
 		a.ctxBuilder.userID = a.ownerUserID
+	}
+	// Chatter-timezone date line — same re-apply rule as the Store
+	// wiring above: the rebuilt ContextBuilder starts with a nil
+	// resolver and would silently fall back to server-local time.
+	if a.dataStore != nil {
+		a.ctxBuilder.SetTimezoneResolver(a.chatterLocation)
 	}
 }
 

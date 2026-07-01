@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/usage"
 )
 
 // slashResult holds the result of a slash command.
@@ -41,12 +43,11 @@ func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
 	// Owner-only gate for write commands. Read-only inspections (/status,
 	// /usage, /insights, /help, /version, /start, /whoami) stay open so
 	// any group member can self-serve info. Mutators that change the
-	// agent's runtime state (model, personality) or the session history
-	// (new/reset/undo/retry/compact) are restricted to the agent owner
-	// + per-channel admin allowlist — without this gate, anyone in a
-	// Discord guild could `/model haiku` and silently downgrade a shared
-	// agent for everyone else.
-	if writeSlashCommands[cmd] && !a.isAdminChatter(msg) {
+	// agent's runtime state (model, personality) or shared group-session
+	// history are restricted to the agent owner + per-channel admin
+	// allowlist. A DM chatter may start a fresh copy of their own session
+	// with /new or /reset; those commands don't affect anybody else there.
+	if slashRequiresAdmin(cmd, msg) && !a.isAdminChatter(msg) {
 		return slashResult{
 			handled: true,
 			reply:   fmt.Sprintf("🔒 `%s` 只有 agent owner / admin 能用。让 owner 把你的 platform 用户 ID 加进 agent.json 的 `admins.%s` 里(用 `/whoami` 查自己的 ID)。", cmd, msg.Channel),
@@ -152,6 +153,19 @@ var writeSlashCommands = map[string]bool{
 	"/personality": true,
 }
 
+// slashRequiresAdmin keeps agent-wide mutations owner/admin-only and also
+// protects shared group history. Starting a fresh private session is a
+// per-chatter operation, so /new and /reset stay available outside groups.
+func slashRequiresAdmin(cmd string, msg bus.InboundMessage) bool {
+	if !writeSlashCommands[cmd] {
+		return false
+	}
+	if (cmd == "/new" || cmd == "/reset") && msg.PeerKind != "group" {
+		return false
+	}
+	return true
+}
+
 // isAdminChatter decides whether the chatter is allowed to run a write-mode
 // slash command on this channel.
 //
@@ -174,10 +188,12 @@ func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 	}
 	list, ok := a.admins[msg.Channel]
 	if !ok || len(list) == 0 {
-		// No allowlist configured for this channel → preserve legacy
-		// unrestricted behavior. Operators opt in to group-chat
-		// protection by populating admins[channel].
-		return true
+		// No allowlist configured for this channel. Fall back to
+		// ownership check: if the IM chatter's resolved FastClaw
+		// user_id matches the agent owner, they're admin. Otherwise
+		// deny — an unconfigured allowlist should NOT grant admin
+		// to every anonymous chatter on a public-facing IM channel.
+		return msg.UserID != "" && msg.UserID == a.ownerUserID
 	}
 	for _, id := range list {
 		if id == msg.UserID {
@@ -316,7 +332,11 @@ func (a *Agent) slashUsage(msg bus.InboundMessage) slashResult {
 		}
 	}
 
-	reply := fmt.Sprintf("📊 Session Usage\n"+
+	reply := a.billingUsageText(context.Background())
+	if reply != "" {
+		reply += "\n\n"
+	}
+	reply += fmt.Sprintf("📊 Session Usage\n"+
 		"User turns:      %d\n"+
 		"Assistant turns: %d\n"+
 		"Tool calls:      %d\n"+
@@ -342,6 +362,71 @@ func (a *Agent) slashUsage(msg bus.InboundMessage) slashResult {
 	}
 
 	return slashResult{handled: true, reply: reply}
+}
+
+func (a *Agent) billingUsageText(ctx context.Context) string {
+	if a.meter == nil {
+		return ""
+	}
+	userID := a.ownerUserID
+	if userID == "" {
+		return ""
+	}
+	if a.quotaStore != nil {
+		if _, qerr := a.quotaStore.GetQuota(ctx, userID); qerr == nil {
+			if status, err := usage.CheckQuota(ctx, a.quotaStore, a.meter, userID); err == nil && status != nil {
+				return fmt.Sprintf("💳 Billing Usage\n"+
+					"Billing user:   %s\n"+
+					"Tokens:         %d / %s\n"+
+					"Requests:       %d / %s\n"+
+					"Remaining:      %s tokens, %s requests\n"+
+					"Allowed:        %t\n"+
+					"Resets at:      %s",
+					userID,
+					status.TokensUsed, usageLimitText(status.MonthlyTokenLimit),
+					status.RequestsUsed, usageLimitText(status.MonthlyRequestLimit),
+					remainingText(status.MonthlyTokenLimit, status.TokensUsed),
+					remainingText(status.MonthlyRequestLimit, status.RequestsUsed),
+					status.Allowed, emptyDash(status.ResetsAt))
+			}
+		}
+	}
+	totals, err := a.meter.TotalsForUser(ctx, userID, usage.LastN(30))
+	if err != nil {
+		return ""
+	}
+	tokens := totals.Input + totals.Output + totals.CacheRead + totals.CacheCreation
+	return fmt.Sprintf("💳 Billing Usage\n"+
+		"Billing user:   %s\n"+
+		"Tokens:         %d used in last 30 days\n"+
+		"Requests:       %d in last 30 days\n"+
+		"Quota:          unlimited / not configured",
+		userID, tokens, totals.Requests)
+}
+
+func usageLimitText(limit int64) string {
+	if limit <= 0 {
+		return "unlimited"
+	}
+	return fmt.Sprintf("%d", limit)
+}
+
+func remainingText(limit, used int64) string {
+	if limit <= 0 {
+		return "unlimited"
+	}
+	left := limit - used
+	if left < 0 {
+		left = 0
+	}
+	return fmt.Sprintf("%d", left)
+}
+
+func emptyDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
 }
 
 func (a *Agent) slashInsights(msg bus.InboundMessage, days int) slashResult {
@@ -490,9 +575,10 @@ Info
   /version        — Show version
   /whoami         — Show your platform user ID
 
-🔒 Write commands (/new /reset /undo /retry /compact /model /personality)
-   in IM channels are restricted to the agent owner + admins listed in
-   agent.json's "admins" field. Use /whoami to find your ID.`
+🔒 Agent-wide write commands (/undo /retry /compact /model /personality)
+   and group-chat /new or /reset are restricted to the agent owner + admins
+   listed in agent.json's "admins" field. Private-chat /new and /reset are
+   available to the chatter. Use /whoami to find your ID.`
 }
 
 // slashPlan handles `/plan <task>`: republish the rest of the message

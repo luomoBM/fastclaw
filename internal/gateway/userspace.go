@@ -16,6 +16,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/plugin"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
+	coderuntime "github.com/fastclaw-ai/fastclaw/internal/runtime"
 	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
 	"github.com/fastclaw-ai/fastclaw/internal/session"
@@ -311,6 +312,10 @@ type UserSpace struct {
 	// register hook plugins onto the lazy-built agent without
 	// reaching back into the gateway. Nil when systemPlugins is off.
 	PluginMgr *plugin.Manager
+	// ProjectRuntime is borrowed from the gateway; held so EnsureAgent's
+	// lazy-built agents also gain the coding-agent preview tools. Nil
+	// when no runtime is configured.
+	ProjectRuntime *coderuntime.Manager
 
 	mu sync.Mutex
 }
@@ -581,6 +586,13 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			ag.ToolRegistry().SetSandboxRoot(rc.Workspace)
 		}
 	}
+	// Independent of sandbox mode: hand the lazy-built agent the
+	// coding-agent preview tools when a runtime is configured.
+	if sp.ProjectRuntime != nil {
+		if ag := sp.Agents.AgentByID(rc.ID); ag != nil {
+			ag.SetProjectRuntime(sp.ProjectRuntime)
+		}
+	}
 	// Wire hook plugins onto the freshly-attached agent. Mirrors what
 	// loadUserSpace does for owner agents — without this, hook
 	// plugins would only fire for the agent's owner and never for
@@ -607,7 +619,7 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 // by the resulting UserSpace. Pass nil when sandbox is disabled at
 // system scope; agents will run with path-only file roots in that
 // case.
-func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager) (*UserSpace, error) {
+func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, quotaStore usage.QuotaStore, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager, projectRuntime *coderuntime.Manager) (*UserSpace, error) {
 	if userID == "" {
 		return nil, fmt.Errorf("loadUserSpace: userID required")
 	}
@@ -759,6 +771,9 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	if meter != nil {
 		managerOpts = append(managerOpts, agent.WithMeter(meter))
 	}
+	if quotaStore != nil {
+		managerOpts = append(managerOpts, agent.WithQuotaStore(quotaStore))
+	}
 	agentMgr, err := agent.NewManager(resolved, prov, mb, managerOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create agent manager for user %q: %w", userID, err)
@@ -767,6 +782,15 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	registerAgentToolChains(cfg, agentMgr.All())
 
 	pool := attachSandboxToAgents(systemSandboxPool, userID, resolved, agentMgr)
+
+	// Coding-agent runtime: hand every agent the preview tools. Nil when
+	// no runtime is configured, in which case agents stay plain
+	// assistants (no preview tools, per-chat file isolation unchanged).
+	if projectRuntime != nil {
+		for _, ag := range agentMgr.All() {
+			ag.SetProjectRuntime(projectRuntime)
+		}
+	}
 
 	// Wire hook plugins onto each agent's HookRegistry. Per-agent
 	// enable comes from the configs row at (scope=agent, agent_id=X,
@@ -781,12 +805,13 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	slog.Info("loaded user space", "user", userID, "agents", agentMgr.Names())
 
 	return &UserSpace{
-		UserID:      userID,
-		Config:      cfg,
-		Provider:    prov,
-		Agents:      agentMgr,
-		SandboxPool: pool,
-		PluginMgr:   pluginMgr,
+		UserID:         userID,
+		Config:         cfg,
+		Provider:       prov,
+		Agents:         agentMgr,
+		SandboxPool:    pool,
+		PluginMgr:      pluginMgr,
+		ProjectRuntime: projectRuntime,
 	}, nil
 }
 
@@ -910,6 +935,7 @@ type userSpaceRegistry struct {
 	store             store.Store
 	workspace         workspace.Store
 	meter             usage.Meter
+	quotaStore        usage.QuotaStore
 	systemSandboxPool sandbox.ExecutorPool
 	// pluginMgr is the shared (process-wide) plugin manager. Nil
 	// when systemPlugins is disabled. Used by loadUserSpace and
@@ -917,6 +943,32 @@ type userSpaceRegistry struct {
 	// HookRegistry, gated by per-agent plugins.enabled config.
 	pluginMgr *plugin.Manager
 	idleTTL   time.Duration
+	// projectRuntime is the coding-agent runtime manager, attached to
+	// every agent at load time so they gain the preview tools. Nil unless
+	// the gateway was given one via SetProjectRuntime; set after
+	// construction (the manager is built later in boot than the
+	// registry), hence the mutable field + mutex rather than a ctor arg.
+	projectRuntime *coderuntime.Manager
+}
+
+// setProjectRuntime records the manager so subsequent loadUserSpace calls
+// attach it. Guarded by mu since it races with concurrent getOrLoad.
+func (r *userSpaceRegistry) setProjectRuntime(m *coderuntime.Manager) {
+	r.mu.Lock()
+	r.projectRuntime = m
+	r.mu.Unlock()
+}
+
+// setSystemSandboxPool swaps the gateway-owned pool reference used for
+// future UserSpace loads, then drops already-loaded spaces so active agents
+// reattach to the new pool on their next request.
+func (r *userSpaceRegistry) setSystemSandboxPool(p sandbox.ExecutorPool) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.systemSandboxPool = p
+	evicted := len(r.spaces)
+	r.spaces = make(map[string]*userSpaceEntry)
+	return evicted
 }
 
 type userSpaceEntry struct {
@@ -924,13 +976,14 @@ type userSpaceEntry struct {
 	lastUsed time.Time
 }
 
-func newUserSpaceRegistry(mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager) *userSpaceRegistry {
+func newUserSpaceRegistry(mb *bus.MessageBus, st store.Store, ws workspace.Store, meter usage.Meter, quotaStore usage.QuotaStore, systemSandboxPool sandbox.ExecutorPool, pluginMgr *plugin.Manager) *userSpaceRegistry {
 	return &userSpaceRegistry{
 		spaces:            make(map[string]*userSpaceEntry),
 		bus:               mb,
 		store:             st,
 		workspace:         ws,
 		meter:             meter,
+		quotaStore:        quotaStore,
 		systemSandboxPool: systemSandboxPool,
 		pluginMgr:         pluginMgr,
 		idleTTL:           30 * time.Minute,
@@ -960,7 +1013,7 @@ func (r *userSpaceRegistry) getOrLoad(ctx context.Context, userID string) (*User
 		e.lastUsed = time.Now()
 		return e.space, nil
 	}
-	sp, err := loadUserSpace(ctx, userID, r.bus, r.store, r.workspace, r.meter, r.systemSandboxPool, r.pluginMgr)
+	sp, err := loadUserSpace(ctx, userID, r.bus, r.store, r.workspace, r.meter, r.quotaStore, r.systemSandboxPool, r.pluginMgr, r.projectRuntime)
 	if err != nil {
 		return nil, err
 	}
@@ -1056,8 +1109,41 @@ func bindingsFromChannelRows(ctx context.Context, st store.Store, userID string,
 	}
 	var out []config.Binding
 	covered := make(map[string]bool, len(agents))
+
+	// Try the new channels table first — build bindings from ChannelRecords.
+	hasNewRows := false
 	for _, ar := range agents {
 		covered[ar.ID] = true
+		if chRows, err := st.ListChannels(ctx, "", ar.ID); err == nil && len(chRows) > 0 {
+			hasNewRows = true
+			out = append(out, expandChannelRecordBindings(chRows, ar.ID)...)
+		}
+		if userID != "" {
+			if chRows, err := st.ListChannels(ctx, userID, ar.ID); err == nil && len(chRows) > 0 {
+				hasNewRows = true
+				out = append(out, expandChannelRecordBindings(chRows, ar.ID)...)
+			}
+		}
+	}
+	// Reverse-lookup from the new table: any channel this user bound
+	// to an agent they don't own.
+	if userID != "" {
+		if allUserCh, err := st.ListAllChannels(ctx); err == nil {
+			for _, ch := range allUserCh {
+				if ch.UserID != userID || ch.AgentID == "" || covered[ch.AgentID] {
+					continue
+				}
+				hasNewRows = true
+				out = append(out, expandChannelRecordBindings([]store.ChannelRecord{ch}, ch.AgentID)...)
+			}
+		}
+	}
+	if hasNewRows {
+		return out
+	}
+
+	// Fallback: read from configs for pre-migration installs.
+	for _, ar := range agents {
 		rows, err := st.ListConfigs(ctx, store.KindChannel, "", ar.ID)
 		if err == nil {
 			out = append(out, expandChannelBindings(rows, ar.ID)...)
@@ -1081,6 +1167,37 @@ func bindingsFromChannelRows(ctx context.Context, st store.Store, userID string,
 				}
 				out = append(out, expandChannelBindings([]store.ConfigRecord{rec}, rec.AgentID)...)
 			}
+		}
+	}
+	return out
+}
+
+// expandChannelRecordBindings builds Binding entries from ChannelRecord rows.
+func expandChannelRecordBindings(rows []store.ChannelRecord, agentID string) []config.Binding {
+	var out []config.Binding
+	for _, r := range rows {
+		if !r.Enabled {
+			continue
+		}
+		cc := config.ChannelConfig{}
+		if blob, err := json.Marshal(r.Data); err == nil {
+			_ = json.Unmarshal(blob, &cc)
+		}
+		// Each ChannelRecord is one (type, account_id) — but the Data
+		// blob may still carry an Accounts map from the migration. Use
+		// the top-level AccountID as the primary binding key.
+		if len(cc.Accounts) == 0 {
+			out = append(out, config.Binding{
+				AgentID: agentID,
+				Match:   config.Match{Channel: r.Type, AccountID: r.AccountID},
+			})
+			continue
+		}
+		for accountID := range cc.Accounts {
+			out = append(out, config.Binding{
+				AgentID: agentID,
+				Match:   config.Match{Channel: r.Type, AccountID: accountID},
+			})
 		}
 	}
 	return out

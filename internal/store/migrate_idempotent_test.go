@@ -43,12 +43,14 @@ func TestMigrateIdempotentOnFreshInstall(t *testing.T) {
 			t.Errorf("%s.%s present = %v; want %v", table, column, has, wantPresent)
 		}
 	}
-	// `scope` is back as a denormalized label column; `scope_id` is
-	// gone for good. user_id/agent_id are the source of truth.
+	// `scope` is a denormalized label column; `scope_id` merges
+	// user_id/agent_id into a single lookup key. user_id, agent_id,
+	// and credential_key have been dropped.
 	missing(t, "configs", "scope", true)
-	missing(t, "configs", "scope_id", false)
-	missing(t, "configs", "user_id", true)
-	missing(t, "configs", "agent_id", true)
+	missing(t, "configs", "scope_id", true)
+	missing(t, "configs", "user_id", false)
+	missing(t, "configs", "agent_id", false)
+	missing(t, "configs", "credential_key", false)
 	missing(t, "cron_jobs", "user_id", true)
 	missing(t, "sessions", "channel", true)
 	missing(t, "sessions", "account_id", true)
@@ -72,8 +74,7 @@ func TestMigrateIdempotentOnFreshInstall(t *testing.T) {
 		names = append(names, n)
 	}
 	want := []string{
-		"idx_configs_lookup",
-		"idx_configs_credential",
+		"idx_configs_scope",
 		"idx_cron_jobs_user",
 		"idx_sessions_chat_active",
 	}

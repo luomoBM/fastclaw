@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -147,6 +148,27 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateSessionsAddChatterUserID(ctx); err != nil {
 		return fmt.Errorf("migrate sessions chatter_user_id: %w", err)
 	}
+	if err := d.migrateSessionMessagesAddProviderModel(ctx); err != nil {
+		return fmt.Errorf("migrate session_messages provider/model: %w", err)
+	}
+	if err := d.migrateTokenUsageAddChannelChatter(ctx); err != nil {
+		return fmt.Errorf("migrate token_usage channel/chatter: %w", err)
+	}
+	if err := d.migrateUsersAddOwnerUserID(ctx); err != nil {
+		return fmt.Errorf("migrate users.owner_user_id: %w", err)
+	}
+	if err := d.migrateConfigsMergeScopeID(ctx); err != nil {
+		return fmt.Errorf("migrate configs scope_id: %w", err)
+	}
+	if err := d.migrateChannelsAddSharedIdentity(ctx); err != nil {
+		return fmt.Errorf("migrate channels shared_identity: %w", err)
+	}
+	if err := d.migrateChannelsFromConfigs(ctx); err != nil {
+		return fmt.Errorf("migrate channels from configs: %w", err)
+	}
+	if err := d.migrateConfigsDropLegacyColumns(ctx); err != nil {
+		return fmt.Errorf("migrate configs drop legacy columns: %w", err)
+	}
 	return nil
 }
 
@@ -160,7 +182,7 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 //
 // Empty default + partial indexes preserve existing query plans for
 // rows written before this column existed. Readers that want the
-// chatter should COALESCE(NULLIF(chatter_user_id,''), user_id) — the
+// chatter should COALESCE(NULLIF(chatter_user_id,”), user_id) — the
 // fallback is exactly right for the web channel (user_id was already
 // the chatter there) and matches the pre-fix behavior on IM (where
 // every chatter was mis-attributed to the channel owner anyway).
@@ -200,7 +222,7 @@ func (d *DBStore) migrateSessionsAddChatterUserID(ctx context.Context) error {
 }
 
 // migrateAgentGoalsAddRouting retrofits channel/account_id/chat_id/
-// project_id onto legacy agent_goals tables. All four default to ''
+// project_id onto legacy agent_goals tables. All four default to ”
 // — pre-existing rows had no continuation infrastructure attached
 // anyway, so the empty value just means "no routing recorded; can't
 // auto-continue this goal" and TryFireContinuation bails safely.
@@ -238,6 +260,28 @@ func (d *DBStore) migrateSessionMessagesAddOrigin(ctx context.Context) error {
 	if _, err := d.db.ExecContext(ctx,
 		`ALTER TABLE session_messages ADD COLUMN origin TEXT NOT NULL DEFAULT ''`); err != nil {
 		return fmt.Errorf("add column: %w", err)
+	}
+	return nil
+}
+
+// migrateSessionMessagesAddProviderModel adds provider and model columns
+// to session_messages and session_events so each row records which LLM
+// produced it. Empty default preserves existing rows. Idempotent.
+func (d *DBStore) migrateSessionMessagesAddProviderModel(ctx context.Context) error {
+	for _, tbl := range []string{"session_messages", "session_events"} {
+		for _, col := range []string{"provider", "model"} {
+			has, err := d.tableHasColumn(ctx, tbl, col)
+			if err != nil {
+				return err
+			}
+			if has {
+				continue
+			}
+			if _, err := d.db.ExecContext(ctx,
+				fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, tbl, col)); err != nil {
+				return fmt.Errorf("add %s.%s: %w", tbl, col, err)
+			}
+		}
 	}
 	return nil
 }
@@ -303,6 +347,126 @@ func (d *DBStore) migrateTokenUsageAddProvider(ctx context.Context) error {
 	return nil
 }
 
+// migrateTokenUsageAddChannelChatter adds channel + chatter_user_id
+// columns to token_usage_daily and token_usage_log so usage records
+// capture which channel the conversation came from and who the actual
+// chatter was (as opposed to the agent owner stored in user_id).
+func (d *DBStore) migrateTokenUsageAddChannelChatter(ctx context.Context) error {
+	for _, table := range []string{"token_usage_daily", "token_usage_log"} {
+		exists, err := d.tableExists(ctx, table)
+		if err != nil || !exists {
+			continue
+		}
+		for _, col := range []string{"channel", "chatter_user_id"} {
+			has, err := d.tableHasColumn(ctx, table, col)
+			if err != nil || has {
+				continue
+			}
+			stmt := fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s TEXT NOT NULL DEFAULT ''`, table, col)
+			if _, err := d.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("add %s.%s: %w", table, col, err)
+			}
+		}
+	}
+	return nil
+}
+
+// migrateUsersAddOwnerUserID adds the owner_user_id column and
+// backfills it from the existing apikey_id data. Also fixes role
+// (chatter vs app_user) and normalizes username/email for non-human
+// users. Idempotent.
+func (d *DBStore) migrateUsersAddOwnerUserID(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "users", "owner_user_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := d.db.ExecContext(ctx,
+			`ALTER TABLE users ADD COLUMN owner_user_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add column: %w", err)
+		}
+	}
+	// Backfill owner_user_id from apikey_id for rows that haven't been
+	// migrated yet (owner_user_id still empty, but apikey_id is set).
+
+	// 1. Rows with apikey_id = "owner:u_xxx" → chatter
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET
+			role = 'channel_user',
+			owner_user_id = REPLACE(apikey_id, 'owner:', '')
+		WHERE apikey_id LIKE 'owner:%' AND owner_user_id = ''`); err != nil {
+		return fmt.Errorf("backfill chatters (owner: prefix): %w", err)
+	}
+	// 2. Rows with IM-channel external_id but apikey_id is a user_id
+	//    (legacy platform-scoped namespace) → chatter
+	for _, ch := range []string{"wechat", "telegram", "discord", "line", "feishu", "slack"} {
+		if _, err := d.db.ExecContext(ctx, fmt.Sprintf(`
+			UPDATE users SET
+				role = 'channel_user',
+				owner_user_id = apikey_id
+			WHERE external_id LIKE '%s:%%' AND owner_user_id = '' AND apikey_id != ''
+				AND apikey_id NOT LIKE 'owner:%%'`, ch)); err != nil {
+			return fmt.Errorf("backfill chatters (%s): %w", ch, err)
+		}
+	}
+	// 3. Remaining app_user rows with apikey_id = "k_xxx" or "ak_xxx" →
+	//    look up the apikey's owner
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET
+			owner_user_id = (SELECT a.user_id FROM apikeys a WHERE a.id = users.apikey_id)
+		WHERE role IN ('app_user', 'user') AND owner_user_id = ''
+			AND apikey_id != '' AND (apikey_id LIKE 'k_%' OR apikey_id LIKE 'ak_%')
+			AND EXISTS (SELECT 1 FROM apikeys a WHERE a.id = users.apikey_id)`); err != nil {
+		return fmt.Errorf("backfill app_users (apikey lookup): %w", err)
+	}
+	// 4. Remaining app_user rows with apikey_id = a user_id (not owner:
+	//    prefix, not k_/ak_ prefix) → apikey_id IS the owner
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET
+			role = CASE
+				WHEN role = 'user' AND apikey_id != '' AND external_id != '' THEN 'app_user'
+				ELSE role
+			END,
+			owner_user_id = apikey_id
+		WHERE owner_user_id = '' AND apikey_id != ''
+			AND apikey_id NOT LIKE 'owner:%'
+			AND apikey_id NOT LIKE 'k_%' AND apikey_id NOT LIKE 'ak_%'`); err != nil {
+		return fmt.Errorf("backfill app_users (user_id namespace): %w", err)
+	}
+	// 5. Rename legacy role='chatter' → 'channel_user' (from an earlier
+	//    migration draft that shipped briefly).
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET role = 'channel_user' WHERE role = 'chatter'`); err != nil {
+		return fmt.Errorf("rename chatter→channel_user: %w", err)
+	}
+	// 6. Clean up apikey_id: channel_user rows should have empty
+	//    apikey_id (they weren't created via API key). app_user rows
+	//    with a user_id in apikey_id (legacy namespace) get cleared too
+	//    since owner_user_id now holds that relationship. Only keep
+	//    actual API key IDs (k_xxx / ak_xxx).
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET apikey_id = ''
+		WHERE owner_user_id != '' AND apikey_id != ''
+			AND apikey_id NOT LIKE 'k_%' AND apikey_id NOT LIKE 'ak_%'`); err != nil {
+		return fmt.Errorf("clean apikey_id: %w", err)
+	}
+	// 7. Normalize username/email for app_user and channel_user rows.
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET
+			username = id,
+			email = id || '@' || role
+		WHERE role IN ('app_user', 'channel_user')
+			AND username LIKE 'ext:%'`); err != nil {
+		return fmt.Errorf("normalize username/email: %w", err)
+	}
+	// Create index for the new lookup pattern.
+	if _, err := d.db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_users_owner_external ON users (owner_user_id, external_id)`); err != nil {
+		return fmt.Errorf("create index: %w", err)
+	}
+	return nil
+}
+
 // migrateSessionsAddProjectID adds the project_id column to legacy
 // sessions tables. Empty default = "loose chat" (the existing behavior),
 // non-empty = belongs to that project. Idempotent: returns early if
@@ -351,6 +515,58 @@ func (d *DBStore) migrateConfigsAddScopeColumn(ctx context.Context) error {
 		ELSE 'system'
 	END WHERE scope = ''`); err != nil {
 		return fmt.Errorf("backfill scope: %w", err)
+	}
+	return nil
+}
+
+// migrateConfigsMergeScopeID adds a scope_id column that collapses
+// (user_id, agent_id) into a single lookup key: whichever is non-empty
+// wins (they're mutually exclusive for provider/setting rows — the only
+// kinds that remain in configs now that channels have their own table).
+// System rows get scope_id=”.
+//
+// Idempotent: skips the ALTER if the column already exists and only
+// backfills rows where scope_id is still empty.
+func (d *DBStore) migrateConfigsMergeScopeID(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "configs", "scope_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := d.db.ExecContext(ctx,
+			`ALTER TABLE configs ADD COLUMN scope_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("add scope_id column: %w", err)
+		}
+	}
+	// Backfill: scope_id = user_id when user_id != '', else agent_id.
+	// Only touch rows where scope_id is still empty to stay idempotent.
+	// Skip if user_id column no longer exists (post-drop migration).
+	hasUserID, err := d.tableHasColumn(ctx, "configs", "user_id")
+	if err != nil {
+		return err
+	}
+	if !hasUserID {
+		// Legacy columns already dropped — backfill not needed, but
+		// ensure the index exists (migrateConfigsDropLegacyColumns
+		// normally handles it, but be defensive).
+		if _, err := d.db.ExecContext(ctx,
+			`CREATE INDEX IF NOT EXISTS idx_configs_scope ON configs (kind, scope_id)`); err != nil {
+			return fmt.Errorf("create idx_configs_scope: %w", err)
+		}
+		return nil
+	}
+	if _, err := d.db.ExecContext(ctx, `UPDATE configs SET scope_id = CASE
+		WHEN user_id != '' THEN user_id
+		WHEN agent_id != '' THEN agent_id
+		ELSE ''
+	END WHERE scope_id = ''`); err != nil {
+		return fmt.Errorf("backfill scope_id: %w", err)
+	}
+	// Assert the index now that scope_id is guaranteed to exist.
+	// IF NOT EXISTS keeps it idempotent for fresh installs and re-runs.
+	if _, err := d.db.ExecContext(ctx,
+		`CREATE INDEX IF NOT EXISTS idx_configs_scope ON configs (kind, scope_id)`); err != nil {
+		return fmt.Errorf("create idx_configs_scope: %w", err)
 	}
 	return nil
 }
@@ -448,6 +664,16 @@ func (d *DBStore) migrateConfigsScopeToUserAgent(ctx context.Context) error {
 		return err
 	}
 	if !hasUserID {
+		// If credential_key is also missing, the table has already been
+		// through the full lifecycle (scope→user_id→drop), so there's
+		// nothing to do.
+		hasCredKey, err := d.tableHasColumn(ctx, "configs", "credential_key")
+		if err != nil {
+			return err
+		}
+		if !hasCredKey {
+			return nil
+		}
 		// Probe `scope_id` rather than `scope`: the post-refactor
 		// schema reintroduces `scope` as a denormalized label, so its
 		// presence no longer means "this is the legacy shape".
@@ -467,11 +693,15 @@ func (d *DBStore) migrateConfigsScopeToUserAgent(ctx context.Context) error {
 			}
 		}
 	}
-	// Always assert the lookup index — both upgrade and fresh-install
-	// paths flow through here. CREATE INDEX IF NOT EXISTS is idempotent.
-	if _, err := d.db.ExecContext(ctx,
-		`CREATE INDEX IF NOT EXISTS idx_configs_lookup ON configs (kind, user_id, agent_id)`); err != nil {
-		return fmt.Errorf("create configs index: %w", err)
+	// Assert the lookup index only if user_id still exists (pre-drop
+	// state). After migrateConfigsDropLegacyColumns runs, the column is
+	// gone and the index would fail. The drop migration creates its own
+	// idx_configs_scope index as a replacement.
+	if hasUserID {
+		if _, err := d.db.ExecContext(ctx,
+			`CREATE INDEX IF NOT EXISTS idx_configs_lookup ON configs (kind, user_id, agent_id)`); err != nil {
+			return fmt.Errorf("create configs index: %w", err)
+		}
 	}
 	return nil
 }
@@ -792,6 +1022,32 @@ func (d *DBStore) migrateUsersAppUserCols(ctx context.Context) error {
 			ON users (apikey_id, external_id)
 			WHERE apikey_id <> '' AND external_id <> ''`); err != nil {
 		return fmt.Errorf("create idx_users_apikey_external: %w", err)
+	}
+
+	// One-time, collision-safe re-key: app_users minted under the OLD scheme
+	// stored the api_key id as their mint scope, which orphans the end-user
+	// when the calling app rotates/replaces that key. Re-key them onto the
+	// api_key's OWNER account so identity survives key rotation. Only rows
+	// whose apikey_id still resolves to a real api_key are remapped; rows that
+	// would collide with an already-owner-keyed sibling (same owner +
+	// external_id) are skipped. Idempotent: once apikey_id holds a "u_…" owner
+	// it no longer matches any apikeys.id ("k_…"), so reruns touch nothing.
+	// Non-fatal: a rare unrecoverable collision (two legacy keys, same owner,
+	// same external_id) is logged and left for manual reconciliation rather
+	// than blocking startup.
+	if _, err := d.db.ExecContext(ctx, `
+		UPDATE users SET apikey_id = (SELECT a.user_id FROM apikeys a WHERE a.id = users.apikey_id)
+		WHERE role = 'app_user'
+		  AND apikey_id <> ''
+		  AND apikey_id IN (SELECT id FROM apikeys)
+		  AND NOT EXISTS (
+		    SELECT 1 FROM users u2
+		    WHERE u2.id <> users.id
+		      AND u2.role = 'app_user'
+		      AND u2.external_id = users.external_id
+		      AND u2.apikey_id = (SELECT a.user_id FROM apikeys a WHERE a.id = users.apikey_id)
+		  )`); err != nil {
+		slog.Warn("migrate: backfill app_user owner scope failed (non-fatal)", "error", err)
 	}
 	return nil
 }
@@ -1185,6 +1441,17 @@ func (d *DBStore) migrationSQL() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_web_sessions_user ON web_sessions (user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions (expires_at)`,
+		`CREATE TABLE IF NOT EXISTS push_devices (
+			user_id TEXT NOT NULL,
+			token TEXT NOT NULL,
+			platform TEXT NOT NULL DEFAULT 'ios',
+			environment TEXT NOT NULL DEFAULT '',
+			bundle_id TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user_id, token)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_push_devices_user ON push_devices (user_id)`,
 		// type values: "admin" | "user" | "agent". The default 'agent'
 		// preserves the pre-tier behavior on existing rows — every legacy
 		// key was implicitly an "agent-scoped" key (explicit list in
@@ -1350,20 +1617,14 @@ func (d *DBStore) migrationSQL() []string {
 		`CREATE TABLE IF NOT EXISTS configs (
 			id TEXT PRIMARY KEY,
 			kind TEXT NOT NULL,
-			-- scope is a denormalized 'system'|'user'|'agent'|'user-agent'
-			-- label derived from (user_id, agent_id). SaveConfig writes it
-			-- on every upsert; nothing else writes it. Kept for DB-dump
-			-- readability and ad-hoc admin queries.
 			scope TEXT NOT NULL DEFAULT '',
-			user_id TEXT NOT NULL DEFAULT '',
-			agent_id TEXT NOT NULL DEFAULT '',
+			scope_id TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL,
 			enabled BOOLEAN NOT NULL DEFAULT TRUE,
-			credential_key TEXT NOT NULL DEFAULT '',
 			data TEXT NOT NULL DEFAULT '{}',
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			UNIQUE (kind, user_id, agent_id, name)
+			UNIQUE (kind, scope_id, name)
 		)`,
 		// idx_configs_lookup creation moved to
 		// migrateConfigsScopeToUserAgent so it runs after the column-add
@@ -1371,7 +1632,9 @@ func (d *DBStore) migrationSQL() []string {
 		// don't exist yet at this point in migrationSQL). Fresh installs
 		// hit the IF NOT EXISTS path inside the migrator and still get
 		// the index.
-		`CREATE INDEX IF NOT EXISTS idx_configs_credential ON configs (kind, credential_key)`,
+		//
+		// idx_configs_scope likewise deferred to migrateConfigsMergeScopeID
+		// — on legacy databases scope_id does not exist yet at this point.
 		`CREATE TABLE IF NOT EXISTS cron_jobs (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL DEFAULT '',
@@ -1420,6 +1683,29 @@ func (d *DBStore) migrationSQL() []string {
 			PRIMARY KEY (user_id, agent_id, project_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_projects_listing ON projects (user_id, agent_id, updated_at DESC)`,
+		// project_runtimes is the live-app layer on top of a project: at
+		// most one running instance (long-lived sandbox + dev server +
+		// preview URL) per project. Same PK as projects — a runtime is
+		// 1:1 with its project and shares its ownership. Kept in a
+		// separate table so the existing project feature is untouched;
+		// dropping every row here degrades gracefully to "no previews",
+		// it never affects chat grouping or workspace files.
+		`CREATE TABLE IF NOT EXISTS project_runtimes (
+			user_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL,
+			project_id TEXT NOT NULL,
+			template_ref TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'none',
+			dev_port INTEGER NOT NULL DEFAULT 0,
+			host_port INTEGER NOT NULL DEFAULT 0,
+			preview_url TEXT NOT NULL DEFAULT '',
+			container_id TEXT NOT NULL DEFAULT '',
+			git_ref TEXT NOT NULL DEFAULT '',
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (user_id, agent_id, project_id)
+		)`,
 		// agent_goals backs the /goal feature: one persistent objective
 		// per (agent, session). The UNIQUE (agent_id, session_key)
 		// constraint is the source of truth for "this session already
@@ -1467,6 +1753,8 @@ func (d *DBStore) migrationSQL() []string {
 			cache_read_tokens BIGINT NOT NULL DEFAULT 0,
 			cache_create_tokens BIGINT NOT NULL DEFAULT 0,
 			request_count BIGINT NOT NULL DEFAULT 0,
+			channel TEXT NOT NULL DEFAULT '',
+			chatter_user_id TEXT NOT NULL DEFAULT '',
 			PRIMARY KEY (day, user_id, agent_id, session_key, provider, model)
 		)`,
 		// Range scans on day are the dominant query (24h/7d/30d filter)
@@ -1476,6 +1764,43 @@ func (d *DBStore) migrationSQL() []string {
 		// all time") when the table grows.
 		`CREATE INDEX IF NOT EXISTS idx_token_usage_agent ON token_usage_daily (agent_id, day)`,
 		`CREATE INDEX IF NOT EXISTS idx_token_usage_user ON token_usage_daily (user_id, day)`,
+		// quotas stores per-user monthly token/request ceilings set by
+		// upstream SaaS apps (e.g. weclaw) via PUT /v1/quota. The agent
+		// loop checks this before every LLM call so channel messages
+		// that arrive when the user is over-limit get a friendly
+		// rejection. One row per user_id; UPSERT on write.
+		`CREATE TABLE IF NOT EXISTS quotas (
+			user_id TEXT NOT NULL PRIMARY KEY,
+			monthly_token_limit BIGINT NOT NULL DEFAULT 0,
+			monthly_request_limit BIGINT NOT NULL DEFAULT 0,
+			reset_day INTEGER NOT NULL DEFAULT 1,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		// token_usage_log is the append-only per-LLM-call audit trail.
+		// Unlike token_usage_daily (which UPSERTs into daily buckets),
+		// this table INSERTs one row per provider.Chat / ChatStream
+		// call so upstream SaaS apps can show "this message cost N
+		// tokens" in their billing UI. session_key + created_at let
+		// callers correlate with session_messages for a full picture.
+		// No AUTOINCREMENT — SQLite rowid alias auto-increments;
+		// Postgres uses GENERATED BY DEFAULT on the INTEGER PRIMARY KEY.
+		`CREATE TABLE IF NOT EXISTS token_usage_log (
+			user_id TEXT NOT NULL DEFAULT '',
+			agent_id TEXT NOT NULL DEFAULT '',
+			session_key TEXT NOT NULL DEFAULT '',
+			provider TEXT NOT NULL DEFAULT '',
+			model TEXT NOT NULL DEFAULT '',
+			input_tokens BIGINT NOT NULL DEFAULT 0,
+			output_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+			cache_create_tokens BIGINT NOT NULL DEFAULT 0,
+			duration_ms BIGINT NOT NULL DEFAULT 0,
+			channel TEXT NOT NULL DEFAULT '',
+			chatter_user_id TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_token_usage_log_user ON token_usage_log (user_id, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_token_usage_log_session ON token_usage_log (user_id, agent_id, session_key)`,
 		// channel_leases gates polling / persistent-connection channel
 		// adapters (WeChat, Telegram, Discord, Slack, Feishu long-conn)
 		// to one process at a time. Without it, two cloud replicas
@@ -1491,6 +1816,26 @@ func (d *DBStore) migrationSQL() []string {
 			expires_at TIMESTAMP NOT NULL,
 			PRIMARY KEY (channel, account_id)
 		)`,
+		// channels is the dedicated IM bot binding table. Extracted from
+		// configs (kind='channel') so channel entities have their own
+		// lifecycle, credentials, and routing independent of config rows.
+		`CREATE TABLE IF NOT EXISTS channels (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL DEFAULT '',
+			agent_id TEXT NOT NULL DEFAULT '',
+			type TEXT NOT NULL,
+			account_id TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			bot_token TEXT NOT NULL DEFAULT '',
+			base_url TEXT NOT NULL DEFAULT '',
+			platform_user_id TEXT NOT NULL DEFAULT '',
+			shared_identity INTEGER NOT NULL DEFAULT 0,
+			data TEXT NOT NULL DEFAULT '{}',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (type, account_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_channels_user ON channels (user_id, agent_id)`,
 	}
 }
 
@@ -1518,11 +1863,11 @@ func scanErr(err error) error {
 
 // userColumns is the canonical select list — keep ordering aligned with
 // the Scan calls below so adding a column means editing both lines.
-const userColumns = `id, username, email, password_hash, display_name, role, status, apikey_id, external_id, avatar_url, agent_quota, created_at, updated_at`
+const userColumns = `id, username, email, password_hash, display_name, role, status, apikey_id, external_id, avatar_url, agent_quota, created_at, updated_at, owner_user_id`
 
 func scanUser(scanner interface{ Scan(dest ...any) error }) (*UserRecord, error) {
 	var u UserRecord
-	if err := scanner.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.DisplayName, &u.Role, &u.Status, &u.APIKeyID, &u.ExternalID, &u.AvatarURL, &u.AgentQuota, &u.CreatedAt, &u.UpdatedAt); err != nil {
+	if err := scanner.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.DisplayName, &u.Role, &u.Status, &u.APIKeyID, &u.ExternalID, &u.AvatarURL, &u.AgentQuota, &u.CreatedAt, &u.UpdatedAt, &u.OwnerUserID); err != nil {
 		return nil, err
 	}
 	return &u, nil
@@ -1535,10 +1880,10 @@ func (d *DBStore) CreateUser(ctx context.Context, u *UserRecord) error {
 	}
 	u.UpdatedAt = now
 	_, err := d.db.ExecContext(ctx,
-		fmt.Sprintf(`INSERT INTO users (id, username, email, password_hash, display_name, role, status, apikey_id, external_id, avatar_url, agent_quota, created_at, updated_at)
-			VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)`,
-			d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8), d.ph(9), d.ph(10), d.ph(11), d.ph(12), d.ph(13)),
-		u.ID, u.Username, u.Email, u.PasswordHash, u.DisplayName, u.Role, u.Status, u.APIKeyID, u.ExternalID, u.AvatarURL, u.AgentQuota, u.CreatedAt, u.UpdatedAt)
+		fmt.Sprintf(`INSERT INTO users (id, username, email, password_hash, display_name, role, status, apikey_id, external_id, avatar_url, agent_quota, created_at, updated_at, owner_user_id)
+			VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)`,
+			d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5), d.ph(6), d.ph(7), d.ph(8), d.ph(9), d.ph(10), d.ph(11), d.ph(12), d.ph(13), d.ph(14)),
+		u.ID, u.Username, u.Email, u.PasswordHash, u.DisplayName, u.Role, u.Status, u.APIKeyID, u.ExternalID, u.AvatarURL, u.AgentQuota, u.CreatedAt, u.UpdatedAt, u.OwnerUserID)
 	return err
 }
 
@@ -1563,18 +1908,40 @@ func (d *DBStore) GetUserByLogin(ctx context.Context, usernameOrEmail string) (*
 	return u, nil
 }
 
-// GetUserByExternal looks up an app_user by (apikey_id, external_id).
+// GetUserByExternal looks up an app_user/chatter by (owner_user_id, external_id).
 // Returns ErrNotFound when nothing matches — used by the lazy-mint
 // flow on api_key chat calls and by the explicit provisioning endpoint
 // to make creation idempotent on re-entry.
-func (d *DBStore) GetUserByExternal(ctx context.Context, apikeyID, externalID string) (*UserRecord, error) {
-	if apikeyID == "" || externalID == "" {
+func (d *DBStore) GetUserByExternal(ctx context.Context, ownerUserID, externalID string) (*UserRecord, error) {
+	if ownerUserID == "" || externalID == "" {
 		return nil, ErrNotFound
 	}
 	row := d.db.QueryRowContext(ctx,
-		fmt.Sprintf(`SELECT `+userColumns+` FROM users WHERE apikey_id = %s AND external_id = %s LIMIT 1`,
+		fmt.Sprintf(`SELECT `+userColumns+` FROM users WHERE owner_user_id = %s AND external_id = %s ORDER BY created_at ASC LIMIT 1`,
 			d.ph(1), d.ph(2)),
-		apikeyID, externalID)
+		ownerUserID, externalID)
+	u, err := scanUser(row)
+	if err != nil {
+		return nil, scanErr(err)
+	}
+	return u, nil
+}
+
+// GetUserByExternalSuffix looks up an app_user/chatter by owner + external_id
+// suffix match. Used by resolveChatter to find legacy chatter rows whose
+// external_id is "channel:accountID:platformUserID" when only
+// "channel:" and ":platformUserID" are known (accountID changed on bot
+// reconnect). Returns the most recently created match.
+func (d *DBStore) GetUserByExternalSuffix(ctx context.Context, ownerUserID, prefix, suffix string) (*UserRecord, error) {
+	if ownerUserID == "" || prefix == "" || suffix == "" {
+		return nil, ErrNotFound
+	}
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT `+userColumns+` FROM users
+			WHERE owner_user_id = %s AND external_id LIKE %s AND external_id LIKE %s
+			ORDER BY created_at DESC LIMIT 1`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		ownerUserID, prefix+"%", "%"+suffix)
 	u, err := scanUser(row)
 	if err != nil {
 		return nil, scanErr(err)
@@ -1646,7 +2013,8 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM configs WHERE agent_id = %s", d.ph(1)), aid); err != nil {
+			fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+			aid, "%/"+aid); err != nil {
 			return err
 		}
 	}
@@ -1718,6 +2086,64 @@ func (d *DBStore) DeleteExpiredWebSessions(ctx context.Context, before time.Time
 	_, err := d.db.ExecContext(ctx,
 		fmt.Sprintf(`DELETE FROM web_sessions WHERE expires_at < %s`, d.ph(1)), before)
 	return err
+}
+
+// --- Mobile push devices ---
+
+func (d *DBStore) SavePushDevice(ctx context.Context, dev *PushDeviceRecord) error {
+	if dev == nil {
+		return errors.New("store: push device is nil")
+	}
+	if dev.UserID == "" || dev.Token == "" {
+		return errors.New("store: push device requires user_id and token")
+	}
+	now := time.Now().UTC()
+	if dev.CreatedAt.IsZero() {
+		dev.CreatedAt = now
+	}
+	dev.UpdatedAt = now
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`INSERT INTO push_devices (user_id, token, platform, environment, bundle_id, created_at, updated_at)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 ON CONFLICT (user_id, token) DO UPDATE SET
+			   platform=$3, environment=$4, bundle_id=$5, updated_at=$7`,
+			dev.UserID, dev.Token, dev.Platform, dev.Environment, dev.BundleID, dev.CreatedAt, dev.UpdatedAt)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO push_devices (user_id, token, platform, environment, bundle_id, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT (user_id, token) DO UPDATE SET
+		   platform=excluded.platform, environment=excluded.environment, bundle_id=excluded.bundle_id, updated_at=excluded.updated_at`,
+		dev.UserID, dev.Token, dev.Platform, dev.Environment, dev.BundleID, dev.CreatedAt, dev.UpdatedAt)
+	return err
+}
+
+func (d *DBStore) DeletePushDevice(ctx context.Context, userID, token string) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM push_devices WHERE user_id = %s AND token = %s`, d.ph(1), d.ph(2)),
+		userID, token)
+	return err
+}
+
+func (d *DBStore) ListPushDevices(ctx context.Context, userID string) ([]PushDeviceRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT user_id, token, platform, environment, bundle_id, created_at, updated_at FROM push_devices WHERE user_id = %s ORDER BY updated_at DESC`, d.ph(1)),
+		userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]PushDeviceRecord, 0)
+	for rows.Next() {
+		var dev PushDeviceRecord
+		if err := rows.Scan(&dev.UserID, &dev.Token, &dev.Platform, &dev.Environment, &dev.BundleID, &dev.CreatedAt, &dev.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, dev)
+	}
+	return out, rows.Err()
 }
 
 // --- API keys ---
@@ -1856,8 +2282,18 @@ const agentSelectCols = `id, user_id, name, config, is_public, created_at, updat
 
 func (d *DBStore) ListAgents(ctx context.Context, ownerUserID string) ([]AgentRecord, error) {
 	rows, err := d.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT `+agentSelectCols+` FROM agents WHERE user_id = %s ORDER BY created_at`, d.ph(1)),
+		fmt.Sprintf(`SELECT `+agentSelectCols+` FROM agents WHERE user_id = %s ORDER BY created_at DESC`, d.ph(1)),
 		ownerUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAgents(rows)
+}
+
+func (d *DBStore) ListPublicAgents(ctx context.Context) ([]AgentRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+agentSelectCols+` FROM agents WHERE is_public = TRUE ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -1916,7 +2352,16 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 		return err
 	}
 	defer tx.Rollback()
-	for _, t := range []string{"agent_files", "sessions", "session_messages", "session_events", "cron_jobs"} {
+	for _, t := range []string{
+		"agent_files",
+		"sessions",
+		"session_messages",
+		"session_events",
+		"cron_jobs",
+		"projects",
+		"project_runtimes",
+		"agent_goals",
+	} {
 		if _, err := tx.ExecContext(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE agent_id = %s`, t, d.ph(1)), agentID); err != nil {
 			return err
@@ -1926,12 +2371,11 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 		fmt.Sprintf(`DELETE FROM apikey_agents WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
 		return err
 	}
-	// Drop every config row pointing at this agent — owner's official
-	// rows (user_id='', agent_id=X), agent owner's per-agent overrides
-	// (user_id=owner, agent_id=X), and any non-owner per-agent
-	// overrides (user_id=other, agent_id=X).
+	// Drop every config row pointing at this agent — official agent rows
+	// (scope_id=X) and per-user agent overrides (scope_id=user/X).
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM configs WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
+		fmt.Sprintf(`DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s`, d.ph(1), d.ph(2)),
+		agentID, "%/"+agentID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -1981,6 +2425,35 @@ func (d *DBStore) GetSession(ctx context.Context, userID, agentID, sessionKey st
 	return &rec, nil
 }
 
+// LookupSessionOwner returns the user_id that owns the given session row.
+func (d *DBStore) LookupSessionOwner(ctx context.Context, agentID, sessionKey string) (string, error) {
+	var uid string
+	err := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT user_id FROM sessions WHERE agent_id = %s AND session_key = %s`,
+			d.ph(1), d.ph(2)),
+		agentID, sessionKey).Scan(&uid)
+	if err != nil {
+		return "", scanErr(err)
+	}
+	return uid, nil
+}
+
+// GetSessionByKey loads a session by (agentID, sessionKey) without
+// user_id scoping. Safe because session_key is globally unique.
+func (d *DBStore) GetSessionByKey(ctx context.Context, agentID, sessionKey string) (*SessionRecord, error) {
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT messages, channel, account_id, chat_id, project_id, updated_at FROM sessions WHERE agent_id = %s AND session_key = %s`,
+			d.ph(1), d.ph(2)),
+		agentID, sessionKey)
+	var msgsStr string
+	var rec SessionRecord
+	if err := row.Scan(&msgsStr, &rec.Channel, &rec.AccountID, &rec.ChatID, &rec.ProjectID, &rec.UpdatedAt); err != nil {
+		return nil, scanErr(err)
+	}
+	json.Unmarshal([]byte(msgsStr), &rec.Messages)
+	return &rec, nil
+}
+
 // SaveSession upserts the session row. Channel / AccountID / ChatID /
 // ProjectID are written on INSERT only; the ON CONFLICT branch
 // deliberately preserves the existing values so a callback that didn't
@@ -2020,10 +2493,18 @@ func (d *DBStore) SaveSession(ctx context.Context, userID, agentID, sessionKey s
 }
 
 func (d *DBStore) ListSessions(ctx context.Context, userID, agentID string) ([]SessionMeta, error) {
+	// Include sessions owned by the caller AND sessions owned by any
+	// app_user whose owner_user_id is the caller. This surfaces IM
+	// conversations routed through an API-key-provisioned app_user's
+	// channel binding in the web dashboard sidebar.
 	rows, err := d.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT session_key, channel, account_id, chat_id, project_id, title, message_count, updated_at FROM sessions
-			WHERE user_id = %s AND agent_id = %s ORDER BY updated_at DESC`, d.ph(1), d.ph(2)),
-		userID, agentID)
+		fmt.Sprintf(`SELECT session_key, user_id, channel, account_id, chat_id, project_id, title, message_count, updated_at, COALESCE(chatter_user_id,'') FROM sessions
+			WHERE agent_id = %s AND (
+				user_id = %s OR user_id IN (
+					SELECT id FROM users WHERE owner_user_id = %s
+				)
+			) ORDER BY updated_at DESC`, d.ph(1), d.ph(2), d.ph(3)),
+		agentID, userID, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -2031,7 +2512,7 @@ func (d *DBStore) ListSessions(ctx context.Context, userID, agentID string) ([]S
 	var metas []SessionMeta
 	for rows.Next() {
 		var m SessionMeta
-		if err := rows.Scan(&m.Key, &m.Channel, &m.AccountID, &m.ChatID, &m.ProjectID, &m.Title, &m.MessageCount, &m.UpdatedAt); err != nil {
+		if err := rows.Scan(&m.Key, &m.UserID, &m.Channel, &m.AccountID, &m.ChatID, &m.ProjectID, &m.Title, &m.MessageCount, &m.UpdatedAt, &m.ChatterUserID); err != nil {
 			return nil, err
 		}
 		metas = append(metas, m)
@@ -2062,6 +2543,80 @@ func (d *DBStore) ListSessionOwnerPairs(ctx context.Context) ([]SessionOwnerPair
 		pairs = append(pairs, p)
 	}
 	return pairs, rows.Err()
+}
+
+// ListSessionOwnerPairsByAgents returns distinct (user_id, agent_id)
+// pairs restricted to the given agent IDs.
+func (d *DBStore) ListSessionOwnerPairsByAgents(ctx context.Context, agentIDs []string) ([]SessionOwnerPair, error) {
+	if len(agentIDs) == 0 {
+		return nil, nil
+	}
+	// Build placeholders for the IN clause.
+	placeholders := make([]string, len(agentIDs))
+	args := make([]any, len(agentIDs))
+	for i, id := range agentIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query := `SELECT DISTINCT user_id, agent_id FROM sessions
+		WHERE user_id <> '' AND agent_id <> ''
+		AND agent_id IN (` + strings.Join(placeholders, ",") + `)`
+	rows, err := d.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var pairs []SessionOwnerPair
+	for rows.Next() {
+		var p SessionOwnerPair
+		if err := rows.Scan(&p.UserID, &p.AgentID); err != nil {
+			return nil, err
+		}
+		pairs = append(pairs, p)
+	}
+	return pairs, rows.Err()
+}
+
+func (d *DBStore) ListSessionsPaginated(ctx context.Context, agentIDs []string, offset, limit int) ([]SessionMeta, int, error) {
+	var where string
+	var args []any
+	if agentIDs != nil {
+		if len(agentIDs) == 0 {
+			return nil, 0, nil
+		}
+		phs := make([]string, len(agentIDs))
+		args = make([]any, len(agentIDs))
+		for i, id := range agentIDs {
+			phs[i] = d.ph(i + 1)
+			args[i] = id
+		}
+		where = `WHERE agent_id IN (` + strings.Join(phs, ",") + `)`
+	}
+	// Total count.
+	var total int
+	countQ := `SELECT COUNT(*) FROM sessions ` + where
+	if err := d.db.QueryRowContext(ctx, countQ, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	// Page query.
+	dataQ := fmt.Sprintf(`SELECT session_key, user_id, agent_id, channel, account_id, chat_id, project_id, title, message_count, updated_at, COALESCE(chatter_user_id,'')
+		FROM sessions %s ORDER BY updated_at DESC LIMIT %d OFFSET %d`, where, limit, offset)
+	rows, err := d.db.QueryContext(ctx, dataQ, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var metas []SessionMeta
+	for rows.Next() {
+		var m SessionMeta
+		var agentID string
+		if err := rows.Scan(&m.Key, &m.UserID, &agentID, &m.Channel, &m.AccountID, &m.ChatID, &m.ProjectID, &m.Title, &m.MessageCount, &m.UpdatedAt, &m.ChatterUserID); err != nil {
+			return nil, 0, err
+		}
+		m.AgentID = agentID
+		metas = append(metas, m)
+	}
+	return metas, total, rows.Err()
 }
 
 // LookupSessionTriple is ResolveActiveSessionKey's inverse: given a
@@ -2113,10 +2668,29 @@ func (d *DBStore) ResolveActiveSessionKey(ctx context.Context, userID, agentID, 
 			d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5)),
 		userID, agentID, channel, accountID, chatID)
 	var key string
-	if err := row.Scan(&key); err != nil {
-		return "", scanErr(err)
+	if err := row.Scan(&key); err == nil {
+		return key, nil
 	}
-	return key, nil
+	// Fallback for IM channels: when the bot is re-scanned the
+	// accountID changes (e.g. iLink assigns a new bot ID) but the
+	// chatID (platform user openid) stays the same. Try matching by
+	// (channel, chatID) only so the conversation continues in the
+	// existing session instead of minting a fresh one. Also widen
+	// user_id to include child app_users (the session may have been
+	// created under a different app_user or the web user).
+	if channel != "" && channel != "web" && channel != "api" && channel != "shared" {
+		row = d.db.QueryRowContext(ctx,
+			fmt.Sprintf(`SELECT session_key FROM sessions
+				WHERE agent_id = %s AND channel = %s AND chat_id = %s
+				  AND user_id IN (SELECT id FROM users WHERE id = %s OR owner_user_id = %s)
+				ORDER BY updated_at DESC LIMIT 1`,
+				d.ph(1), d.ph(2), d.ph(3), d.ph(4), d.ph(5)),
+			agentID, channel, chatID, userID, userID)
+		if err := row.Scan(&key); err == nil {
+			return key, nil
+		}
+	}
+	return "", ErrNotFound
 }
 
 func (d *DBStore) DeleteSession(ctx context.Context, userID, agentID, sessionKey string) error {
@@ -2158,24 +2732,26 @@ func (d *DBStore) AppendSessionMessage(ctx context.Context, userID, agentID, ses
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
 			`INSERT INTO session_messages
-				(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id)
-			SELECT $1, $2, $3, COALESCE(MAX(seq), -1) + 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+				(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id, provider, model)
+			SELECT $1, $2, $3, COALESCE(MAX(seq), -1) + 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
 				FROM session_messages
 				WHERE user_id = $1 AND agent_id = $2 AND session_key = $3`,
 			userID, agentID, sessionKey,
 			msg.Role, msg.Content, string(contentParts), string(toolCalls),
-			msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts, chatterID)
+			msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts, chatterID,
+			msg.Provider, msg.Model)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO session_messages
-			(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id)
-		SELECT ?, ?, ?, COALESCE(MAX(seq), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			(user_id, agent_id, session_key, seq, role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, chatter_user_id, provider, model)
+		SELECT ?, ?, ?, COALESCE(MAX(seq), -1) + 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
 			FROM session_messages
 			WHERE user_id = ? AND agent_id = ? AND session_key = ?`,
 		userID, agentID, sessionKey,
 		msg.Role, msg.Content, string(contentParts), string(toolCalls),
 		msg.ToolCallID, msg.Name, string(metadata), msg.Thinking, rawAssistant, msg.Origin, ts, chatterID,
+		msg.Provider, msg.Model,
 		userID, agentID, sessionKey)
 	return err
 }
@@ -2286,7 +2862,7 @@ func (d *DBStore) LatestSessionEventSeq(ctx context.Context, userID, agentID, se
 // to sessions.messages should check len() and decide.
 func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sessionKey string) ([]SessionMessage, error) {
 	rows, err := d.db.QueryContext(ctx,
-		fmt.Sprintf(`SELECT role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at
+		fmt.Sprintf(`SELECT role, content, content_parts, tool_calls, tool_call_id, name, metadata, thinking, raw_assistant, origin, created_at, provider, model
 			FROM session_messages
 			WHERE user_id = %s AND agent_id = %s AND session_key = %s
 			ORDER BY seq ASC`, d.ph(1), d.ph(2), d.ph(3)),
@@ -2299,7 +2875,7 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 	for rows.Next() {
 		var m SessionMessage
 		var contentParts, toolCalls, metadata, rawAssistant string
-		if err := rows.Scan(&m.Role, &m.Content, &contentParts, &toolCalls, &m.ToolCallID, &m.Name, &metadata, &m.Thinking, &rawAssistant, &m.Origin, &m.Timestamp); err != nil {
+		if err := rows.Scan(&m.Role, &m.Content, &contentParts, &toolCalls, &m.ToolCallID, &m.Name, &metadata, &m.Thinking, &rawAssistant, &m.Origin, &m.Timestamp, &m.Provider, &m.Model); err != nil {
 			return nil, err
 		}
 		if contentParts != "" && contentParts != "null" {
@@ -2332,7 +2908,7 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 //
 // Filter is strictly on chatter_user_id (no fallback to user_id). Old
 // rows written before the chatter_user_id column existed have it set
-// to '' and are not counted; those predate per-chatter resolution and
+// to ” and are not counted; those predate per-chatter resolution and
 // folding them in would over-count (they're keyed by channel owner,
 // not the actual chatter). New conversations write chatter_user_id
 // correctly so this is only a concern for sessions migrated from
@@ -2524,14 +3100,15 @@ func (d *DBStore) ListAgentFiles(ctx context.Context, agentID, userID string) ([
 // first. Existing callers that pass a real scopeID continue to get
 // exact-match semantics. System rows have scope_id="" anyway so
 // system-scope queries are unaffected by this widening.
-const configSelectCols = `id, kind, scope, user_id, agent_id, name, enabled, credential_key, data, created_at, updated_at`
+const configSelectCols = `id, kind, scope, scope_id, name, enabled, data, created_at, updated_at`
 
 func (d *DBStore) ListConfigs(ctx context.Context, kind, userID, agentID string) ([]ConfigRecord, error) {
+	scopeID := computeScopeID(userID, agentID)
 	rows, err := d.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT `+configSelectCols+`
-			FROM configs WHERE kind = %s AND user_id = %s AND agent_id = %s ORDER BY name`,
-			d.ph(1), d.ph(2), d.ph(3)),
-		kind, userID, agentID)
+			FROM configs WHERE kind = %s AND scope_id = %s ORDER BY name`,
+			d.ph(1), d.ph(2)),
+		kind, scopeID)
 	if err != nil {
 		return nil, err
 	}
@@ -2540,11 +3117,26 @@ func (d *DBStore) ListConfigs(ctx context.Context, kind, userID, agentID string)
 }
 
 func (d *DBStore) ListConfigsByUser(ctx context.Context, kind, userID string) ([]ConfigRecord, error) {
+	// scope_id contains the userID for user-scoped rows. For user-agent
+	// rows scope_id is "userID/agentID", so we use a prefix match.
+	if userID == "" {
+		// System rows: scope_id = ''.
+		rows, err := d.db.QueryContext(ctx,
+			fmt.Sprintf(`SELECT `+configSelectCols+`
+				FROM configs WHERE kind = %s AND scope_id = '' ORDER BY name`,
+				d.ph(1)),
+			kind)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanConfigs(rows)
+	}
 	rows, err := d.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT `+configSelectCols+`
-			FROM configs WHERE kind = %s AND user_id = %s ORDER BY agent_id, name`,
-			d.ph(1), d.ph(2)),
-		kind, userID)
+			FROM configs WHERE kind = %s AND (scope_id = %s OR scope_id LIKE %s) ORDER BY name`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		kind, userID, userID+"/%")
 	if err != nil {
 		return nil, err
 	}
@@ -2555,7 +3147,7 @@ func (d *DBStore) ListConfigsByUser(ctx context.Context, kind, userID string) ([
 func (d *DBStore) QueryAllConfigs(ctx context.Context, kind string) ([]ConfigRecord, error) {
 	rows, err := d.db.QueryContext(ctx,
 		fmt.Sprintf(`SELECT `+configSelectCols+`
-			FROM configs WHERE kind = %s ORDER BY user_id, agent_id, name`,
+			FROM configs WHERE kind = %s ORDER BY scope_id, name`,
 			d.ph(1)),
 		kind)
 	if err != nil {
@@ -2572,11 +3164,12 @@ func (d *DBStore) GetConfig(ctx context.Context, id string) (*ConfigRecord, erro
 }
 
 func (d *DBStore) GetConfigByName(ctx context.Context, kind, userID, agentID, name string) (*ConfigRecord, error) {
+	scopeID := computeScopeID(userID, agentID)
 	row := d.db.QueryRowContext(ctx,
 		fmt.Sprintf(`SELECT `+configSelectCols+`
-			FROM configs WHERE kind = %s AND user_id = %s AND agent_id = %s AND name = %s`,
-			d.ph(1), d.ph(2), d.ph(3), d.ph(4)),
-		kind, userID, agentID, name)
+			FROM configs WHERE kind = %s AND scope_id = %s AND name = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		kind, scopeID, name)
 	return scanConfigRow(row)
 }
 
@@ -2584,42 +3177,38 @@ func (d *DBStore) SaveConfig(ctx context.Context, c *ConfigRecord) error {
 	if c.Kind == "" || c.Name == "" {
 		return errors.New("store: SaveConfig requires kind and name")
 	}
-	// scope is denormalized from (user_id, agent_id). SaveConfig is the
-	// only writer — recompute on every upsert so a caller-supplied
-	// stale value can't corrupt the column. The DB-dump readability
-	// promise depends on this invariant.
+	// Compute scope and scope_id from (UserID, AgentID) convenience
+	// fields when they're set. These fields are kept on the Go struct
+	// for backward compat with callers but are NOT persisted as columns.
 	c.Scope = computeConfigScope(c.UserID, c.AgentID)
+	if c.ScopeID == "" {
+		c.ScopeID = computeScopeID(c.UserID, c.AgentID)
+	}
 	now := time.Now().UTC()
 	if c.CreatedAt.IsZero() {
 		c.CreatedAt = now
 	}
 	c.UpdatedAt = now
 	if c.ID == "" {
-		// Random id; the (kind, user_id, agent_id, name) unique index is
-		// what guarantees idempotency below. We used to derive id from a
-		// hash of those columns, but the column rename (scope/scope_id →
-		// user_id/agent_id) changed the hash for the same logical row,
-		// making the legacy and new ids drift apart. Upserting on the
-		// natural key sidesteps that mess entirely.
 		c.ID = randomConfigID()
 	}
 	dataBytes, _ := json.Marshal(c.Data)
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
-			`INSERT INTO configs (id, kind, scope, user_id, agent_id, name, enabled, credential_key, data, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-				ON CONFLICT (kind, user_id, agent_id, name) DO UPDATE SET
-				  scope=$3, enabled=$7, credential_key=$8, data=$9, updated_at=$11`,
-			c.ID, c.Kind, c.Scope, c.UserID, c.AgentID, c.Name, c.Enabled, c.CredentialKey, string(dataBytes), c.CreatedAt, c.UpdatedAt)
+			`INSERT INTO configs (id, kind, scope, scope_id, name, enabled, data, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+				ON CONFLICT (kind, scope_id, name) DO UPDATE SET
+				  scope=$3, enabled=$6, data=$7, updated_at=$9`,
+			c.ID, c.Kind, c.Scope, c.ScopeID, c.Name, c.Enabled, string(dataBytes), c.CreatedAt, c.UpdatedAt)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO configs (id, kind, scope, user_id, agent_id, name, enabled, credential_key, data, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT (kind, user_id, agent_id, name) DO UPDATE SET
-			  scope=excluded.scope, enabled=excluded.enabled, credential_key=excluded.credential_key,
+		`INSERT INTO configs (id, kind, scope, scope_id, name, enabled, data, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (kind, scope_id, name) DO UPDATE SET
+			  scope=excluded.scope, enabled=excluded.enabled,
 			  data=excluded.data, updated_at=excluded.updated_at`,
-		c.ID, c.Kind, c.Scope, c.UserID, c.AgentID, c.Name, c.Enabled, c.CredentialKey, string(dataBytes), c.CreatedAt, c.UpdatedAt)
+		c.ID, c.Kind, c.Scope, c.ScopeID, c.Name, c.Enabled, string(dataBytes), c.CreatedAt, c.UpdatedAt)
 	return err
 }
 
@@ -2646,12 +3235,10 @@ func (d *DBStore) DeleteConfig(ctx context.Context, id string) error {
 }
 
 func (d *DBStore) LookupChannelByCredential(ctx context.Context, channelType, credKey string) (*ConfigRecord, error) {
-	row := d.db.QueryRowContext(ctx,
-		fmt.Sprintf(`SELECT `+configSelectCols+`
-			FROM configs WHERE kind = 'channel' AND name = %s AND credential_key = %s LIMIT 1`,
-			d.ph(1), d.ph(2)),
-		channelType, credKey)
-	return scanConfigRow(row)
+	// credential_key column has been removed; channels now live in
+	// the channels table. Return ErrNotFound so callers fall through
+	// to their channels-table code path.
+	return nil, ErrNotFound
 }
 
 // configRowID produces a stable id for a (kind, scope, scope_id,
@@ -2679,10 +3266,23 @@ type rowScanner interface {
 func scanConfigRow(row rowScanner) (*ConfigRecord, error) {
 	var c ConfigRecord
 	var dataStr string
-	if err := row.Scan(&c.ID, &c.Kind, &c.Scope, &c.UserID, &c.AgentID, &c.Name, &c.Enabled, &c.CredentialKey, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.Kind, &c.Scope, &c.ScopeID, &c.Name, &c.Enabled, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, scanErr(err)
 	}
 	json.Unmarshal([]byte(dataStr), &c.Data)
+	// Populate convenience fields from scope for backward compat.
+	switch c.Scope {
+	case "user":
+		c.UserID = c.ScopeID
+	case "agent":
+		c.AgentID = c.ScopeID
+	case "user-agent":
+		// user-agent rows encode "userID/agentID" in scope_id.
+		if idx := strings.Index(c.ScopeID, "/"); idx >= 0 {
+			c.UserID = c.ScopeID[:idx]
+			c.AgentID = c.ScopeID[idx+1:]
+		}
+	}
 	return &c, nil
 }
 
@@ -2691,13 +3291,361 @@ func scanConfigs(rows *sql.Rows) ([]ConfigRecord, error) {
 	for rows.Next() {
 		var c ConfigRecord
 		var dataStr string
-		if err := rows.Scan(&c.ID, &c.Kind, &c.Scope, &c.UserID, &c.AgentID, &c.Name, &c.Enabled, &c.CredentialKey, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ID, &c.Kind, &c.Scope, &c.ScopeID, &c.Name, &c.Enabled, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
 			return nil, err
 		}
+		json.Unmarshal([]byte(dataStr), &c.Data)
+		switch c.Scope {
+		case "user":
+			c.UserID = c.ScopeID
+		case "agent":
+			c.AgentID = c.ScopeID
+		case "user-agent":
+			if idx := strings.Index(c.ScopeID, "/"); idx >= 0 {
+				c.UserID = c.ScopeID[:idx]
+				c.AgentID = c.ScopeID[idx+1:]
+			}
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// --- Channels (IM bot bindings) ---
+
+const channelSelectCols = `id, user_id, agent_id, type, account_id, enabled, bot_token, base_url, platform_user_id, shared_identity, data, created_at, updated_at`
+
+func (d *DBStore) ListChannels(ctx context.Context, userID, agentID string) ([]ChannelRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT `+channelSelectCols+`
+			FROM channels WHERE user_id = %s AND agent_id = %s ORDER BY type, account_id`,
+			d.ph(1), d.ph(2)),
+		userID, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanChannels(rows)
+}
+
+func (d *DBStore) ListAllChannels(ctx context.Context) ([]ChannelRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT `+channelSelectCols+` FROM channels ORDER BY user_id, agent_id, type`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanChannels(rows)
+}
+
+func (d *DBStore) GetChannel(ctx context.Context, id string) (*ChannelRecord, error) {
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT `+channelSelectCols+` FROM channels WHERE id = %s`, d.ph(1)), id)
+	return scanChannelRow(row)
+}
+
+func (d *DBStore) SaveChannel(ctx context.Context, ch *ChannelRecord) error {
+	if ch.Type == "" || ch.AccountID == "" {
+		return errors.New("store: SaveChannel requires type and accountId")
+	}
+	now := time.Now().UTC()
+	if ch.CreatedAt.IsZero() {
+		ch.CreatedAt = now
+	}
+	ch.UpdatedAt = now
+	if ch.ID == "" {
+		ch.ID = randomChannelID()
+	}
+	dataBytes, _ := json.Marshal(ch.Data)
+	// Convert bools to int for PostgreSQL INTEGER columns.
+	enabledInt := 0
+	if ch.Enabled {
+		enabledInt = 1
+	}
+	sharedIdent := 0
+	if ch.SharedIdentity {
+		sharedIdent = 1
+	}
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`INSERT INTO channels (id, user_id, agent_id, type, account_id, enabled, bot_token, base_url, platform_user_id, shared_identity, data, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+				ON CONFLICT (type, account_id) DO UPDATE SET
+				  user_id=$2, agent_id=$3, enabled=$6, bot_token=$7, base_url=$8,
+				  platform_user_id=$9, shared_identity=$10, data=$11, updated_at=$13`,
+			ch.ID, ch.UserID, ch.AgentID, ch.Type, ch.AccountID, enabledInt, ch.BotToken, ch.BaseURL, ch.PlatformUserID, sharedIdent, string(dataBytes), ch.CreatedAt, ch.UpdatedAt)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO channels (id, user_id, agent_id, type, account_id, enabled, bot_token, base_url, platform_user_id, shared_identity, data, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (type, account_id) DO UPDATE SET
+			  user_id=excluded.user_id, agent_id=excluded.agent_id, enabled=excluded.enabled,
+			  bot_token=excluded.bot_token, base_url=excluded.base_url,
+			  platform_user_id=excluded.platform_user_id, shared_identity=excluded.shared_identity,
+			  data=excluded.data, updated_at=excluded.updated_at`,
+		ch.ID, ch.UserID, ch.AgentID, ch.Type, ch.AccountID, enabledInt, ch.BotToken, ch.BaseURL, ch.PlatformUserID, sharedIdent, string(dataBytes), ch.CreatedAt, ch.UpdatedAt)
+	return err
+}
+
+func (d *DBStore) DeleteChannel(ctx context.Context, id string) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM channels WHERE id = %s`, d.ph(1)), id)
+	return err
+}
+
+func (d *DBStore) LookupChannel(ctx context.Context, channelType, accountID string) (*ChannelRecord, error) {
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT `+channelSelectCols+`
+			FROM channels WHERE type = %s AND account_id = %s LIMIT 1`,
+			d.ph(1), d.ph(2)),
+		channelType, accountID)
+	return scanChannelRow(row)
+}
+
+func randomChannelID() string {
+	var b [10]byte
+	if _, err := cryptorand.Read(b[:]); err != nil {
+		now := time.Now().UnixNano()
+		for i := range b {
+			b[i] = byte(now >> (i * 8))
+		}
+	}
+	return "ch_" + hex.EncodeToString(b[:])
+}
+
+func scanChannelRow(row rowScanner) (*ChannelRecord, error) {
+	var c ChannelRecord
+	var dataStr string
+	var enabledInt, sharedIdent int
+	if err := row.Scan(&c.ID, &c.UserID, &c.AgentID, &c.Type, &c.AccountID, &enabledInt, &c.BotToken, &c.BaseURL, &c.PlatformUserID, &sharedIdent, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		return nil, scanErr(err)
+	}
+	c.Enabled = enabledInt != 0
+	c.SharedIdentity = sharedIdent != 0
+	json.Unmarshal([]byte(dataStr), &c.Data)
+	return &c, nil
+}
+
+func scanChannels(rows *sql.Rows) ([]ChannelRecord, error) {
+	var out []ChannelRecord
+	for rows.Next() {
+		var c ChannelRecord
+		var dataStr string
+		var enabledInt, sharedIdent int
+		if err := rows.Scan(&c.ID, &c.UserID, &c.AgentID, &c.Type, &c.AccountID, &enabledInt, &c.BotToken, &c.BaseURL, &c.PlatformUserID, &sharedIdent, &dataStr, &c.CreatedAt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		c.Enabled = enabledInt != 0
+		c.SharedIdentity = sharedIdent != 0
 		json.Unmarshal([]byte(dataStr), &c.Data)
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// migrateChannelsFromConfigs copies kind='channel' configs rows into the
+// new channels table. Skipped when the channels table already has data
+// (i.e. migration already ran). Old configs rows are kept for rollback.
+func (d *DBStore) migrateChannelsFromConfigs(ctx context.Context) error {
+	exists, err := d.tableExists(ctx, "channels")
+	if err != nil || !exists {
+		return err
+	}
+	// Skip the copy if channels table already has data.
+	var count int
+	if err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM channels`).Scan(&count); err != nil {
+		return err
+	}
+	if count > 0 {
+		return nil
+	}
+	// Read all channel configs.
+	configRows, err := d.db.QueryContext(ctx,
+		`SELECT `+configSelectCols+` FROM configs WHERE kind = 'channel'`)
+	if err != nil {
+		return err
+	}
+	defer configRows.Close()
+	configs, err := scanConfigs(configRows)
+	if err != nil {
+		return err
+	}
+	for _, cfg := range configs {
+		// Each config row may have multiple accounts in its data JSON.
+		// Extract them and create one channel row per account.
+		var cc struct {
+			BotToken string                     `json:"botToken"`
+			BaseURL  string                     `json:"baseUrl"`
+			Accounts map[string]json.RawMessage `json:"accounts"`
+		}
+		if blob, merr := json.Marshal(cfg.Data); merr == nil {
+			_ = json.Unmarshal(blob, &cc)
+		}
+		if len(cc.Accounts) == 0 {
+			// Single-bot legacy shape: one channel row with credential_key as accountID.
+			ch := &ChannelRecord{
+				ID:        randomChannelID(),
+				UserID:    cfg.UserID,
+				AgentID:   cfg.AgentID,
+				Type:      cfg.Name,
+				AccountID: cfg.CredentialKey,
+				Enabled:   cfg.Enabled,
+				BotToken:  cc.BotToken,
+				BaseURL:   cc.BaseURL,
+				Data:      cfg.Data,
+				CreatedAt: cfg.CreatedAt,
+				UpdatedAt: cfg.UpdatedAt,
+			}
+			if ch.AccountID == "" {
+				ch.AccountID = cfg.Name // fallback
+			}
+			if err := d.SaveChannel(ctx, ch); err != nil {
+				slog.Warn("migrate channel from config failed",
+					"config_id", cfg.ID, "type", cfg.Name, "error", err)
+			}
+			continue
+		}
+		// Multi-account: one channel row per account entry.
+		for accountID, rawAcct := range cc.Accounts {
+			var acct struct {
+				BotToken string `json:"botToken"`
+				BaseURL  string `json:"baseUrl"`
+				UserID   string `json:"userId"`
+			}
+			_ = json.Unmarshal(rawAcct, &acct)
+			botToken := acct.BotToken
+			if botToken == "" {
+				botToken = cc.BotToken
+			}
+			baseURL := acct.BaseURL
+			if baseURL == "" {
+				baseURL = cc.BaseURL
+			}
+			ch := &ChannelRecord{
+				ID:             randomChannelID(),
+				UserID:         cfg.UserID,
+				AgentID:        cfg.AgentID,
+				Type:           cfg.Name,
+				AccountID:      accountID,
+				Enabled:        cfg.Enabled,
+				BotToken:       botToken,
+				BaseURL:        baseURL,
+				PlatformUserID: acct.UserID,
+				Data:           cfg.Data,
+				CreatedAt:      cfg.CreatedAt,
+				UpdatedAt:      cfg.UpdatedAt,
+			}
+			if err := d.SaveChannel(ctx, ch); err != nil {
+				slog.Warn("migrate channel from config failed",
+					"config_id", cfg.ID, "type", cfg.Name, "account", accountID, "error", err)
+			}
+		}
+	}
+	if len(configs) > 0 {
+		slog.Info("migrated channel configs to channels table", "count", len(configs))
+		// Clean up: delete channel rows from configs after successful copy.
+		if _, err := d.db.ExecContext(ctx, `DELETE FROM configs WHERE kind = 'channel'`); err != nil {
+			slog.Warn("failed to clean channel rows from configs", "error", err)
+		}
+	}
+	return nil
+}
+
+// migrateConfigsDropLegacyColumns removes the user_id, agent_id, and
+// credential_key columns from configs. These are redundant: scope_id
+// replaces user_id+agent_id, and credential_key was only used by
+// channels which now have their own table.
+//
+// Idempotent: skips if user_id column no longer exists.
+func (d *DBStore) migrateConfigsDropLegacyColumns(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "configs", "user_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		// Already migrated — nothing to do.
+		return nil
+	}
+
+	if d.dialect == "postgres" {
+		// Recompute scope_id for user-agent rows before dropping the columns.
+		if _, err := d.db.ExecContext(ctx,
+			`UPDATE configs SET scope_id = user_id || '/' || agent_id
+			 WHERE user_id != '' AND agent_id != ''`); err != nil {
+			return fmt.Errorf("postgres recompute scope_id: %w", err)
+		}
+		// Postgres supports ALTER TABLE DROP COLUMN directly.
+		stmts := []string{
+			`ALTER TABLE configs DROP CONSTRAINT IF EXISTS configs_kind_user_id_agent_id_name_key`,
+			`DROP INDEX IF EXISTS idx_configs_lookup`,
+			`DROP INDEX IF EXISTS idx_configs_credential`,
+			`ALTER TABLE configs DROP COLUMN IF EXISTS user_id`,
+			`ALTER TABLE configs DROP COLUMN IF EXISTS agent_id`,
+			`ALTER TABLE configs DROP COLUMN IF EXISTS credential_key`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS configs_kind_scope_id_name_key ON configs (kind, scope_id, name)`,
+			`CREATE INDEX IF NOT EXISTS idx_configs_scope ON configs (kind, scope_id)`,
+		}
+		for _, s := range stmts {
+			if _, err := d.db.ExecContext(ctx, s); err != nil {
+				return fmt.Errorf("postgres migrate configs drop legacy: %w\nSQL: %s", err, s)
+			}
+		}
+		return nil
+	}
+
+	// SQLite: rebuild the table via copy-rename.
+	stmts := []string{
+		`CREATE TABLE configs_new (
+			id TEXT PRIMARY KEY,
+			kind TEXT NOT NULL,
+			scope TEXT NOT NULL DEFAULT '',
+			scope_id TEXT NOT NULL DEFAULT '',
+			name TEXT NOT NULL,
+			enabled BOOLEAN NOT NULL DEFAULT TRUE,
+			data TEXT NOT NULL DEFAULT '{}',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (kind, scope_id, name)
+		)`,
+		// Recompute scope_id: user-agent rows (both user_id and agent_id
+		// non-empty) get "user_id/agent_id"; other rows keep scope_id as-is.
+		`INSERT INTO configs_new (id, kind, scope, scope_id, name, enabled, data, created_at, updated_at)
+		   SELECT id, kind, scope,
+		     CASE WHEN user_id != '' AND agent_id != '' THEN user_id || '/' || agent_id
+		          ELSE scope_id END,
+		     name, enabled, data, created_at, updated_at
+		   FROM configs`,
+		`DROP TABLE configs`,
+		`ALTER TABLE configs_new RENAME TO configs`,
+		`DROP INDEX IF EXISTS idx_configs_lookup`,
+		`DROP INDEX IF EXISTS idx_configs_credential`,
+		`CREATE INDEX IF NOT EXISTS idx_configs_scope ON configs (kind, scope_id)`,
+	}
+	for _, s := range stmts {
+		if _, err := d.db.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("sqlite migrate configs drop legacy: %w\nSQL: %s", err, s)
+		}
+	}
+	return nil
+}
+
+// migrateChannelsAddSharedIdentity retrofits a shared_identity column
+// onto the channels table. Default 0 (off) — each platform sender gets
+// an isolated chatter. When set to 1, inbound messages use the channel
+// owner's user_id as chatter so sessions and memory are shared across
+// the owner's personal channels.
+func (d *DBStore) migrateChannelsAddSharedIdentity(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "channels", "shared_identity")
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+	_, err = d.db.ExecContext(ctx,
+		`ALTER TABLE channels ADD COLUMN shared_identity INTEGER NOT NULL DEFAULT 0`)
+	return err
 }
 
 // --- Cron jobs ---
@@ -3080,6 +4028,93 @@ func (d *DBStore) CountProjectSessions(ctx context.Context, userID, agentID, pro
 		return 0, err
 	}
 	return n, nil
+}
+
+// --- Project runtimes (live-app layer) ---
+
+const projectRuntimeCols = `template_ref, status, dev_port, host_port, preview_url, container_id, git_ref, last_error, created_at, updated_at`
+
+func scanProjectRuntime(r *ProjectRuntimeRecord, sc func(...any) error) error {
+	return sc(&r.TemplateRef, &r.Status, &r.DevPort, &r.HostPort, &r.PreviewURL,
+		&r.ContainerID, &r.GitRef, &r.LastError, &r.CreatedAt, &r.UpdatedAt)
+}
+
+func (d *DBStore) GetProjectRuntime(ctx context.Context, userID, agentID, projectID string) (*ProjectRuntimeRecord, error) {
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT `+projectRuntimeCols+` FROM project_runtimes
+			WHERE user_id = %s AND agent_id = %s AND project_id = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		userID, agentID, projectID)
+	rec := ProjectRuntimeRecord{UserID: userID, AgentID: agentID, ProjectID: projectID}
+	if err := scanProjectRuntime(&rec, row.Scan); err != nil {
+		return nil, scanErr(err)
+	}
+	return &rec, nil
+}
+
+// SaveProjectRuntime upserts. created_at is preserved on update;
+// updated_at is bumped every write. Status defaults to 'none' at the
+// row level if the caller left it empty.
+func (d *DBStore) SaveProjectRuntime(ctx context.Context, r *ProjectRuntimeRecord) error {
+	if r.UserID == "" || r.AgentID == "" || r.ProjectID == "" {
+		return errors.New("store: SaveProjectRuntime requires user_id, agent_id, project_id")
+	}
+	if r.Status == "" {
+		r.Status = "none"
+	}
+	now := time.Now().UTC()
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`INSERT INTO project_runtimes (user_id, agent_id, project_id, template_ref, status, dev_port, host_port, preview_url, container_id, git_ref, last_error, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+				ON CONFLICT (user_id, agent_id, project_id) DO UPDATE SET
+				  template_ref=$4, status=$5, dev_port=$6, host_port=$7, preview_url=$8,
+				  container_id=$9, git_ref=$10, last_error=$11, updated_at=$12`,
+			r.UserID, r.AgentID, r.ProjectID, r.TemplateRef, r.Status, r.DevPort, r.HostPort,
+			r.PreviewURL, r.ContainerID, r.GitRef, r.LastError, now)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO project_runtimes (user_id, agent_id, project_id, template_ref, status, dev_port, host_port, preview_url, container_id, git_ref, last_error, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (user_id, agent_id, project_id) DO UPDATE SET
+			  template_ref=excluded.template_ref, status=excluded.status, dev_port=excluded.dev_port,
+			  host_port=excluded.host_port, preview_url=excluded.preview_url, container_id=excluded.container_id,
+			  git_ref=excluded.git_ref, last_error=excluded.last_error, updated_at=excluded.updated_at`,
+		r.UserID, r.AgentID, r.ProjectID, r.TemplateRef, r.Status, r.DevPort, r.HostPort,
+		r.PreviewURL, r.ContainerID, r.GitRef, r.LastError, now, now)
+	return err
+}
+
+func (d *DBStore) DeleteProjectRuntime(ctx context.Context, userID, agentID, projectID string) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM project_runtimes WHERE user_id = %s AND agent_id = %s AND project_id = %s`,
+			d.ph(1), d.ph(2), d.ph(3)),
+		userID, agentID, projectID)
+	return err
+}
+
+// ListAllProjectRuntimes returns every runtime row across all owners.
+// Used by the idle sweeper to evict stale containers; deliberately not
+// user-scoped.
+func (d *DBStore) ListAllProjectRuntimes(ctx context.Context) ([]ProjectRuntimeRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT user_id, agent_id, project_id, `+projectRuntimeCols+` FROM project_runtimes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProjectRuntimeRecord
+	for rows.Next() {
+		var rec ProjectRuntimeRecord
+		if err := rows.Scan(&rec.UserID, &rec.AgentID, &rec.ProjectID,
+			&rec.TemplateRef, &rec.Status, &rec.DevPort, &rec.HostPort, &rec.PreviewURL,
+			&rec.ContainerID, &rec.GitRef, &rec.LastError, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
 }
 
 // parseTimeString tries common time formats that modernc.org/sqlite may

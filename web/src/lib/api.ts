@@ -115,6 +115,9 @@ export interface AgentDetail {
   // this is the only path the agent has to remember a chatter across
   // sessions.
   autoPersist?: boolean | null;
+  // sharedIdentity — when true, all channels share sessions and memory
+  // with the web channel (owner's identity). Default false.
+  sharedIdentity?: boolean;
   // plugins is the per-agent hook-plugin enable overlay: pluginID →
   // enabled. Missing keys fall back to the system-wide enable state
   // (visible via /api/plugins). null/undefined means "no per-agent
@@ -241,6 +244,9 @@ export interface ConfigResponse {
     boxliteKey?: string;
     boxlitePrefix?: string;
   };
+  prefs?: {
+    timezone?: string;
+  };
   wechat?: {
     splitReplies?: boolean;
   };
@@ -261,6 +267,7 @@ export interface ConfigResponse {
   // value) to know whether the caller has overridden at user scope.
   meta?: {
     systemDefaultModel?: string;
+    serverTimezone?: string;
   };
 }
 
@@ -731,6 +738,74 @@ export async function listAgentFiles(
   return (data.files || []) as WorkspaceFile[];
 }
 
+// getScopePreview returns the live dev-server preview for the current chat
+// scope (sessionId for a loose chat, projectId for a project), or status
+// "none" when nothing is running. Backs the workspace panel's "open
+// preview" entry.
+export interface ScopePreview {
+  previewUrl?: string;
+  status: string; // none|scaffolding|starting|running|sleeping|crashed
+}
+export async function getScopePreview(
+  agentId: string,
+  sessionId?: string,
+  projectId?: string,
+): Promise<ScopePreview> {
+  const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
+  if (projectId) params.set("projectId", projectId);
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/preview${qs ? "?" + qs : ""}`,
+  );
+  if (!res.ok) return { status: "none" };
+  const data = await res.json().catch(() => ({ status: "none" }));
+  return { previewUrl: data.previewUrl as string | undefined, status: (data.status as string) || "none" };
+}
+
+// getScopePreviewLogs tails the build/dev log for the current chat scope.
+// The preview panel polls it while the app is scaffolding so the user sees
+// the live pnpm-install output instead of an opaque spinner. Returns "" when
+// there's nothing yet (no runtime, or the scaffold hasn't written a line).
+export async function getScopePreviewLogs(
+  agentId: string,
+  sessionId?: string,
+  projectId?: string,
+  tail = 400,
+): Promise<string> {
+  const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
+  if (projectId) params.set("projectId", projectId);
+  if (tail > 0) params.set("tail", String(tail));
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/preview/logs${qs ? "?" + qs : ""}`,
+  );
+  if (!res.ok) return "";
+  const data = await res.json().catch(() => ({ logs: "" }));
+  return (data.logs as string) || "";
+}
+
+// getChangedFiles returns only the files the agent created/modified vs the
+// template baseline (git diff in the running app). `available` is false when
+// there's no live runtime/baseline — the caller then lists all files.
+export async function getChangedFiles(
+  agentId: string,
+  sessionId?: string,
+  projectId?: string,
+): Promise<{ files: WorkspaceFile[]; available: boolean }> {
+  const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
+  if (projectId) params.set("projectId", projectId);
+  const qs = params.toString();
+  const res = await apiFetch(
+    `/api/agents/${encodeURIComponent(agentId)}/changed-files${qs ? "?" + qs : ""}`,
+  );
+  if (!res.ok) return { files: [], available: false };
+  const data = await res.json().catch(() => ({ files: [], available: false }));
+  return { files: (data.files || []) as WorkspaceFile[], available: !!data.available };
+}
+
 // Chat
 export interface ChatHistoryMessage {
   role: "user" | "assistant" | "tool";
@@ -1093,11 +1168,28 @@ export async function sendChatStream(
     } catch { /* non-JSON body — keep status fallback */ }
     throw new Error(msg);
   }
+  const contentType = res.headers.get("content-type") || "";
+  if (contentType && !contentType.includes("text/event-stream")) {
+    let msg = "stream failed: unexpected response";
+    try {
+      const body = await res.text();
+      if (body) {
+        try {
+          const data = JSON.parse(body);
+          msg = String(data?.error || data?.message || msg);
+        } catch {
+          msg = body.slice(0, 240);
+        }
+      }
+    } catch { /* keep fallback */ }
+    throw new Error(msg);
+  }
   if (!res.body) throw new Error("stream failed: no body");
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawEvent = false;
 
   // Reader loop exits on either an explicit {type:"done"} event from the
   // server or a clean stream end (done flag from getReader). We tear down
@@ -1116,14 +1208,20 @@ export async function sendChatStream(
       if (!line.startsWith("data: ")) continue;
       try {
         const evt = JSON.parse(line.slice(6)) as ChatStreamEvent;
+        sawEvent = true;
         onEvent(evt);
         if (evt.type === "done") {
           finished = true;
         }
-      } catch { /* skip malformed frames */ }
+      } catch {
+        throw new Error("stream failed: malformed event from server");
+      }
     }
   }
   try { await reader.cancel(); } catch { /* ignore */ }
+  if (!sawEvent) {
+    throw new Error("stream ended without any response from the server");
+  }
 }
 
 export interface UploadedFile {
@@ -1265,11 +1363,19 @@ export interface AgentUpdatePayload {
   // profile) and MEMORY.md (long-term facts) — see Agent.autoPersist.
   autoPersist?: boolean;
   autoPersistReset?: boolean;
+  // Shared identity across channels. When true, all channels bound
+  // to this agent use the owner's user_id as chatter so sessions
+  // and memory are shared across web + IM channels.
+  sharedIdentity?: boolean;
   // Per-agent plugin enable overrides (patch semantics — keys not in
   // the map are preserved). Pass pluginsReset:true to clear ALL
   // per-agent overrides and fall back to system-wide enable state.
   plugins?: Record<string, boolean>;
   pluginsReset?: boolean;
+  // MCP servers whole-map replace. Omit to leave untouched, send {}
+  // to clear, or send the full desired map to replace.
+  mcpServers?: Record<string, MCPServerConfig>;
+  mcpServersReset?: boolean;
 }
 
 export async function updateAgent(id: string, agent: AgentUpdatePayload) {
@@ -1301,6 +1407,15 @@ export async function listHookPlugins(): Promise<HookPlugin[]> {
   }
 }
 
+export interface MCPServerConfig {
+  type: "http" | "stdio";
+  url?: string;
+  headers?: Record<string, string>;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
 export interface AgentFileConfig {
   model?: string;
   maxTokens?: number;
@@ -1309,6 +1424,7 @@ export interface AgentFileConfig {
   workspace?: string;
   skills?: AgentSkillsConfig;
   providers?: Record<string, ProviderData>;
+  mcpServers?: Record<string, MCPServerConfig>;
 }
 
 // Fetch the raw agent.json for one agent (per-agent overrides only — not
@@ -1323,7 +1439,11 @@ export async function deleteAgent(id: string) {
   const res = await apiFetch(`/api/agents/${id}`, {
     method: "DELETE",
   });
-  return res.json();
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || body?.ok === false) {
+    throw new Error(body?.error || `Delete failed (${res.status})`);
+  }
+  return body;
 }
 
 // Skills
@@ -1608,6 +1728,7 @@ export interface AgentChannel {
   botUsername?: string;
   botToken: string;    // server-masked
   enabled: boolean;
+  sharedIdentity: boolean;
   updatedAt?: string;
 }
 
@@ -1798,6 +1919,19 @@ export async function disconnectAgentChannel(
   return res.json();
 }
 
+export async function updateAgentChannel(
+  agentId: string,
+  type: string,
+  accountId: string,
+  patch: { sharedIdentity?: boolean },
+): Promise<{ ok: boolean; error?: string }> {
+  const res = await apiFetch(
+    `/api/agents/${agentId}/channels/${encodeURIComponent(type)}/${encodeURIComponent(accountId)}`,
+    { method: "PATCH", body: JSON.stringify(patch) },
+  );
+  return res.json();
+}
+
 // ---------- Admin: token usage ----------
 
 export type TokenUsageRange = "24h" | "7d" | "30d";
@@ -1850,4 +1984,17 @@ export async function getAgentTokenUsage(
     `/api/agents/${agentId}/usage?range=${range}&limit=${limit}`,
   );
   return res.json();
+}
+
+// Build a same-origin URL to a workspace file. Deliberately carries NO bearer
+// token: the web UI is same-origin and the auth middleware reads the session
+// cookie, so <img src>, <a href>, and direct downloads authenticate by cookie
+// like every other API call. (Putting `?token=<bearer>` in a URL leaked a full
+// API credential via Referer, browser history, and reverse-proxy access logs.)
+export function fileUrl(agentId: string, path: string, download = false): string {
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  const params = new URLSearchParams();
+  if (download) params.set("download", "1");
+  const qs = params.toString();
+  return `/api/agents/${agentId}/files/${encoded}${qs ? "?" + qs : ""}`;
 }

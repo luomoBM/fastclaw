@@ -9,6 +9,11 @@ data:
   FASTCLAW_BIND: "all"
   FASTCLAW_STORAGE_TYPE: "postgres"
   FASTCLAW_STORAGE_AUTO_MIGRATE: "true"
+  {{- with .Values.timezone }}
+  ## Server default timezone — last fallback after chatter / agent /
+  ## system prefs.
+  TZ: {{ . | quote }}
+  {{- end }}
 
   ## Object store
   FASTCLAW_OBJECT_STORE_TYPE: {{ .Values.objectStore.type | quote }}

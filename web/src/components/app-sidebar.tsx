@@ -316,12 +316,6 @@ export function AppSidebar(props: React.ComponentProps<typeof Sidebar>) {
         <NavSessions agentId={activeAgentId} sessions={sessions} />
       </SidebarContent>
       <SidebarFooter>
-        {/* Settings is pinned to the footer regardless of route so the
-            entry point stays in one place. Mode keys off activeAgentId:
-            on an agent route the dialog opens with full agent tabs
-            (Profile / Customize / Models / Skills / Channels / Scheduler)
-            — viewers get a filtered subset; on platform routes it opens
-            in user-only mode (Account / General). */}
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton

@@ -28,7 +28,8 @@ type Store interface {
 	CreateUser(ctx context.Context, u *UserRecord) error
 	GetUser(ctx context.Context, id string) (*UserRecord, error)
 	GetUserByLogin(ctx context.Context, usernameOrEmail string) (*UserRecord, error)
-	GetUserByExternal(ctx context.Context, apikeyID, externalID string) (*UserRecord, error)
+	GetUserByExternal(ctx context.Context, ownerUserID, externalID string) (*UserRecord, error)
+	GetUserByExternalSuffix(ctx context.Context, ownerUserID, prefix, suffix string) (*UserRecord, error)
 	ListUsers(ctx context.Context) ([]UserRecord, error)
 	UpdateUser(ctx context.Context, u *UserRecord) error
 	DeleteUser(ctx context.Context, id string) error
@@ -39,6 +40,11 @@ type Store interface {
 	GetWebSession(ctx context.Context, sid string) (*WebSessionRecord, error)
 	DeleteWebSession(ctx context.Context, sid string) error
 	DeleteExpiredWebSessions(ctx context.Context, before time.Time) error
+
+	// --- Mobile push devices (per user) ---
+	SavePushDevice(ctx context.Context, d *PushDeviceRecord) error
+	DeletePushDevice(ctx context.Context, userID, token string) error
+	ListPushDevices(ctx context.Context, userID string) ([]PushDeviceRecord, error)
 
 	// --- API keys (per user) ---
 	ListAPIKeys(ctx context.Context, userID string) ([]APIKeyRecord, error)
@@ -55,6 +61,7 @@ type Store interface {
 
 	// --- Agents (atomic; agents.id is globally unique) ---
 	ListAgents(ctx context.Context, ownerUserID string) ([]AgentRecord, error)
+	ListPublicAgents(ctx context.Context) ([]AgentRecord, error)
 	GetAgent(ctx context.Context, agentID string) (*AgentRecord, error)
 	SaveAgent(ctx context.Context, agent *AgentRecord) error
 	DeleteAgent(ctx context.Context, agentID string) error
@@ -62,6 +69,14 @@ type Store interface {
 
 	// --- Sessions (per user, per agent — chat history is private) ---
 	GetSession(ctx context.Context, userID, agentID, sessionKey string) (*SessionRecord, error)
+	// GetSessionByKey loads a session by (agentID, sessionKey) without
+	// user_id scoping. Used when the caller's user_id may differ from
+	// the session's owner (e.g. parent user viewing a child app_user's
+	// session in the dashboard).
+	GetSessionByKey(ctx context.Context, agentID, sessionKey string) (*SessionRecord, error)
+	// LookupSessionOwner returns the user_id that owns the given session.
+	// Used to resolve the correct user_id for cross-user session reads.
+	LookupSessionOwner(ctx context.Context, agentID, sessionKey string) (string, error)
 	SaveSession(ctx context.Context, userID, agentID, sessionKey string, session *SessionRecord) error
 	ListSessions(ctx context.Context, userID, agentID string) ([]SessionMeta, error)
 	// ListSessionOwnerPairs returns every distinct (user_id, agent_id)
@@ -73,6 +88,14 @@ type Store interface {
 	// pairs lets the admin view enumerate every (chatter, agent) tuple
 	// that has chat history, regardless of who owns the agent.
 	ListSessionOwnerPairs(ctx context.Context) ([]SessionOwnerPair, error)
+	// ListSessionOwnerPairsByAgents is like ListSessionOwnerPairs but
+	// restricted to the given agent IDs. Used by the scoped /api/chats
+	// endpoint so user/agent API keys see only their authorized agents.
+	ListSessionOwnerPairsByAgents(ctx context.Context, agentIDs []string) ([]SessionOwnerPair, error)
+	// ListSessionsPaginated returns a page of session metadata ordered by
+	// updated_at DESC. When agentIDs is nil every agent is included (admin
+	// view); otherwise only the listed agents. Returns (rows, totalCount, err).
+	ListSessionsPaginated(ctx context.Context, agentIDs []string, offset, limit int) ([]SessionMeta, int, error)
 	DeleteSession(ctx context.Context, userID, agentID, sessionKey string) error
 	RenameSession(ctx context.Context, userID, agentID, sessionKey, title string) error
 	// MoveSession reassigns a session to a different project (or
@@ -111,6 +134,18 @@ type Store interface {
 	SaveProject(ctx context.Context, p *ProjectRecord) error
 	DeleteProject(ctx context.Context, userID, agentID, projectID string) error
 	CountProjectSessions(ctx context.Context, userID, agentID, projectID string) (int, error)
+
+	// --- Project runtimes (the live-app layer on top of a project) ---
+	//
+	// At most one row per (user, agent, project). Get returns
+	// ErrNotFound when a project has no runtime yet. Save upserts.
+	// ListAllProjectRuntimes is for the idle sweeper, which needs to
+	// enumerate every live runtime regardless of owner to evict stale
+	// containers — it is NOT user-scoped on purpose.
+	GetProjectRuntime(ctx context.Context, userID, agentID, projectID string) (*ProjectRuntimeRecord, error)
+	SaveProjectRuntime(ctx context.Context, r *ProjectRuntimeRecord) error
+	DeleteProjectRuntime(ctx context.Context, userID, agentID, projectID string) error
+	ListAllProjectRuntimes(ctx context.Context) ([]ProjectRuntimeRecord, error)
 
 	// --- Session messages (append-only per-turn archive) ---
 	//
@@ -162,24 +197,18 @@ type Store interface {
 	DeleteAgentFile(ctx context.Context, agentID, userID, filename string) error
 	ListAgentFiles(ctx context.Context, agentID, userID string) ([]string, error)
 
-	// --- Configs (providers / channels / settings live here) ---
+	// --- Configs (providers / settings live here; channels have their own table) ---
 	//
-	// One table backs all three concept families. Each row is keyed by
-	// (kind, user_id, agent_id, name) and carries a JSON `data` payload.
+	// Each row is keyed by (kind, scope_id, name) and carries a JSON
+	// `data` payload.
 	//
 	//   kind="provider": LLM provider (name = provider key, e.g. "openai")
-	//   kind="channel":  channel adapter (name = channel type, e.g. "telegram")
 	//   kind="setting":  config namespace (name = "agents.defaults", "sandbox", …)
 	//
-	// `credential_key` is only populated for kind="channel" — it's the
-	// stable lookup key the inbound dispatcher uses to find the row when a
-	// message arrives. `enabled` lets a row hide an outer-scope row in the
-	// merge (used by channels: an inner-scope disabled row erases the
-	// outer entry).
+	// `enabled` lets a row hide an outer-scope row in the merge.
 	//
-	// ListConfigs(kind, userID, agentID) returns rows that match BOTH ids
-	// exactly. Pass empty for either to filter the corresponding ownership
-	// dimension. Pass both empty to get only system/global rows.
+	// ListConfigs(kind, userID, agentID) derives scope_id internally and
+	// returns matching rows. Pass both empty to get only system/global rows.
 	ListConfigs(ctx context.Context, kind, userID, agentID string) ([]ConfigRecord, error)
 	// ListConfigsByUser returns every row of a given kind owned by userID
 	// regardless of agent_id. The UserSpace assembly uses this to surface
@@ -198,6 +227,14 @@ type Store interface {
 	SaveConfig(ctx context.Context, c *ConfigRecord) error
 	DeleteConfig(ctx context.Context, id string) error
 	LookupChannelByCredential(ctx context.Context, channelType, credKey string) (*ConfigRecord, error)
+
+	// --- Channels (IM bot bindings) ---
+	ListChannels(ctx context.Context, userID, agentID string) ([]ChannelRecord, error)
+	ListAllChannels(ctx context.Context) ([]ChannelRecord, error)
+	GetChannel(ctx context.Context, id string) (*ChannelRecord, error)
+	SaveChannel(ctx context.Context, ch *ChannelRecord) error
+	DeleteChannel(ctx context.Context, id string) error
+	LookupChannel(ctx context.Context, channelType, accountID string) (*ChannelRecord, error)
 
 	// --- Cron jobs (per agent) ---
 	//
@@ -273,6 +310,11 @@ type UserRecord struct {
 	Status       string `json:"status"` // "active" | "disabled"
 	APIKeyID     string `json:"apikeyId,omitempty"`
 	ExternalID   string `json:"externalId,omitempty"`
+	// OwnerUserID links this user to its parent:
+	//   app_user  → the user who created the API key that provisioned this row
+	//   chatter   → the channel owner (the user/app_user whose agent the chatter talks to)
+	//   super_admin / user → empty (top-level)
+	OwnerUserID string `json:"ownerUserId,omitempty"`
 	// AvatarURL is a self-contained data: URL ("data:image/png;base64,...")
 	// stored inline to avoid a separate blob path. Cap is enforced by the
 	// handler at write time (256KB by default). Empty means "no avatar"
@@ -297,6 +339,17 @@ type WebSessionRecord struct {
 	UserID    string    `json:"userId"`
 	CreatedAt time.Time `json:"createdAt"`
 	ExpiresAt time.Time `json:"expiresAt"`
+}
+
+// PushDeviceRecord stores one mobile push destination for a user.
+type PushDeviceRecord struct {
+	UserID      string    `json:"userId"`
+	Token       string    `json:"token"`
+	Platform    string    `json:"platform"`
+	Environment string    `json:"environment"`
+	BundleID    string    `json:"bundleId,omitempty"`
+	CreatedAt   time.Time `json:"createdAt"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 // APIKeyRecord is one row of the apikeys table. KeyHash is SHA256(token);
@@ -379,6 +432,11 @@ type SessionMessage struct {
 	// (currently only "goal_context"). Stored as a column on
 	// session_messages (see migrateSessionMessagesAddOrigin).
 	Origin string `json:"origin,omitempty"`
+	// Provider and Model record which LLM produced this message.
+	// Only set on role="assistant" messages. Empty on user/tool rows
+	// and on rows written before this column existed.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 }
 
 // SessionEventRecord is one row of session_events — a single delta the
@@ -406,14 +464,17 @@ type SessionOwnerPair struct {
 
 // SessionMeta is summary info for a session (for listing).
 type SessionMeta struct {
-	Key          string    `json:"key"`
-	Channel      string    `json:"channel,omitempty"`
-	AccountID    string    `json:"accountId,omitempty"`
-	ChatID       string    `json:"chatId,omitempty"`
-	ProjectID    string    `json:"projectId,omitempty"`
-	Title        string    `json:"title,omitempty"`
-	MessageCount int       `json:"messageCount"`
-	UpdatedAt    time.Time `json:"updatedAt"`
+	Key           string    `json:"key"`
+	UserID        string    `json:"userId,omitempty"`  // session owner (may differ from the listing caller when child app_users are included)
+	AgentID       string    `json:"agentId,omitempty"` // populated by ListSessionsPaginated
+	Channel       string    `json:"channel,omitempty"`
+	AccountID     string    `json:"accountId,omitempty"`
+	ChatID        string    `json:"chatId,omitempty"`
+	ProjectID     string    `json:"projectId,omitempty"`
+	Title         string    `json:"title,omitempty"`
+	MessageCount  int       `json:"messageCount"`
+	UpdatedAt     time.Time `json:"updatedAt"`
+	ChatterUserID string    `json:"chatterUserId,omitempty"`
 }
 
 // ProjectRecord is a per-(user, agent) named workspace folder. Sessions
@@ -435,6 +496,49 @@ type ProjectRecord struct {
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
+// ProjectRuntimeRecord is the live-app layer that sits ON TOP of a
+// ProjectRecord — at most one per (user, agent, project). The
+// ProjectRecord owns the source tree (the shared workspace folder);
+// this record owns the *running instance* of that source: a long-lived
+// sandbox container, a dev server, and a preview URL. The two are
+// deliberately separate tables so the existing project feature (chat
+// grouping + shared files) keeps its exact semantics and the coding-
+// agent runtime is purely additive.
+//
+// Lifecycle of Status:
+//
+//	none        — record exists but nothing is provisioned yet
+//	scaffolding — template is being copied into the workspace
+//	starting    — sandbox is up, dev server is booting
+//	running     — dev server is serving; PreviewURL is live
+//	sleeping    — container evicted to save compute; Wake re-creates it
+//	crashed     — dev server exited non-zero; LastError has the detail
+type ProjectRuntimeRecord struct {
+	UserID      string `json:"-"`
+	AgentID     string `json:"-"`
+	ProjectID   string `json:"projectId"`
+	TemplateRef string `json:"templateRef,omitempty"`
+	Status      string `json:"status"`
+	// DevPort is the container-internal port the dev server listens on
+	// (e.g. 3000 for ShipAny). HostPort is the host-published port the
+	// preview gateway reverse-proxies to; 0 means not currently
+	// published (sleeping / never started). PreviewURL is the
+	// user-facing URL the gateway resolves to HostPort.
+	DevPort    int    `json:"devPort,omitempty"`
+	HostPort   int    `json:"hostPort,omitempty"`
+	PreviewURL string `json:"previewUrl,omitempty"`
+	// ContainerID is the long-lived sandbox container backing this
+	// runtime. Empty when sleeping/none. Stored so a process restart can
+	// re-adopt or clean up orphaned containers.
+	ContainerID string `json:"-"`
+	// GitRef is the commit the agent snapshotted after the last turn, so
+	// Revert can roll the workspace back a step.
+	GitRef    string    `json:"gitRef,omitempty"`
+	LastError string    `json:"lastError,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
 // Kinds for ConfigRecord.
 const (
 	KindProvider = "provider"
@@ -443,21 +547,15 @@ const (
 )
 
 // ConfigRecord is one row of the configs table — the unified
-// home for providers, channels, and namespaced settings.
+// home for providers and namespaced settings (channels have their
+// own table now).
 //
 //   - kind says which family this row belongs to
-//   - (user_id, agent_id) says who owns it; the empty-string defaults
-//     give us four natural ownership levels:
-//     (”, ”)   = system / global
-//     (X, ”)    = user X's private config
-//     (”, Y)    = agent Y's "official" config (anyone using Y inherits)
-//     (X, Y)     = user X's per-agent override on agent Y (multi-tenant)
-//   - name is the lookup handle inside that family (provider key,
-//     channel type, or setting namespace)
+//   - scope_id is the single lookup key derived from (UserID, AgentID);
+//     whichever is non-empty wins. System rows have scope_id=””.
+//   - name is the lookup handle inside that family (provider key or
+//     setting namespace)
 //   - data is the family-specific JSON payload
-//
-// CredentialKey is only meaningful for kind="channel" — see
-// LookupChannelByCredential.
 type ConfigRecord struct {
 	ID   string `json:"id"`
 	Kind string `json:"kind"`
@@ -468,15 +566,52 @@ type ConfigRecord struct {
 	// sync with the (user_id, agent_id) source of truth. Kept so DB
 	// dumps and ad-hoc queries (`WHERE scope='system'`) stay readable
 	// without parsing the empty/non-empty pattern of the id columns.
-	Scope         string                 `json:"scope,omitempty"`
-	UserID        string                 `json:"userId,omitempty"`
-	AgentID       string                 `json:"agentId,omitempty"`
-	Name          string                 `json:"name"`
-	Enabled       bool                   `json:"enabled"`
+	Scope string `json:"scope,omitempty"`
+	// ScopeID collapses (UserID, AgentID) into a single lookup key:
+	// whichever is non-empty wins (they're mutually exclusive for
+	// provider/setting rows). System rows have ScopeID="". The column
+	// enables single-column WHERE filters instead of the two-column
+	// (user_id, agent_id) pair. UserID and AgentID are kept for
+	// backward compatibility but ScopeID is the canonical lookup key.
+	ScopeID string `json:"scopeId,omitempty"`
+	// UserID and AgentID are convenience fields populated from
+	// scope/scope_id on read and used to compute scope_id on write.
+	// They are NOT persisted as DB columns.
+	UserID  string `json:"userId,omitempty"`
+	AgentID string `json:"agentId,omitempty"`
+	Name    string `json:"name"`
+	Enabled bool   `json:"enabled"`
+	// CredentialKey is a legacy convenience field. No longer persisted
+	// as a DB column (channels have their own table now). Kept on the
+	// struct so callers that synthesize ConfigRecord for hot-register
+	// don't break.
 	CredentialKey string                 `json:"credentialKey,omitempty"`
 	Data          map[string]interface{} `json:"data,omitempty"`
 	CreatedAt     time.Time              `json:"createdAt"`
 	UpdatedAt     time.Time              `json:"updatedAt"`
+}
+
+// ChannelRecord is one row of the channels table — a bound IM bot.
+type ChannelRecord struct {
+	ID             string `json:"id"`
+	UserID         string `json:"userId"`    // who bound this channel
+	AgentID        string `json:"agentId"`   // which agent it routes to
+	Type           string `json:"type"`      // wechat / telegram / discord / slack / line / feishu
+	AccountID      string `json:"accountId"` // bot unique identifier (credential_key equivalent)
+	Enabled        bool   `json:"enabled"`
+	BotToken       string `json:"botToken,omitempty"`
+	BaseURL        string `json:"baseUrl,omitempty"`
+	PlatformUserID string `json:"platformUserId,omitempty"` // scanner's platform ID (WeChat openID)
+	// SharedIdentity, when true, makes all inbound messages on this
+	// channel use the channel owner's user_id as the chatter identity
+	// instead of minting a per-platform u_xxx chatter. This lets the
+	// owner share sessions and memory across multiple personal channels
+	// (e.g. WeChat + Feishu + Telegram all resolving as the same user).
+	// Default false — each platform sender gets an isolated chatter.
+	SharedIdentity bool                   `json:"sharedIdentity"`
+	Data           map[string]interface{} `json:"data,omitempty"` // extra config (accounts map, etc.)
+	CreatedAt      time.Time              `json:"createdAt"`
+	UpdatedAt      time.Time              `json:"updatedAt"`
 }
 
 // computeConfigScope derives the scope label from the (userID, agentID)
@@ -494,6 +629,22 @@ func computeConfigScope(userID, agentID string) string {
 		return "agent"
 	default:
 		return "system"
+	}
+}
+
+// computeScopeID derives the single-column lookup key from (userID,
+// agentID). The encoding matches LegacyScopeID: user-agent rows use
+// "userID/agentID" so the two halves are recoverable on read.
+func computeScopeID(userID, agentID string) string {
+	switch {
+	case userID != "" && agentID != "":
+		return userID + "/" + agentID
+	case userID != "":
+		return userID
+	case agentID != "":
+		return agentID
+	default:
+		return ""
 	}
 }
 

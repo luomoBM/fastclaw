@@ -490,6 +490,9 @@ type applyPatchArgs struct {
 // -----------------------------------------------------------------------------
 
 func (r *Registry) readForPatch(ctx context.Context, path string) (string, error) {
+	if r.identityFileBlocked(path) {
+		return "", fmt.Errorf("%s", IdentityFileRefusal)
+	}
 	if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(path) {
 		rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.sessionID, path)
 		if err != nil {
@@ -530,6 +533,9 @@ func (r *Registry) readForPatch(ctx context.Context, path string) (string, error
 }
 
 func (r *Registry) writeForPatch(ctx context.Context, path, content string) error {
+	if r.identityFileBlocked(path) {
+		return fmt.Errorf("%s", IdentityFileRefusal)
+	}
 	if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(path) {
 		return r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.sessionID, path,
 			strings.NewReader(content), int64(len(content)), "")

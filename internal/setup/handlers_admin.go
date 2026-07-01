@@ -1,10 +1,13 @@
 package setup
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
@@ -138,6 +141,56 @@ func (s *Server) handleUpdateMe(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "user": acct})
 }
 
+func (s *Server) handleUploadMyAvatar(w http.ResponseWriter, r *http.Request) {
+	ident, ok := auth.FromContext(r.Context())
+	if !ok || ident.ReadOnly() {
+		jsonResponse(w, http.StatusForbidden, map[string]any{"ok": false, "error": "read-only"})
+		return
+	}
+	if err := r.ParseMultipartForm(1 << 20); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "no file"})
+		return
+	}
+	defer file.Close()
+
+	data, err := io.ReadAll(io.LimitReader(file, maxAvatarBytes+1))
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	contentType := header.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = http.DetectContentType(data)
+	}
+	contentType = strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
+	if !strings.HasPrefix(contentType, "image/") {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "avatar must be an image"})
+		return
+	}
+	avatarURL := "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	if len(avatarURL) > maxAvatarBytes {
+		jsonResponse(w, http.StatusRequestEntityTooLarge, map[string]any{"ok": false, "error": "avatar too large (max 256KB)"})
+		return
+	}
+
+	current, err := s.accounts.Get(r.Context(), ident.UserID)
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	acct, err := s.accounts.UpdateProfile(r.Context(), ident.UserID, current.DisplayName, avatarURL)
+	if err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "user": acct})
+}
+
 type changePasswordReq struct {
 	OldPassword string `json:"oldPassword"`
 	NewPassword string `json:"newPassword"`
@@ -186,12 +239,12 @@ type onboardRequest struct {
 	Password    string `json:"password"`
 	DisplayName string `json:"displayName,omitempty"`
 
-	Provider  string `json:"provider"`
-	APIBase   string `json:"apiBase"`
-	APIKey    string `json:"apiKey"`
-	APIType   string `json:"apiType,omitempty"`
-	AuthType  string `json:"authType,omitempty"`
-	Model     string `json:"model"`
+	Provider string `json:"provider"`
+	APIBase  string `json:"apiBase"`
+	APIKey   string `json:"apiKey"`
+	APIType  string `json:"apiType,omitempty"`
+	AuthType string `json:"authType,omitempty"`
+	Model    string `json:"model"`
 
 	AgentName string `json:"agentName,omitempty"`
 
@@ -313,6 +366,10 @@ func (s *Server) handleOnboard(w http.ResponseWriter, r *http.Request) {
 			sandbox["boxlitePrefix"] = req.SandboxBoxlitePrefix
 		}
 		if err := scope.SaveSettingByScope(r.Context(), s.dataStore, scope.System, "", "sandbox", sandbox); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		if err := s.reloadSystemSandbox(); err != nil {
 			jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
@@ -537,7 +594,17 @@ func (s *Server) handleAdminChats(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "no data store"})
 		return
 	}
-	pairs, err := s.dataStore.ListSessionOwnerPairs(r.Context())
+	// Pagination: ?page=1&pageSize=30 (1-based, defaults to page 1, 30 per page).
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 30
+	}
+	offset := (page - 1) * pageSize
+	metas, total, err := s.dataStore.ListSessionsPaginated(r.Context(), nil, offset, pageSize)
 	if err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -566,47 +633,64 @@ func (s *Server) handleAdminChats(w http.ResponseWriter, r *http.Request) {
 		agentCache[agentID] = a
 		return a
 	}
-	out := make([]map[string]any, 0)
-	for _, p := range pairs {
-		ag := resolveAgent(p.AgentID)
+	out := make([]map[string]any, 0, len(metas))
+	for _, m := range metas {
+		ag := resolveAgent(m.AgentID)
 		if ag == nil {
-			// Orphan session row whose agent has been deleted — skip
-			// rather than surfacing a row with a blank Agent column.
 			continue
 		}
-		adapter := session.NewStoreAdapter(s.dataStore, p.UserID)
-		sessions, err := adapter.ListWebSessions(r.Context(), p.AgentID)
-		if err != nil {
+		adapter := session.NewStoreAdapter(s.dataStore, m.UserID)
+		ws := adapter.BuildWebSession(r.Context(), m)
+		if ws == nil {
 			continue
 		}
-		owner := resolveOwner(p.UserID)
-		for _, ws := range sessions {
-			entry := map[string]any{
-				"id":           ws.ID,
-				"agentId":      p.AgentID,
-				"agentName":    ag.Name,
-				"userId":       p.UserID,
-				"channel":      ws.Channel,
-				"accountId":    ws.AccountID,
-				"chatId":       ws.ChatID,
-				"projectId":    ws.ProjectID,
-				"title":        ws.Title,
-				"preview":      ws.Preview,
-				"thumbnailUrl": ws.ThumbnailURL,
-				"createdAt":    ws.CreatedAt,
-				"updatedAt":    ws.UpdatedAt,
-			}
-			if owner != nil {
-				entry["ownerUsername"] = owner.Username
-				entry["ownerEmail"] = owner.Email
-				if owner.DisplayName != "" {
-					entry["ownerDisplayName"] = owner.DisplayName
+		owner := resolveOwner(m.UserID)
+		entry := map[string]any{
+			"id":           ws.ID,
+			"agentId":      m.AgentID,
+			"agentName":    ag.Name,
+			"userId":       m.UserID,
+			"channel":      ws.Channel,
+			"accountId":    ws.AccountID,
+			"chatId":       ws.ChatID,
+			"projectId":    ws.ProjectID,
+			"title":        ws.Title,
+			"preview":      ws.Preview,
+			"thumbnailUrl": ws.ThumbnailURL,
+			"createdAt":    ws.CreatedAt,
+			"updatedAt":    ws.UpdatedAt,
+		}
+		if ws.ChatterUserID != "" {
+			entry["chatterUserId"] = ws.ChatterUserID
+			if chatter := resolveOwner(ws.ChatterUserID); chatter != nil {
+				if chatter.ExternalID != "" {
+					entry["chatterExternalId"] = chatter.ExternalID
+				}
+				if chatter.DisplayName != "" {
+					entry["chatterDisplayName"] = chatter.DisplayName
 				}
 			}
-			out = append(out, entry)
 		}
+		if owner != nil {
+			entry["ownerUsername"] = owner.Username
+			entry["ownerEmail"] = owner.Email
+			if owner.ExternalID != "" {
+				entry["ownerExternalId"] = owner.ExternalID
+			}
+			if owner.DisplayName != "" {
+				entry["ownerDisplayName"] = owner.DisplayName
+			}
+		}
+		out = append(out, entry)
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"sessions": out})
+	totalPages := (total + pageSize - 1) / pageSize
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"sessions":   out,
+		"page":       page,
+		"pageSize":   pageSize,
+		"total":      total,
+		"totalPages": totalPages,
+	})
 }
 
 // --- Admin provisioning (per-user) ---

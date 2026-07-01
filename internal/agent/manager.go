@@ -47,6 +47,7 @@ type managerOpts struct {
 	workspaceStore  workspace.Store
 	dataStore       store.Store
 	meter           usage.Meter
+	quotaStore      usage.QuotaStore
 	userID          string
 	globalSkillsCfg config.SkillsCfg
 }
@@ -88,6 +89,14 @@ func WithDataStore(st store.Store) ManagerOption {
 // to disable metering (tests, single-user dev runs).
 func WithMeter(m usage.Meter) ManagerOption {
 	return func(o *managerOpts) { o.meter = m }
+}
+
+// WithQuotaStore installs per-user billing quota enforcement on every
+// agent. The agent loop checks the owner's quota before processing a
+// turn — when exceeded, the user gets a friendly rejection and no LLM
+// tokens are burned. Omit to disable quota enforcement.
+func WithQuotaStore(qs usage.QuotaStore) ManagerOption {
+	return func(o *managerOpts) { o.quotaStore = qs }
 }
 
 // WithGlobalSkillsCfg propagates cfg.Skills (entries + agentEntries
@@ -222,6 +231,12 @@ func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb
 		// at execute time (bindSession stamps them per-turn) so the
 		// fired message routes back to the originating chat.
 		tools.RegisterCronTools(ag.registry, m.opts.dataStore, m.uid, rc.ID)
+		// set_timezone persists the chatter's IANA timezone into scope
+		// prefs — the same rows the system-prompt date line and cron
+		// scheduling resolve through. Needs the relational store, so it
+		// rides the same guard as cron.
+		tools.RegisterTimezoneTool(ag.registry, m.opts.dataStore)
+		tools.RegisterPreferenceTool(ag.registry, m.opts.dataStore)
 		// /goal feature: token-accounting hook + update_goal tool, all
 		// keyed on the agent's owner (set above by SetOwnerUserID).
 		// Same dataStore guard as cron because both features need the
@@ -232,12 +247,20 @@ func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb
 		// on an in-memory counter that restart-clears) can hit the
 		// store directly without re-plumbing through Manager.
 		ag.dataStore = m.opts.dataStore
+		// Date line in the chatter's timezone — needs dataStore for the
+		// scope-prefs lookup, hence wired here and re-applied by
+		// ReloadWorkspaceFiles after every ctxBuilder rebuild.
+		ag.ctxBuilder.SetTimezoneResolver(ag.chatterLocation)
 	}
 	// Stamp agentID even when no workspaceStore is wired (single-user
 	// local mode), so usage metering can record per-agent rollups.
 	ag.agentID = rc.ID
 	if m.opts.meter != nil {
 		ag.SetMeter(m.opts.meter)
+		tools.RegisterBillingTools(ag.registry, m.opts.meter, m.opts.quotaStore)
+	}
+	if m.opts.quotaStore != nil {
+		ag.SetQuotaStore(m.opts.quotaStore)
 	}
 	return ag
 }

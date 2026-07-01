@@ -55,6 +55,9 @@ stringData:
   # in the Deployment below.
   # E2B_API_KEY: "REPLACE_WITH_E2B_KEY"
 
+  # Optional Redis auth. Configure when your Redis requires AUTH.
+  # REDIS_PASSWORD: "REPLACE_WITH_REDIS_PASSWORD"
+
 ---
 # =================== EDIT HERE (object store provider) ==================
 # Pick ONE provider — uncomment its block and leave the others commented.
@@ -77,6 +80,12 @@ data:
   FASTCLAW_BIND: "all"
   FASTCLAW_STORAGE_TYPE: "postgres"
   FASTCLAW_STORAGE_AUTO_MIGRATE: "true"
+
+  # Server default timezone (IANA name) — the LAST fallback in the chain
+  # chatter pref → agent default → system default → TZ. Without it pods
+  # run UTC, so agents whose chatters never set a timezone see UTC wall
+  # clocks and get UTC-fired schedules.
+  TZ: "Asia/Shanghai"
 
   # ─── Provider 1: Aliyun OSS (default example) ───
   FASTCLAW_OBJECT_STORE_TYPE: "aliyun-oss"
@@ -113,6 +122,16 @@ data:
 
   # Optional: prefix to share one bucket across multiple environments.
   # FASTCLAW_OBJECT_STORE_PREFIX: "prod"
+
+  # ─── Redis (recommended for multi-replica IM bots) ───
+  # When enabled, FastClaw uses Redis for:
+  #   1. cross-replica channel leases (only one pod long-polls each bot)
+  #   2. shared Redis Stream inbound/outbound delivery for IM/cron traffic
+  # Web/API traffic stays process-local so dashboard SSE keeps working.
+  # FASTCLAW_REDIS_ENABLED: "true"
+  # FASTCLAW_REDIS_ADDR: "redis.fastclaw.svc.cluster.local:6379"
+  # FASTCLAW_REDIS_DB: "0"
+  # FASTCLAW_REDIS_PREFIX: "fastclaw"
 
   # ─── Sandbox (optional) ───
   # k8s pods don't have a docker daemon, so the only sandbox backend
@@ -151,6 +170,7 @@ spec:
             - { name: FASTCLAW_STORAGE_DSN,             valueFrom: { secretKeyRef: { name: fastclaw-secrets, key: STORAGE_DSN } } }
             - { name: FASTCLAW_OBJECT_STORE_ACCESSKEY,  valueFrom: { secretKeyRef: { name: fastclaw-secrets, key: OBJECT_STORE_ACCESSKEY } } }
             - { name: FASTCLAW_OBJECT_STORE_SECRETKEY,  valueFrom: { secretKeyRef: { name: fastclaw-secrets, key: OBJECT_STORE_SECRETKEY } } }
+            # - { name: FASTCLAW_REDIS_PASSWORD, valueFrom: { secretKeyRef: { name: fastclaw-secrets, key: REDIS_PASSWORD } } }
             # - { name: E2B_API_KEY, valueFrom: { secretKeyRef: { name: fastclaw-secrets, key: E2B_API_KEY } } }
           volumeMounts:
             - { name: data, mountPath: /data/.fastclaw }

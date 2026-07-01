@@ -48,6 +48,11 @@ type Session struct {
 	// Empty when the caller hasn't bound a chatter — writes leave the
 	// column '' and readers fall back to user_id.
 	chatterUserID string
+	// provider and model are stamped onto assistant messages by
+	// Append so session_messages rows record which LLM produced them.
+	// Set per-turn by the agent loop via SetProviderModel.
+	provider string
+	model    string
 
 	// Steering: turnDepth counts in-flight HandleMessage turns for this
 	// session (a counter, not a bool, so re-entrant/overlapping turns
@@ -75,7 +80,7 @@ func (s *Session) SessionKey() string { return s.sessionKey }
 // session_events.chatter_user_id) can record the actual conversation
 // participant. user_id stays = UserSpace owner; chatter is the
 // additional dimension. Both tags are independent — empty chatter
-// just leaves the column ''.
+// just leaves the column ”.
 func (s *Session) ctx() context.Context {
 	ctx := context.Background()
 	if s.userID != "" {
@@ -91,10 +96,20 @@ func (s *Session) ctx() context.Context {
 // Session so the next Append / SaveSession write stamps the
 // chatter_user_id column. Called by the agent loop at the top of each
 // turn from the resolved chatterUID. Passing "" clears it (the next
-// write goes back to '' which readers fall back to user_id for).
+// write goes back to ” which readers fall back to user_id for).
 func (s *Session) SetChatter(uid string) {
 	s.mu.Lock()
 	s.chatterUserID = uid
+	s.mu.Unlock()
+}
+
+// SetProviderModel binds the current LLM provider and model to this
+// Session so Append stamps them onto assistant messages. Called by the
+// agent loop alongside SetChatter.
+func (s *Session) SetProviderModel(prov, mdl string) {
+	s.mu.Lock()
+	s.provider = prov
+	s.model = mdl
 	s.mu.Unlock()
 }
 
@@ -158,10 +173,12 @@ func NewManager(dataDir string) *Manager {
 }
 
 // NewManagerWithStoreForUser is the user-scoped constructor. Caller MUST
-// supply a real user_id resolved from auth — there is no fallback.
+// supply a real user_id resolved from auth. We log and keep the Manager
+// alive on empty input so a bad request cannot crash the whole gateway;
+// downstream store calls will fail closed under the empty owner.
 func NewManagerWithStoreForUser(dataDir string, st SessionStore, userID, agentID string) *Manager {
 	if userID == "" {
-		panic("session.NewManagerWithStoreForUser: userID is required")
+		fmt.Fprintf(os.Stderr, "session.NewManagerWithStoreForUser: empty userID for agent %q\n", agentID)
 	}
 	return &Manager{
 		sessions: make(map[string]*Session),
@@ -442,6 +459,12 @@ func (s *Session) Append(msg provider.Message) {
 	if msg.Timestamp == 0 {
 		msg.Timestamp = time.Now().UnixMilli()
 	}
+	// Stamp provider/model on assistant messages so the archive
+	// records which LLM produced each response.
+	if msg.Role == "assistant" && msg.Provider == "" && s.provider != "" {
+		msg.Provider = s.provider
+		msg.Model = s.model
+	}
 
 	s.Messages = append(s.Messages, msg)
 
@@ -667,6 +690,10 @@ type WebSession struct {
 	// text" instead of just the text label for multimodal chats.
 	// Empty for sessions whose opening message had no image.
 	ThumbnailURL string `json:"thumbnailUrl,omitempty"`
+	// ChatterUserID is the actual conversation participant. Differs
+	// from user_id when an IM sender is resolved to a per-sender
+	// app_user under the channel owner's UserSpace.
+	ChatterUserID string `json:"chatterUserId,omitempty"`
 }
 
 // ListWebSessions scans session files for web chat sessions and returns

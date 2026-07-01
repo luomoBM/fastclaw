@@ -488,11 +488,16 @@ func makeReadFile(r *Registry) ToolFunc {
 		if r.identityFileBlocked(args.Path) {
 			return IdentityFileRefusal, nil
 		}
+		// Skill-manifest gate. Same rationale for a bundled SKILL.md —
+		// the agent's IP, not for a chatter to pull verbatim.
+		if r.skillManifestBlocked(args.Path) {
+			return SkillManifestRefusal, nil
+		}
 
 		// Mirror makeWriteFile's routing: userRoot-destined paths go to the
 		// workspace store when one is configured.
 		if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(args.Path) {
-			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.sessionID, args.Path)
+			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path))
 			if err != nil {
 				return "", fmt.Errorf("workspace get: %w", err)
 			}
@@ -585,7 +590,7 @@ func makeWriteFile(r *Registry) ToolFunc {
 		// filesystem because the memory store already covers their
 		// durability via a separate path.
 		if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(args.Path) {
-			if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.sessionID, args.Path,
+			if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path),
 				strings.NewReader(args.Content), int64(len(args.Content)), ""); err != nil {
 				if friendly := asIsDirToolError("write_file", args.Path, err); friendly != nil {
 					return "", friendly
@@ -667,6 +672,12 @@ func makeEditFile(r *Registry) ToolFunc {
 		if r.identityFileBlocked(args.Path) {
 			return IdentityFileRefusal, nil
 		}
+		// Skill-manifest gate — block edits to a bundled SKILL.md for
+		// non-admin chatters (editing returns surrounding content + lets
+		// them tamper with the agent's IP). Owner edits skills via the UI.
+		if r.skillManifestBlocked(args.Path) {
+			return SkillManifestRefusal, nil
+		}
 
 		// Mirror makeWriteFile's routing precedence: workspace store first
 		// (user artifacts), then identity-file store (SOUL.md / IDENTITY.md /
@@ -674,7 +685,7 @@ func makeEditFile(r *Registry) ToolFunc {
 		// the same backend or an edit could silently land in a different
 		// store than the one the agent later reads from.
 		if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(args.Path) {
-			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.sessionID, args.Path)
+			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path))
 			if err != nil {
 				return "", fmt.Errorf("workspace get: %w", err)
 			}
@@ -690,7 +701,7 @@ func makeEditFile(r *Registry) ToolFunc {
 			if err != nil {
 				return "", err
 			}
-			if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.sessionID, args.Path,
+			if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path),
 				strings.NewReader(updated), int64(len(updated)), ""); err != nil {
 				if friendly := asIsDirToolError("edit_file", args.Path, err); friendly != nil {
 					return "", friendly
@@ -792,7 +803,7 @@ func makeListDir(r *Registry) ToolFunc {
 		// listing" by filtering List output to entries whose agent-relative
 		// path sits under args.Path's prefix.
 		if r.workspaceStore != nil && r.agentID != "" && r.isWorkspacePath(args.Path) {
-			objs, err := r.workspaceStore.List(ctx, r.agentID, r.projectID, r.sessionID)
+			objs, err := r.workspaceStore.List(ctx, r.agentID, r.projectID, r.scopeSessionID())
 			if err != nil {
 				return "", fmt.Errorf("workspace list: %w", err)
 			}
@@ -863,6 +874,29 @@ func makeListDir(r *Registry) ToolFunc {
 // the path (absolute paths, `skills/...`, ad-hoc scripts, etc.). The
 // sandbox badge is emitted only for the executor-fallback path — store
 // hits intentionally don't badge, since they didn't run in the sandbox.
+// mirrorCodingWriteToSandbox pushes a coding-agent workspace write into the
+// live preview sandbox. Coding writes route to workspace.Store (host), which
+// docker bind-mounts into the dev-server container — but a remote backend
+// (E2B) shares no host mount, so without this the dev server never sees the
+// edit and HMR looks dead. Guarded on RemoteWorkspace, so it's a no-op for
+// docker (whose executor isn't remote). Best-effort: the user-visible write
+// already hit the store, so a mirror failure only degrades live-reload — we
+// log and move on. Destination is ABSOLUTE /workspace/<path> because the
+// dev server serves the sandbox /workspace root and envd resolves a bare
+// path against $HOME, not /workspace.
+func (r *Registry) mirrorCodingWriteToSandbox(ctx context.Context, path, content string) {
+	if r.codingSubdir == "" || r.executor == nil {
+		return
+	}
+	if _, ok := r.executor.(sandbox.RemoteWorkspace); !ok {
+		return
+	}
+	dest := "/workspace/" + strings.TrimPrefix(filepath.ToSlash(filepath.Clean(path)), "/")
+	if _, err := r.executor.WriteFile(ctx, dest, content); err != nil {
+		slog.Warn("coding preview mirror to sandbox failed", "path", dest, "err", err)
+	}
+}
+
 func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 	r.Register("read_file", "Read the contents of a file", map[string]interface{}{
 		"type": "object",
@@ -884,6 +918,11 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		if r.identityFileBlocked(args.Path) {
 			return IdentityFileRefusal, nil
 		}
+		// Skill-manifest gate — refuse before any routing so a chatter
+		// can't read a bundled `/skills/<name>/SKILL.md` off the mount.
+		if r.skillManifestBlocked(args.Path) {
+			return SkillManifestRefusal, nil
+		}
 		// Identity files (SOUL.md, IDENTITY.md, …) are routed by basename
 		// (lenient) instead of the strict isSingleSegmentSystemFile that
 		// routeFor uses. Need to be checked separately for reads so an
@@ -898,7 +937,7 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		}
 		switch r.routeFor(args.Path, OpRead) {
 		case RouteWorkspaceStore:
-			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.sessionID, args.Path)
+			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path))
 			if err == nil {
 				defer rc.Close()
 				data, readErr := io.ReadAll(rc)
@@ -988,13 +1027,14 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 			}
 			return fmt.Sprintf("Written %d bytes to %s", len(args.Content), name), nil
 		case RouteWorkspaceStore:
-			if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.sessionID, args.Path,
+			if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path),
 				strings.NewReader(args.Content), int64(len(args.Content)), ""); err != nil {
 				if friendly := asIsDirToolError("write_file", args.Path, err); friendly != nil {
 					return "", friendly
 				}
 				return "", fmt.Errorf("workspace put: %w", err)
 			}
+			r.mirrorCodingWriteToSandbox(ctx, args.Path, args.Content)
 			return fmt.Sprintf("Written %d bytes to %s", len(args.Content), args.Path), nil
 		case RouteSkillStore:
 			// Skill scaffolding (skill-creator's `skills/<name>/...`) lands
@@ -1041,7 +1081,7 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		}
 		switch r.routeFor(args.Path, OpList) {
 		case RouteWorkspaceStore:
-			objs, err := r.workspaceStore.List(ctx, r.agentID, r.projectID, r.sessionID)
+			objs, err := r.workspaceStore.List(ctx, r.agentID, r.projectID, r.scopeSessionID())
 			if err == nil {
 				prefix := strings.Trim(filepath.ToSlash(filepath.Clean(args.Path)), "/")
 				if prefix == "." {
@@ -1117,6 +1157,9 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 		if r.identityFileBlocked(args.Path) {
 			return IdentityFileRefusal, nil
 		}
+		if r.skillManifestBlocked(args.Path) {
+			return SkillManifestRefusal, nil
+		}
 
 		// editSandboxRMW is the read-modify-write fallback through the
 		// sandbox executor. Used when the store route misses or for any
@@ -1156,7 +1199,7 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 			}
 			return fmt.Sprintf("Edited %s (%d replacement(s))", name, count), nil
 		case RouteWorkspaceStore:
-			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.sessionID, args.Path)
+			rc, err := r.workspaceStore.Get(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path))
 			if err == nil {
 				data, readErr := io.ReadAll(rc)
 				rc.Close()
@@ -1168,13 +1211,14 @@ func registerSandboxedFile(r *Registry, ex sandbox.Executor) {
 					if err != nil {
 						return "", err
 					}
-					if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.sessionID, args.Path,
+					if err := r.workspaceStore.Put(ctx, r.agentID, r.projectID, r.scopeSessionID(), r.wsPath(args.Path),
 						strings.NewReader(updated), int64(len(updated)), ""); err != nil {
 						if friendly := asIsDirToolError("edit_file", args.Path, err); friendly != nil {
 							return "", friendly
 						}
 						return "", fmt.Errorf("workspace put: %w", err)
 					}
+					r.mirrorCodingWriteToSandbox(ctx, args.Path, updated)
 					return fmt.Sprintf("Edited %s (%d replacement(s))", args.Path, count), nil
 				}
 			}

@@ -68,11 +68,11 @@ type Feishu struct {
 
 	httpClient *http.Client
 
-	mu          sync.Mutex
-	accessTok   string
+	mu           sync.Mutex
+	accessTok    string
 	accessTokExp time.Time
-	botName     string // populated on Start via /bot/v3/info; best-effort
-	botOpenID   string
+	botName      string // populated on Start via /bot/v3/info; best-effort
+	botOpenID    string
 }
 
 // NewFeishu creates a Feishu adapter. verificationToken matches the value
@@ -135,19 +135,17 @@ func (l *Feishu) Send(chatID, text string) error {
 	return l.SendMessage(bus.OutboundMessage{ChatID: chatID, Text: text})
 }
 
-// SendMessage delivers Text + (optionally) MediaItems. Feishu's text
-// shape is `{"text":"..."}` JSON-stringified inside the `content`
-// field. MediaItems are deferred — sending images requires uploading
-// to Feishu's CDN first via /im/v1/images, which is a separate dance
-// we don't need until users complain.
+// SendMessage delivers Text + (optionally) MediaItems. Text is always sent
+// as a JSON 2.0 interactive card so Feishu can render standard Markdown
+// directly. Plain text is kept only as an error fallback when the card API
+// fails. MediaItems are deferred — sending images requires uploading to
+// Feishu's CDN first via /im/v1/images, which is a separate dance we don't
+// need until users complain.
 func (l *Feishu) SendMessage(msg bus.OutboundMessage) error {
 	if msg.Text == "" && len(msg.MediaItems) == 0 {
 		return nil
 	}
 	if msg.Text == "" {
-		// MediaItems-only without an upload path — skip rather than
-		// posting an empty bubble. Logged so it's debuggable if it
-		// ever happens in practice.
 		slog.Debug("feishu send: media-only message dropped (image upload not implemented)",
 			"account", l.accountID, "chat", msg.ChatID)
 		return nil
@@ -156,19 +154,64 @@ func (l *Feishu) SendMessage(msg bus.OutboundMessage) error {
 	if err != nil {
 		return fmt.Errorf("feishu token: %w", err)
 	}
-	// Feishu's `msg_type:"text"` path renders no markdown — GFM tables
-	// would arrive as literal `|cell|cell|` rows. Collapse them to
-	// label:value or middle-dot lines first.
-	text := FlattenMarkdownTables(msg.Text)
+	if err := l.sendMarkdownCard(tok, msg.ChatID, msg.Text); err != nil {
+		slog.Warn("feishu card send failed, falling back to plain text",
+			"account", l.accountID, "chat", msg.ChatID, "error", err)
+		return l.sendPlainTextMessage(tok, msg.ChatID, msg.Text)
+	}
+	return nil
+}
+
+// sendMarkdownCard sends a JSON 2.0 interactive card with one markdown body.
+func (l *Feishu) sendMarkdownCard(tok, chatID, text string) error {
+	cardJSON, err := buildFeishuMarkdownCardJSON(text)
+	if err != nil {
+		return err
+	}
+	payload := map[string]string{
+		"receive_id": chatID,
+		"content":    string(cardJSON),
+		"msg_type":   "interactive",
+	}
+	return l.doSend(tok, payload)
+}
+
+func buildFeishuMarkdownCardJSON(text string) ([]byte, error) {
+	card := map[string]any{
+		"schema": "2.0",
+		"body": map[string]any{
+			"elements": []map[string]any{
+				{
+					"tag":     "markdown",
+					"content": text,
+				},
+			},
+		},
+	}
+	cardJSON, err := json.Marshal(card)
+	if err != nil {
+		return nil, fmt.Errorf("feishu marshal card: %w", err)
+	}
+	return cardJSON, nil
+}
+
+// sendPlainTextMessage sends a plain text message. Used only as a fallback
+// if the card API fails.
+func (l *Feishu) sendPlainTextMessage(tok, chatID, text string) error {
 	contentJSON, err := json.Marshal(map[string]string{"text": text})
 	if err != nil {
 		return fmt.Errorf("feishu marshal content: %w", err)
 	}
 	payload := map[string]string{
-		"receive_id": msg.ChatID,
+		"receive_id": chatID,
 		"content":    string(contentJSON),
 		"msg_type":   "text",
 	}
+	return l.doSend(tok, payload)
+}
+
+// doSend posts a message payload to Feishu's send API.
+func (l *Feishu) doSend(tok string, payload map[string]string) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("feishu marshal: %w", err)
@@ -214,9 +257,9 @@ func (l *Feishu) SendTyping(_ string) error { return nil }
 // FeishuEventEnvelope is the v2 schema Feishu uses for event subscriptions.
 // We match on header.event_type == "im.message.receive_v1".
 type FeishuEventEnvelope struct {
-	Schema string         `json:"schema"`
+	Schema string            `json:"schema"`
 	Header FeishuEventHeader `json:"header"`
-	Event  json.RawMessage `json:"event"`
+	Event  json.RawMessage   `json:"event"`
 
 	// v1 url_verification challenge fields (also surfaced here for the
 	// initial subscribe-time handshake; Feishu's v2 events use
@@ -246,14 +289,18 @@ type feishuMessageEvent struct {
 		SenderType string `json:"sender_type"`
 	} `json:"sender"`
 	Message struct {
-		MessageID    string `json:"message_id"`
-		RootID       string `json:"root_id,omitempty"`
-		ParentID     string `json:"parent_id,omitempty"`
-		CreateTime   string `json:"create_time"`
-		ChatID       string `json:"chat_id"`
-		ChatType     string `json:"chat_type"` // "p2p" | "group"
-		MessageType  string `json:"message_type"`
-		Content      string `json:"content"`
+		MessageID   string `json:"message_id"`
+		RootID      string `json:"root_id,omitempty"`
+		ParentID    string `json:"parent_id,omitempty"`
+		CreateTime  string `json:"create_time"`
+		ChatID      string `json:"chat_id"`
+		ChatType    string `json:"chat_type"` // "p2p" | "group"
+		MessageType string `json:"message_type"`
+		Content     string `json:"content"`
+		Mentions    []struct {
+			Key  string `json:"key,omitempty"`
+			Name string `json:"name,omitempty"`
+		} `json:"mentions,omitempty"`
 	} `json:"message"`
 }
 
@@ -403,7 +450,8 @@ func (l *Feishu) dispatchInbound(ev feishuMessageEvent) {
 		"account", l.accountID,
 		"from", ev.Sender.SenderID.OpenID,
 		"chat", ev.Message.ChatID,
-		"len", len(content.Text))
+		"len", len(content.Text),
+		"mentions", feishuMentionNames(ev))
 
 	l.bus.Inbound <- bus.InboundMessage{
 		Channel:   "feishu",
@@ -413,7 +461,31 @@ func (l *Feishu) dispatchInbound(ev feishuMessageEvent) {
 		MessageID: msgID,
 		Text:      content.Text,
 		PeerKind:  peerKind,
+		Mentions:  feishuMentionNames(ev),
 	}
+}
+
+func feishuMentionNames(ev feishuMessageEvent) []string {
+	if len(ev.Message.Mentions) == 0 {
+		return nil
+	}
+	mentions := make([]string, 0, len(ev.Message.Mentions))
+	seen := make(map[string]struct{}, len(ev.Message.Mentions))
+	for _, m := range ev.Message.Mentions {
+		name := m.Name
+		if name == "" {
+			name = m.Key
+		}
+		if name == "" {
+			continue
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		mentions = append(mentions, name)
+	}
+	return mentions
 }
 
 // --- HTTP plumbing ---

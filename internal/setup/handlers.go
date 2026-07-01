@@ -52,6 +52,9 @@ func (s *Server) loadUserConfig(r *http.Request) (*config.Config, error) {
 			return nil, err
 		}
 	}
+	if err := scope.SettingInto(r.Context(), s.dataStore, scope.PrefsNamespace, uid, "", &cfg.Prefs); err != nil {
+		return nil, err
+	}
 	if provs, err := scope.Providers(r.Context(), s.dataStore, uid, ""); err == nil {
 		for k, v := range provs {
 			cfg.Providers[k] = v
@@ -197,7 +200,7 @@ var settingNamespaces = []settingNamespace{
 		dst:     func(c *config.Config) interface{} { return &c.Teams },
 		collect: func(c *config.Config) map[string]interface{} { return wrapKeyed(c.Teams) }},
 	{namespace: "bindings",
-		dst:     func(c *config.Config) interface{} { return &c.Bindings },
+		dst: func(c *config.Config) interface{} { return &c.Bindings },
 		collect: func(c *config.Config) map[string]interface{} {
 			if len(c.Bindings) == 0 {
 				return nil
@@ -506,6 +509,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	if s.dataStore != nil {
 		_ = scope.SettingInto(r.Context(), s.dataStore, "agents.defaults", "", "", &sysDefaults)
 	}
+	serverTimezone := time.Local.String()
 	// Marshal-then-extend keeps the response shape compatible (existing
 	// callers ignore the extra `meta` key) without forcing a refactor of
 	// config.Config to carry presentation metadata.
@@ -514,6 +518,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(blob, &out)
 	out["meta"] = map[string]any{
 		"systemDefaultModel": sysDefaults.Model,
+		"serverTimezone":     serverTimezone,
 	}
 	jsonResponse(w, http.StatusOK, out)
 }
@@ -533,6 +538,23 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
+	}
+	var raw struct {
+		Prefs   *config.PrefsCfg `json:"prefs"`
+		Sandbox *json.RawMessage `json:"sandbox"`
+		Skills  *struct {
+			AgentEntries map[string]map[string]config.SkillEntryCfg `json:"agentEntries"`
+		} `json:"skills"`
+	}
+	_ = json.Unmarshal(buf, &raw)
+	if raw.Prefs != nil {
+		raw.Prefs.Timezone = strings.TrimSpace(raw.Prefs.Timezone)
+		if raw.Prefs.Timezone != "" {
+			if _, err := time.LoadLocation(raw.Prefs.Timezone); err != nil {
+				jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid timezone: use an IANA name like Asia/Shanghai"})
+				return
+			}
+		}
 	}
 	merged, err := s.loadUserConfig(r)
 	if err != nil {
@@ -556,12 +578,18 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// name=skills.entries). Pull from the raw body — not from the
 	// merged Config — so we only touch agents the caller actually
 	// patched, and don't echo every existing override back as a write.
-	var raw struct {
-		Skills *struct {
-			AgentEntries map[string]map[string]config.SkillEntryCfg `json:"agentEntries"`
-		} `json:"skills"`
+	if raw.Prefs != nil {
+		sc, scopeID := s.scopeForSave(r)
+		uid, aid := scope.OwnershipFromScope(sc, scopeID)
+		data := map[string]interface{}{}
+		if raw.Prefs.Timezone != "" {
+			data["timezone"] = raw.Prefs.Timezone
+		}
+		if err := scope.SaveSetting(r.Context(), s.dataStore, uid, aid, scope.PrefsNamespace, data); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
 	}
-	_ = json.Unmarshal(buf, &raw)
 	if raw.Skills != nil && raw.Skills.AgentEntries != nil {
 		for agentID, entries := range raw.Skills.AgentEntries {
 			rec, err := s.dataStore.GetAgent(r.Context(), agentID)
@@ -583,8 +611,25 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// agent loaded before the change keeps seeing the stale model and
 	// surfaces "no usable LLM provider" in chat.
 	sc, scopeID := s.scopeForSave(r)
+	if sc == scope.System && raw.Sandbox != nil {
+		if err := s.reloadSystemSandbox(); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+	}
 	s.invalidateScope(sc, scopeID)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) reloadSystemSandbox() error {
+	type sandboxReloader interface{ ReloadSandbox() error }
+	if s.userResolver == nil {
+		return nil
+	}
+	if r, ok := s.userResolver.(sandboxReloader); ok {
+		return r.ReloadSandbox()
+	}
+	return nil
 }
 
 // scopeForSave mirrors the scope-resolution logic in saveUserConfig so
@@ -810,15 +855,15 @@ func (s *Server) handleListTasks(w http.ResponseWriter, r *http.Request) {
 // --- chat handlers (delegate to per-user agent) ---
 
 type chatRequest struct {
-	AgentID   string         `json:"agentId,omitempty"`
-	SessionID string         `json:"sessionId"`
+	AgentID   string `json:"agentId,omitempty"`
+	SessionID string `json:"sessionId"`
 	// ProjectID, when non-empty AND the session row doesn't yet exist,
 	// is the "this chat belongs to project X" hint the URL carries
 	// (`?project=<pid>`) before the first message. Once the row exists
 	// it's authoritative — the server reads project_id from the row
 	// and ignores any later hint.
-	ProjectID string         `json:"projectId,omitempty"`
-	Message   string         `json:"message"`
+	ProjectID string `json:"projectId,omitempty"`
+	Message   string `json:"message"`
 	// Images carries data URLs / HTTPS URLs for image attachments. The
 	// web client historically sends them under `imageUrls` (camelCase)
 	// while the API path uses `images`; we accept both and merge below
@@ -1073,6 +1118,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	defer keepalive.Stop()
 
 	clientGone := r.Context().Done()
+	forwardedAny := false
 	// turnPending flips on when the slash handler reports it queued a
 	// continuation via bus.Inbound (`turn_pending` event). The POST
 	// goroutine's HandleMessage has already returned, but the real
@@ -1109,9 +1155,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 						continue
 					}
 					if env.Event.Type == "done" {
+						forwardEvent(w, flusher, env)
+						forwardedAny = true
 						return
 					}
 					forwardEvent(w, flusher, env)
+					forwardedAny = true
 				default:
 					break drain
 				}
@@ -1123,6 +1172,12 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				// (15-min timeout) is the upper bound if it never lands.
 				agentDone = nil
 				continue
+			}
+			if !forwardedAny {
+				forwardSyntheticEvent(w, flusher, agent.ChatEvent{
+					Type: "error",
+					Data: map[string]any{"message": "agent finished without emitting a response"},
+				})
 			}
 			return
 		case <-agentCtx.Done():
@@ -1142,6 +1197,7 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			forwardEvent(w, flusher, env)
+			forwardedAny = true
 			if env.Event.Type == "done" {
 				return
 			}
@@ -1170,24 +1226,28 @@ func forwardEvent(w http.ResponseWriter, flusher http.Flusher, env agent.EventEn
 	flusher.Flush()
 }
 
+func forwardSyntheticEvent(w http.ResponseWriter, flusher http.Flusher, evt agent.ChatEvent) {
+	forwardEvent(w, flusher, agent.EventEnvelope{Seq: -1, Event: evt})
+}
+
 // handleChatSubscribe holds an SSE connection open for one (agent,
 // session) pair and forwards three kinds of traffic:
 //
-//   1. Replay: session_events rows with seq > since (or > Last-Event-ID)
-//      that the client missed before connecting. Lets a freshly
-//      reloaded page pick up an in-flight turn without the rest of the
-//      reply disappearing.
+//  1. Replay: session_events rows with seq > since (or > Last-Event-ID)
+//     that the client missed before connecting. Lets a freshly
+//     reloaded page pick up an in-flight turn without the rest of the
+//     reply disappearing.
 //
-//   2. Live agent chat events from the hub — every emitEvent call from
-//      the agent loop fans through here. This covers both the
-//      synchronous POST /api/chat/stream path AND turns started by
-//      other tabs / cron firings, so any open chat panel sees them
-//      regardless of who triggered the work.
+//  2. Live agent chat events from the hub — every emitEvent call from
+//     the agent loop fans through here. This covers both the
+//     synchronous POST /api/chat/stream path AND turns started by
+//     other tabs / cron firings, so any open chat panel sees them
+//     regardless of who triggered the work.
 //
-//   3. Legacy WebChannel bus messages — cron-fired final replies that
-//      route through bus.Outbound rather than the chat-event path.
-//      Kept so we don't lose pre-existing functionality during the
-//      transition.
+//  3. Legacy WebChannel bus messages — cron-fired final replies that
+//     route through bus.Outbound rather than the chat-event path.
+//     Kept so we don't lose pre-existing functionality during the
+//     transition.
 //
 // Auth gating reuses resolveAgent, so the caller must already have
 // permission to chat with this agent. The subscription doesn't
@@ -1431,9 +1491,9 @@ func (s *Server) readWorkspaceFileBytes(ctx context.Context, agentID, relPath st
 // parseTodoMarkdown extracts checkbox lines from a todo.md body and
 // returns them as structured items. Conventions:
 //
-//	- [ ] text   → pending
-//	- [x] text   → completed
-//	- [X] text   → completed (case-insensitive)
+//   - [ ] text   → pending
+//   - [x] text   → completed
+//   - [X] text   → completed (case-insensitive)
 //
 // Anything else (heading lines, blank lines, non-checkbox bullets) is
 // ignored — todo.md doubles as a human-readable plan document, so we
@@ -1513,6 +1573,146 @@ func (s *Server) handleChatSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{"sessions": ag.WebChatSessions()})
+}
+
+// handleChats returns chat sessions scoped by the caller's API key type:
+//   - admin key: all sessions across all users and agents
+//   - user key:  all sessions for agents owned by the key's user
+//   - agent key: all sessions for agents in the key's ACL
+//
+// Session-based callers (browser) get the same scoping as user keys.
+func (s *Server) handleChats(w http.ResponseWriter, r *http.Request) {
+	if s.dataStore == nil {
+		jsonResponse(w, http.StatusServiceUnavailable, map[string]any{"error": "no data store"})
+		return
+	}
+	ident, ok := auth.FromContext(r.Context())
+	if !ok {
+		jsonResponse(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+		return
+	}
+
+	// Pagination: ?page=1&pageSize=30 (1-based, defaults to page 1, 30 per page).
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	if page < 1 {
+		page = 1
+	}
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("pageSize"))
+	if pageSize < 1 || pageSize > 100 {
+		pageSize = 30
+	}
+
+	// Resolve which agent IDs the caller may see.
+	var agentIDs []string // nil = all (admin)
+	switch {
+	case ident.AuthMethod == "apikey" && ident.APIKeyType == users.APIKeyTypeAdmin:
+		agentIDs = nil // admin sees everything
+	case ident.AuthMethod == "apikey" && ident.APIKeyType == users.APIKeyTypeAgent:
+		agentIDs = ident.APIKeyAgents
+	default:
+		uid := ident.EffectiveUserID()
+		agents, agentsErr := s.dataStore.ListAgents(r.Context(), uid)
+		if agentsErr != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": agentsErr.Error()})
+			return
+		}
+		agentIDs = make([]string, len(agents))
+		for i, a := range agents {
+			agentIDs[i] = a.ID
+		}
+	}
+
+	offset := (page - 1) * pageSize
+	metas, total, err := s.dataStore.ListSessionsPaginated(r.Context(), agentIDs, offset, pageSize)
+	if err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+
+	ownerCache := map[string]*users.Account{}
+	resolveOwner := func(uid string) *users.Account {
+		if uid == "" {
+			return nil
+		}
+		if a, ok := ownerCache[uid]; ok {
+			return a
+		}
+		a, _ := s.accounts.Get(r.Context(), uid)
+		ownerCache[uid] = a
+		return a
+	}
+	agentCache := map[string]*store.AgentRecord{}
+	resolveAgentRec := func(agentID string) *store.AgentRecord {
+		if agentID == "" {
+			return nil
+		}
+		if a, ok := agentCache[agentID]; ok {
+			return a
+		}
+		a, _ := s.dataStore.GetAgent(r.Context(), agentID)
+		agentCache[agentID] = a
+		return a
+	}
+
+	out := make([]map[string]any, 0, len(metas))
+	for _, m := range metas {
+		ag := resolveAgentRec(m.AgentID)
+		if ag == nil {
+			continue
+		}
+		// Build preview from first user message.
+		adapter := session.NewStoreAdapter(s.dataStore, m.UserID)
+		ws := adapter.BuildWebSession(r.Context(), m)
+		if ws == nil {
+			continue
+		}
+		owner := resolveOwner(m.UserID)
+		entry := map[string]any{
+			"id":           ws.ID,
+			"agentId":      m.AgentID,
+			"agentName":    ag.Name,
+			"userId":       m.UserID,
+			"channel":      ws.Channel,
+			"accountId":    ws.AccountID,
+			"chatId":       ws.ChatID,
+			"projectId":    ws.ProjectID,
+			"title":        ws.Title,
+			"preview":      ws.Preview,
+			"thumbnailUrl": ws.ThumbnailURL,
+			"createdAt":    ws.CreatedAt,
+			"updatedAt":    ws.UpdatedAt,
+		}
+		if ws.ChatterUserID != "" {
+			entry["chatterUserId"] = ws.ChatterUserID
+			if chatter := resolveOwner(ws.ChatterUserID); chatter != nil {
+				if chatter.ExternalID != "" {
+					entry["chatterExternalId"] = chatter.ExternalID
+				}
+				if chatter.DisplayName != "" {
+					entry["chatterDisplayName"] = chatter.DisplayName
+				}
+			}
+		}
+		if owner != nil {
+			entry["ownerUsername"] = owner.Username
+			entry["ownerEmail"] = owner.Email
+			if owner.ExternalID != "" {
+				entry["ownerExternalId"] = owner.ExternalID
+			}
+			if owner.DisplayName != "" {
+				entry["ownerDisplayName"] = owner.DisplayName
+			}
+		}
+		out = append(out, entry)
+	}
+	totalPages := (total + pageSize - 1) / pageSize
+	jsonResponse(w, http.StatusOK, map[string]any{
+		"sessions":   out,
+		"page":       page,
+		"pageSize":   pageSize,
+		"total":      total,
+		"totalPages": totalPages,
+	})
 }
 
 func (s *Server) handleRenameSession(w http.ResponseWriter, r *http.Request) {

@@ -26,9 +26,10 @@ func chatKey(channel, accountID, chatID string) string {
 
 // processInbound consumes the message bus and routes each message to the
 // correct user's agent. Identity resolution order:
-//   1. msg.OwnerUserID set explicitly (cron, webhook with user_id)
-//   2. lookup the receiving channel's row in the channels table — its
-//      (scope, scope_id) tells us which user owns this conversation
+//  1. msg.OwnerUserID set explicitly (cron, webhook with user_id)
+//  2. lookup the receiving channel's row in the channels table — its
+//     (scope, scope_id) tells us which user owns this conversation
+//
 // If neither yields a user_id the message is dropped, never silently
 // routed to a default identity.
 func (g *Gateway) processInbound(ctx context.Context) {
@@ -36,10 +37,13 @@ func (g *Gateway) processInbound(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case msg := <-g.bus.Inbound:
+		case msg := <-g.bus.InboundConsumer():
 			ownerID := msg.OwnerUserID
+			var sharedIdentity bool
 			if ownerID == "" {
-				ownerID = g.resolveChannelOwner(ctx, msg)
+				info := g.resolveChannelOwner(ctx, msg)
+				ownerID = info.ownerID
+				sharedIdentity = info.sharedIdentity
 			}
 			if ownerID == "" {
 				slog.Warn("dropping inbound: cannot resolve owner",
@@ -61,14 +65,20 @@ func (g *Gateway) processInbound(ctx context.Context) {
 				continue
 			}
 
-			// Normalize msg.UserID into a fastclaw `u_xxx` id. IM channels
-			// (wechat, telegram, line, discord, feishu, slack) emit the raw
-			// platform-side identifier, which doesn't match the key that
-			// per-chatter data (USER.md, MEMORY.md, per-user skills) is
-			// stored under — so without translation the agent ends up with
-			// an empty chatter profile every turn. See resolveChatter for
-			// the lazy-mint semantics.
-			if chatterID := g.resolveChatter(ctx, ownerID, msg); chatterID != "" {
+			// When shared_identity is enabled on the channel, the owner
+			// wants all their personal channels to share the same session
+			// and memory. Skip per-platform chatter creation and use the
+			// owner's user_id directly so session/memory resolution lands
+			// on the same identity regardless of which channel the message
+			// arrived from.
+			if sharedIdentity {
+				msg.UserID = ownerID
+				msg.SharedIdentity = true
+			} else if chatterID := g.resolveChatter(ctx, ownerID, msg); chatterID != "" {
+				// Normalize msg.UserID into a fastclaw `u_xxx` id. IM
+				// channels emit the raw platform-side identifier; without
+				// translation the agent ends up with an empty chatter
+				// profile every turn.
 				msg.UserID = chatterID
 			}
 
@@ -84,27 +94,52 @@ func (g *Gateway) processInbound(ctx context.Context) {
 	}
 }
 
+// channelOwnerInfo carries the resolved channel owner and channel-level
+// flags back to processInbound so it can adjust chatter resolution.
+type channelOwnerInfo struct {
+	ownerID        string
+	sharedIdentity bool
+}
+
 // resolveChannelOwner looks up the channels table for the inbound's
-// receiving channel and returns the owning user_id, or "" if not found
-// or scope==system (system channels have no individual owner).
-func (g *Gateway) resolveChannelOwner(ctx context.Context, msg bus.InboundMessage) string {
+// receiving channel and returns the owning user_id (+ flags), or empty
+// ownerID if not found or scope==system (system channels have no
+// individual owner).
+func (g *Gateway) resolveChannelOwner(ctx context.Context, msg bus.InboundMessage) channelOwnerInfo {
 	if g.store == nil {
-		return ""
+		return channelOwnerInfo{}
 	}
+	// Try the new channels table first.
+	if ch, err := g.store.LookupChannel(ctx, msg.Channel, msg.AccountID); err == nil && ch != nil {
+		info := channelOwnerInfo{sharedIdentity: ch.SharedIdentity}
+		if ch.UserID != "" {
+			info.ownerID = ch.UserID
+			return info
+		}
+		if ch.AgentID != "" {
+			all, err := g.store.ListAllAgents(ctx)
+			if err != nil {
+				return channelOwnerInfo{}
+			}
+			for _, ar := range all {
+				if ar.ID == ch.AgentID {
+					info.ownerID = ar.UserID
+					return info
+				}
+			}
+		}
+		return channelOwnerInfo{}
+	}
+	// Fallback: legacy configs table lookup.
 	rec, err := g.store.LookupChannelByCredential(ctx, msg.Channel, msg.AccountID)
 	if err != nil {
 		if !errors.Is(err, store.ErrNotFound) {
 			slog.Warn("channel lookup failed", "channel", msg.Channel, "error", err)
 		}
-		return ""
+		return channelOwnerInfo{}
 	}
-	// channel rows now carry user_id directly — the binder, not the
-	// agent owner indirection. The previous "scope=agent → look up
-	// agent.user_id" branch is gone because every channel row written
-	// by handleConnect* persists the resolved user_id (owner or
-	// non-owner) at insert time.
 	if rec.UserID != "" {
-		return rec.UserID
+		return channelOwnerInfo{ownerID: rec.UserID}
 	}
 	// System-level rows (user_id='') still happen in dev installs that
 	// pre-seed a global bot. Fall back to the agent owner via agent_id
@@ -112,15 +147,15 @@ func (g *Gateway) resolveChannelOwner(ctx context.Context, msg bus.InboundMessag
 	if rec.AgentID != "" {
 		all, err := g.store.ListAllAgents(ctx)
 		if err != nil {
-			return ""
+			return channelOwnerInfo{}
 		}
 		for _, ar := range all {
 			if ar.ID == rec.AgentID {
-				return ar.UserID
+				return channelOwnerInfo{ownerID: ar.UserID}
 			}
 		}
 	}
-	return ""
+	return channelOwnerInfo{}
 }
 
 // resolveChatter normalizes msg.UserID into a fastclaw `u_xxx` id. IM
@@ -135,16 +170,11 @@ func (g *Gateway) resolveChannelOwner(ctx context.Context, msg bus.InboundMessag
 //   - empty UserID → "" (caller leaves the slot empty; chatterUserID will
 //     fall back to the agent owner).
 //   - already `u_`-prefixed → assume it's already canonical, leave alone.
-//   - channel owner is an app_user (has apikey_id) → lazy-mint an
-//     app_user keyed by (apikey_id, "<channel>:<msg.UserID>") so every
-//     distinct IM sender gets a stable u_xxx of their own. Channel name
-//     is prefixed so a numeric id colliding across two channel types
-//     (telegram chat 123, line user 123) can't merge into one row.
-//   - channel owner is a regular user (no apikey_id) → treat as a single-
-//     user dogfood/personal bot and pin the chatter to the owner. This
-//     preserves the simple "I registered my own wechat to my own agent"
-//     flow without forcing the owner to start over with a fresh empty
-//     USER.md every conversation.
+//   - lazy-mint an app_user keyed by the owner namespace plus
+//     "<channel>:<accountID>:<msg.UserID>" so every distinct IM sender gets
+//     a stable u_xxx of their own. Channel and account are prefixed so the
+//     same numeric id on two platforms or two bots cannot merge into one
+//     USER.md / MEMORY.md row.
 //
 // Returns "" when the original msg.UserID should be kept unchanged
 // (empty input, already canonical, or any error path) — the caller treats
@@ -159,25 +189,63 @@ func (g *Gateway) resolveChatter(ctx context.Context, ownerID string, msg bus.In
 	if g.store == nil || g.accounts == nil {
 		return ""
 	}
-	owner, err := g.store.GetUser(ctx, ownerID)
-	if err != nil {
-		slog.Warn("resolveChatter: owner lookup failed",
-			"owner", ownerID, "channel", msg.Channel, "error", err)
-		return ""
-	}
-	if owner.APIKeyID == "" {
-		// Personal / dogfood install — every IM sender is treated as the
-		// channel owner so the operator's own USER.md applies.
-		return ownerID
-	}
+	// extID uses channel + platform user ID only — no accountID.
+	// This keeps the chatter's identity stable across bot reconnections
+	// (where accountID changes) and across multiple agents owned by the
+	// same user (where each agent has a different bot / accountID).
 	extID := msg.Channel + ":" + msg.UserID
-	acc, err := g.accounts.EnsureAppUser(ctx, owner.APIKeyID, extID, "")
+
+	// Look up by owner_user_id + extID (new format).
+	if acc, err := g.store.GetUserByExternal(ctx, ownerID, extID); err == nil {
+		return acc.ID
+	}
+	// Fall back: owner_user_id + legacy extID (channel:accountID:userID)
+	// for chatters created before the accountID-free format.
+	if acc, err := g.store.GetUserByExternalSuffix(ctx, ownerID, msg.Channel+":", ":"+msg.UserID); err == nil {
+		return acc.ID
+	}
+	// Fall back: legacy rows where owner_user_id was stored as
+	// "owner:xxx" in the old apikey_id column (pre-migration). The
+	// migration backfills owner_user_id, but in case it hasn't run
+	// yet or the row was created by an older binary, check the old
+	// namespace format too.
+	legacyNS := "owner:" + ownerID
+	if acc, err := g.store.GetUserByExternalSuffix(ctx, legacyNS, msg.Channel+":", ":"+msg.UserID); err == nil {
+		return acc.ID
+	}
+	// Also check platform-scoped namespace (apikey owner ID) used
+	// before the per-tenant fix.
+	if owner, err := g.store.GetUser(ctx, ownerID); err == nil && owner.APIKeyID != "" {
+		if acc, err := g.store.GetUserByExternalSuffix(ctx, owner.APIKeyID, msg.Channel+":", ":"+msg.UserID); err == nil {
+			return acc.ID
+		}
+	}
+	// Ancestor fallback: when the channel is bound by an app_user but
+	// the chatter was historically created under the app_user's parent
+	// (web user) or another app_user, walk up the ownership chain and
+	// retry. On hit, migrate the chatter's owner_user_id to the current
+	// ownerID so subsequent lookups are fast and don't repeat this walk.
+	if owner, err := g.store.GetUser(ctx, ownerID); err == nil && owner.OwnerUserID != "" {
+		// ownerID is an app_user — try its parent (web user).
+		if acc, err := g.store.GetUserByExternal(ctx, owner.OwnerUserID, extID); err == nil {
+			acc.OwnerUserID = ownerID
+			_ = g.store.UpdateUser(ctx, acc)
+			return acc.ID
+		}
+		if acc, err := g.store.GetUserByExternalSuffix(ctx, owner.OwnerUserID, msg.Channel+":", ":"+msg.UserID); err == nil {
+			acc.OwnerUserID = ownerID
+			_ = g.store.UpdateUser(ctx, acc)
+			return acc.ID
+		}
+	}
+	// Neither found — brand new chatter.
+	chatter, err := g.accounts.EnsureChatter(ctx, ownerID, extID, msg.SenderName)
 	if err != nil {
-		slog.Warn("resolveChatter: EnsureAppUser failed",
-			"apikey", owner.APIKeyID, "ext", extID, "error", err)
+		slog.Warn("resolveChatter: EnsureChatter failed",
+			"owner", ownerID, "ext", extID, "error", err)
 		return ""
 	}
-	return acc.ID
+	return chatter.ID
 }
 
 // trySteer diverts msg into target's currently in-flight turn instead of
