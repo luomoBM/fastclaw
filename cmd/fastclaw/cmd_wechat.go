@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -13,7 +12,6 @@ import (
 
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
-	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 )
 
@@ -197,72 +195,48 @@ func collectWeChatSendTargets(ctx context.Context, st store.Store, agentRef stri
 		selectedAgentID = ag.ID
 	}
 
-	rows, err := st.QueryAllConfigs(ctx, store.KindChannel)
+	chs, err := st.ListAllChannels(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var out []wechatSendTarget
-	for _, rec := range rows {
-		if rec.Name != "wechat" || !rec.Enabled {
+	for _, ch := range chs {
+		if ch.Type != "wechat" || !ch.Enabled {
 			continue
 		}
-		if selectedAgentID != "" && rec.AgentID != selectedAgentID {
+		if selectedAgentID != "" && ch.AgentID != selectedAgentID {
 			continue
 		}
-		ag, ok := agentsByID[rec.AgentID]
+		ag, ok := agentsByID[ch.AgentID]
 		if !ok {
 			continue
 		}
-		cc, err := channelConfigFromRecord(rec)
-		if err != nil {
-			return nil, fmt.Errorf("decode WeChat channel %s: %w", rec.ID, err)
+		// v0.47.0 migrated WeChat bindings out of the legacy configs table
+		// into the dedicated channels table (one row per type+account), so
+		// read the credential fields straight off the ChannelRecord instead
+		// of decoding the old accounts-map blob.
+		if ch.AccountID == "" || ch.BotToken == "" {
+			continue
 		}
-		for accountID, acct := range cc.Accounts {
-			token := acct.BotToken
-			if token == "" {
-				token = cc.BotToken
-			}
-			if accountID == "" || token == "" {
-				continue
-			}
-			userID := rec.UserID
-			if userID == "" {
-				userID = ag.UserID
-			}
-			out = append(out, wechatSendTarget{
-				Agent:     ag,
-				UserID:    userID,
-				AccountID: accountID,
-				BotToken:  token,
-				BaseURL:   acct.BaseURL,
-				ILinkUser: acct.UserID,
-				UpdatedAt: rec.UpdatedAt,
-			})
+		userID := ch.UserID
+		if userID == "" {
+			userID = ag.UserID
 		}
+		out = append(out, wechatSendTarget{
+			Agent:     ag,
+			UserID:    userID,
+			AccountID: ch.AccountID,
+			BotToken:  ch.BotToken,
+			BaseURL:   ch.BaseURL,
+			ILinkUser: ch.PlatformUserID,
+			UpdatedAt: ch.UpdatedAt,
+		})
 	}
 
 	if agentRef == "" {
 		out = preferDefaultAgentIfUseful(out)
 	}
 	return out, nil
-}
-
-func channelConfigFromRecord(rec store.ConfigRecord) (config.ChannelConfig, error) {
-	cc := config.ChannelConfig{Enabled: rec.Enabled}
-	if rec.Data == nil {
-		return cc, nil
-	}
-	blob, err := json.Marshal(rec.Data)
-	if err != nil {
-		return cc, err
-	}
-	if len(blob) > 0 {
-		if err := json.Unmarshal(blob, &cc); err != nil {
-			return cc, err
-		}
-	}
-	cc.Enabled = rec.Enabled
-	return cc, nil
 }
 
 func preferDefaultAgentIfUseful(targets []wechatSendTarget) []wechatSendTarget {
