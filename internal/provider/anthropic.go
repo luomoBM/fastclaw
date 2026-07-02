@@ -112,6 +112,10 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 			m.Thinking == "" {
 			continue
 		}
+		if m.Role == "assistant" && m.Content == "" && len(m.ContentParts) == 0 &&
+			len(m.ToolCalls) == 0 && m.Thinking == "" {
+			continue
+		}
 
 		am := anthropicMessage{Role: m.Role}
 
@@ -147,7 +151,7 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 			}
 			am.Role = "user"
 			am.Content, _ = json.Marshal([]interface{}{block})
-			out = append(out, am)
+			out = appendAnthropicMessage(out, am)
 			continue
 		}
 
@@ -183,7 +187,7 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 				})
 			}
 			am.Content, _ = json.Marshal(blocks)
-			out = append(out, am)
+			out = appendAnthropicMessage(out, am)
 			continue
 		}
 
@@ -240,19 +244,135 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 			am.Content, _ = json.Marshal("")
 		}
 
-		if len(am.Content) == 0 {
-			// Some Anthropic-compatible providers (notably z.ai) reject
-			// `content: null` even though a degenerate empty assistant
-			// message can appear in historical sessions after an aborted
-			// or empty streamed turn. The schema accepts a string, so
-			// serialize the empty content explicitly instead of letting
-			// json.RawMessage's nil value become null.
-			am.Content, _ = json.Marshal("")
+		if len(am.Content) == 0 && m.Role == "assistant" {
+			// Empty assistant history rows carry no replayable signal and
+			// Anthropic-compatible endpoints reject them as `content: null`.
+			continue
 		}
-		out = append(out, am)
+		out = appendAnthropicMessage(out, am)
 	}
 
 	return system, out
+}
+
+func appendAnthropicMessage(out []anthropicMessage, msg anthropicMessage) []anthropicMessage {
+	if len(out) == 0 {
+		return append(out, msg)
+	}
+	last := &out[len(out)-1]
+	if last.Role != msg.Role {
+		return append(out, msg)
+	}
+	// Tool-use blocks carry Anthropic's strict adjacency contract, and
+	// a new tool_result block should stay in the exact tool-run batch
+	// constructed above. A prior tool_result message, however, can
+	// safely absorb a following plain user message: this is how we
+	// normalize sessions where the model failed after tools completed
+	// and the next WeChat message arrived with no assistant row in
+	// between.
+	if anthropicContentHasBlockType(last.Content, "tool_use") ||
+		anthropicContentHasBlockType(msg.Content, "tool_use", "tool_result") {
+		return append(out, msg)
+	}
+	merged, ok := mergeAnthropicContent(last.Content, msg.Content)
+	if !ok {
+		return append(out, msg)
+	}
+	last.Content = merged
+	return out
+}
+
+func mergeAnthropicContent(left, right json.RawMessage) (json.RawMessage, bool) {
+	leftBlocks, ok := anthropicContentBlocks(left)
+	if !ok {
+		return nil, false
+	}
+	rightBlocks, ok := anthropicContentBlocks(right)
+	if !ok {
+		return nil, false
+	}
+	blocks := mergeAdjacentTextBlocks(append(leftBlocks, rightBlocks...))
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	raw, err := json.Marshal(blocks)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
+func anthropicContentBlocks(raw json.RawMessage) ([]interface{}, bool) {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if text == "" {
+			return nil, false
+		}
+		return []interface{}{map[string]interface{}{
+			"type": "text",
+			"text": text,
+		}}, true
+	}
+	var blocks []interface{}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, false
+	}
+	if len(blocks) == 0 {
+		return nil, false
+	}
+	return blocks, true
+}
+
+func mergeAdjacentTextBlocks(blocks []interface{}) []interface{} {
+	var out []interface{}
+	for _, block := range blocks {
+		mp, ok := block.(map[string]interface{})
+		if !ok || mp["type"] != "text" {
+			out = append(out, block)
+			continue
+		}
+		text, _ := mp["text"].(string)
+		if text == "" {
+			continue
+		}
+		if len(out) > 0 {
+			if prev, ok := out[len(out)-1].(map[string]interface{}); ok && prev["type"] == "text" {
+				if prevText, _ := prev["text"].(string); prevText != "" {
+					prev["text"] = prevText + "\n\n" + text
+				} else {
+					prev["text"] = text
+				}
+				continue
+			}
+		}
+		out = append(out, map[string]interface{}{
+			"type": "text",
+			"text": text,
+		})
+	}
+	return out
+}
+
+func anthropicContentHasBlockType(raw json.RawMessage, types ...string) bool {
+	want := map[string]bool{}
+	for _, typ := range types {
+		want[typ] = true
+	}
+	var blocks []interface{}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return false
+	}
+	for _, block := range blocks {
+		mp, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typ, _ := mp["type"].(string)
+		if want[typ] {
+			return true
+		}
+	}
+	return false
 }
 
 // parseToolInput decodes a stored tool_use Arguments string into the

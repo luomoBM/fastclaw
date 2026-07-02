@@ -114,6 +114,7 @@ func main() {
 	rootCmd.AddCommand(apikeyCmd())
 	rootCmd.AddCommand(agentsCmd())
 	rootCmd.AddCommand(sessionCmd())
+	rootCmd.AddCommand(wechatCmd())
 	rootCmd.AddCommand(cronCmd())
 	rootCmd.AddCommand(channelsCmd())
 	rootCmd.AddCommand(toolsCmd())

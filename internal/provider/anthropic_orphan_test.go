@@ -136,10 +136,11 @@ func TestToAnthropicMessagesOrphanAssistantRawOnly(t *testing.T) {
 
 	_, out := toAnthropicMessages(msgs)
 
-	// The orphan-only assistant must be dropped. Remaining wire
-	// messages: user "go", user "好了吗".
-	if len(out) != 2 {
-		t.Fatalf("expected 2 messages, got %d: %+v", len(out), out)
+	// The orphan-only assistant must be dropped. The two adjacent user
+	// turns are then folded into one legal Anthropic turn so an old
+	// failed WeChat request doesn't poison every later request.
+	if len(out) != 1 {
+		t.Fatalf("expected 1 merged user message, got %d: %+v", len(out), out)
 	}
 	for _, am := range out {
 		if am.Role != "user" {
@@ -151,30 +152,138 @@ func TestToAnthropicMessagesOrphanAssistantRawOnly(t *testing.T) {
 			t.Errorf("message has null/empty content (would 400): %+v", am)
 		}
 	}
+	if got := allText(out); !strings.Contains(got, "go") || !strings.Contains(got, "好了吗") {
+		t.Errorf("merged user content missing expected text: %q", got)
+	}
 }
 
-func TestToAnthropicMessagesEmptyAssistantDoesNotEmitNullContent(t *testing.T) {
+// TestToAnthropicMessagesDropsEmptyAssistantHistory covers legacy WeChat
+// sessions that persisted an assistant row with no Content/ContentParts/
+// ToolCalls/Thinking but a non-empty RawAssistant. Before the guard,
+// toAnthropicMessages emitted a wire assistant message whose Content was nil,
+// marshaling as `content: null` and causing GLM/Anthropic-compatible gateways
+// to return 422 "messages.N.content: Input should be a valid string/list".
+func TestToAnthropicMessagesDropsEmptyAssistantHistory(t *testing.T) {
 	msgs := []Message{
-		{Role: "user", Content: "hello"},
-		{Role: "assistant"},
-		{Role: "user", Content: "are you there?"},
+		{Role: "user", Content: "first"},
+		{
+			Role:         "assistant",
+			RawAssistant: json.RawMessage(`{"role":"assistant","content":null}`),
+		},
+		{Role: "user", Content: "again"},
+	}
+
+	_, out := toAnthropicMessages(msgs)
+
+	if len(out) != 1 {
+		t.Fatalf("expected empty assistant history to be dropped and users merged, got %d messages: %+v", len(out), out)
+	}
+	for _, am := range out {
+		if am.Role != "user" {
+			t.Errorf("unexpected non-user message survived: %+v", am)
+		}
+		if string(am.Content) == "null" || len(am.Content) == 0 {
+			t.Errorf("message has null/empty content (would 422): %+v", am)
+		}
+	}
+	if got := allText(out); !strings.Contains(got, "first") || !strings.Contains(got, "again") {
+		t.Errorf("merged user content missing expected text: %q", got)
+	}
+}
+
+func TestToAnthropicMessagesMergesConsecutiveUsersAfterLLMError(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "今天行情"},
+		{Role: "assistant", Content: "昨日行情如下"},
+		{Role: "user", Content: "啊？"},
+		// Prior failed LLM turns append user rows but do not persist an
+		// assistant row. Anthropic-compatible providers expect a single
+		// user turn here, not three adjacent role=user messages.
+		{Role: "user", Content: "今天行情"},
+		{Role: "user", Content: "hi"},
 	}
 
 	_, out := toAnthropicMessages(msgs)
 
 	if len(out) != 3 {
-		t.Fatalf("expected 3 messages, got %d: %+v", len(out), out)
+		t.Fatalf("expected role sequence user/assistant/merged-user, got %d messages: %+v", len(out), out)
 	}
-	if out[1].Role != "assistant" {
-		t.Fatalf("message[1] role = %q, want assistant", out[1].Role)
+	if out[0].Role != "user" || out[1].Role != "assistant" || out[2].Role != "user" {
+		t.Fatalf("unexpected role sequence: %+v", out)
 	}
-	if string(out[1].Content) != `""` {
-		t.Fatalf("message[1] content = %s, want JSON empty string", string(out[1].Content))
-	}
-	for i, am := range out {
-		if string(am.Content) == "null" || len(am.Content) == 0 {
-			t.Fatalf("message[%d] has null/empty content: %+v", i, am)
+	got := allText(out[2:])
+	for _, want := range []string{"啊？", "今天行情", "hi"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged tail missing %q: %q", want, got)
 		}
+	}
+}
+
+func TestToAnthropicMessagesMergesUserAfterToolResult(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "查一下"},
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{{
+				ID:       "toolu_ok",
+				Type:     "function",
+				Function: FunctionCall{Name: "exec", Arguments: `{}`},
+			}},
+		},
+		{Role: "tool", ToolCallID: "toolu_ok", Content: "tool output"},
+		// A later LLM failure can leave the next inbound WeChat message
+		// adjacent to the tool_result user message. Keep the tool_result
+		// first and append the plain text into the same user turn.
+		{Role: "user", Content: "继续"},
+	}
+
+	_, out := toAnthropicMessages(msgs)
+
+	if len(out) != 3 {
+		t.Fatalf("expected user/assistant/merged-tool-user, got %d messages: %+v", len(out), out)
+	}
+	if out[2].Role != "user" {
+		t.Fatalf("expected merged tail to stay user, got %+v", out[2])
+	}
+	var blocks []any
+	if err := json.Unmarshal(out[2].Content, &blocks); err != nil {
+		t.Fatalf("tail content is not a block array: %v\n%s", err, string(out[2].Content))
+	}
+	if len(blocks) != 2 {
+		t.Fatalf("expected tool_result + text blocks, got %+v", blocks)
+	}
+	first, _ := blocks[0].(map[string]any)
+	second, _ := blocks[1].(map[string]any)
+	if first["type"] != "tool_result" {
+		t.Fatalf("tool_result must remain first, got %+v", blocks)
+	}
+	if second["type"] != "text" || second["text"] != "继续" {
+		t.Fatalf("plain user text not merged after tool_result: %+v", blocks)
+	}
+}
+
+func TestToAnthropicMessagesDropsBareEmptyAssistantHistory(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "before"},
+		{Role: "assistant"},
+		{Role: "user", Content: "after"},
+	}
+
+	_, out := toAnthropicMessages(msgs)
+
+	if len(out) != 1 {
+		t.Fatalf("expected empty assistant to be dropped and users merged, got %d messages: %+v", len(out), out)
+	}
+	for _, am := range out {
+		if am.Role == "assistant" {
+			t.Fatalf("empty assistant survived: %+v", am)
+		}
+		if string(am.Content) == "null" || len(am.Content) == 0 {
+			t.Fatalf("message has null/empty content (would 422): %+v", am)
+		}
+	}
+	if got := allText(out); !strings.Contains(got, "before") || !strings.Contains(got, "after") {
+		t.Fatalf("merged user content missing expected text: %q", got)
 	}
 }
 
