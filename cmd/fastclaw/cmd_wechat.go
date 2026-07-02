@@ -283,7 +283,10 @@ func attachWeChatSessionByKey(ctx context.Context, st store.Store, target wechat
 			return target, false, err
 		}
 		for _, s := range sessions {
-			if s.Key != sessionKey || s.Channel != "wechat" || s.AccountID != target.AccountID || s.ChatID == "" {
+			// sessionKey scopes the row; don't also require account match
+			// (see attachLatestWeChatSession — a wechat session can be
+			// filed under a different account than the current channel).
+			if s.Key != sessionKey || s.Channel != "wechat" || s.ChatID == "" {
 				continue
 			}
 			target.UserID = userID
@@ -319,7 +322,14 @@ func attachLatestWeChatSession(ctx context.Context, st store.Store, target wecha
 			return target, false, err
 		}
 		for _, s := range sessions {
-			if s.Channel != "wechat" || s.AccountID != target.AccountID || s.ChatID == "" {
+			// Match by agent + wechat channel, not account: gateway
+			// routing reuses the existing session row for a chat_id across
+			// bots (the ilink user_id/chat_id is stable per person), so the
+			// latest wechat session for this agent may be filed under a
+			// different account than the current channel. The bot token
+			// comes from the channel row (target.AccountID); chat_id is the
+			// per-user destination we need here.
+			if s.Channel != "wechat" || s.ChatID == "" {
 				continue
 			}
 			if best == nil || s.UpdatedAt.After(best.UpdatedAt) {
