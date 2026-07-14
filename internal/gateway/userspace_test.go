@@ -11,6 +11,23 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
+func TestPathSandboxRequiredOnlyForHostedDeploy(t *testing.T) {
+	t.Setenv("FASTCLAW_DEPLOY", "")
+	if pathSandboxRequired() {
+		t.Fatal("self-hosted default must allow direct host file access")
+	}
+
+	t.Setenv("FASTCLAW_DEPLOY", "self-hosted")
+	if pathSandboxRequired() {
+		t.Fatal("explicit self-hosted deploy must allow direct host file access")
+	}
+
+	t.Setenv("FASTCLAW_DEPLOY", "hosted")
+	if !pathSandboxRequired() {
+		t.Fatal("hosted deploy must retain workspace path isolation")
+	}
+}
+
 // readUserScopeAgentDefaults must distinguish "user has no row" from
 // "user explicitly chose the system default". EnsureAgent relies on the
 // returned Model being empty in case 1 (fall through to owner/agent

@@ -13,8 +13,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime/multipart"
 	"net/http"
+	"net/textproto"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +71,7 @@ type Feishu struct {
 	useLongConn bool
 
 	httpClient *http.Client
+	apiBaseURL string
 
 	mu           sync.Mutex
 	accessTok    string
@@ -95,6 +100,7 @@ func NewFeishu(appID, appSecret, verificationToken, encryptKey string, useLongCo
 		encryptKey:        encryptKey,
 		useLongConn:       useLongConn,
 		httpClient:        &http.Client{Timeout: feishuSendTimeout},
+		apiBaseURL:        feishuBaseURL,
 	}, nil
 }
 
@@ -138,28 +144,101 @@ func (l *Feishu) Send(chatID, text string) error {
 // SendMessage delivers Text + (optionally) MediaItems. Text is always sent
 // as a JSON 2.0 interactive card so Feishu can render standard Markdown
 // directly. Plain text is kept only as an error fallback when the card API
-// fails. MediaItems are deferred — sending images requires uploading to
-// Feishu's CDN first via /im/v1/images, which is a separate dance we don't
-// need until users complain.
+// fails. Attachments are uploaded first and then sent as image/file messages.
 func (l *Feishu) SendMessage(msg bus.OutboundMessage) error {
 	if msg.Text == "" && len(msg.MediaItems) == 0 {
-		return nil
-	}
-	if msg.Text == "" {
-		slog.Debug("feishu send: media-only message dropped (image upload not implemented)",
-			"account", l.accountID, "chat", msg.ChatID)
 		return nil
 	}
 	tok, err := l.tenantAccessToken(context.Background())
 	if err != nil {
 		return fmt.Errorf("feishu token: %w", err)
 	}
-	if err := l.sendMarkdownCard(tok, msg.ChatID, msg.Text); err != nil {
-		slog.Warn("feishu card send failed, falling back to plain text",
-			"account", l.accountID, "chat", msg.ChatID, "error", err)
-		return l.sendPlainTextMessage(tok, msg.ChatID, msg.Text)
+	if msg.Text != "" {
+		if err := l.sendMarkdownCard(tok, msg.ChatID, msg.Text); err != nil {
+			slog.Warn("feishu card send failed, falling back to plain text",
+				"account", l.accountID, "chat", msg.ChatID, "error", err)
+			if err := l.sendPlainTextMessage(tok, msg.ChatID, msg.Text); err != nil {
+				return err
+			}
+		}
+	}
+	for _, item := range msg.MediaItems {
+		if err := l.sendMediaItem(tok, msg.ChatID, item); err != nil {
+			return fmt.Errorf("feishu send attachment %q: %w", item.Filename, err)
+		}
 	}
 	return nil
+}
+
+func (l *Feishu) sendMediaItem(tok, chatID string, item bus.MediaItem) error {
+	isImage := strings.HasPrefix(item.ContentType, "image/")
+	endpoint, field, kind := "/open-apis/im/v1/files", "file", "file"
+	fields := map[string]string{"file_type": "stream", "file_name": item.Filename}
+	if isImage {
+		endpoint, field, kind = "/open-apis/im/v1/images", "image", "image"
+		fields = map[string]string{"image_type": "message"}
+	}
+	key, err := l.uploadMedia(tok, endpoint, field, item, fields, kind+"_key")
+	if err != nil {
+		return err
+	}
+	content, _ := json.Marshal(map[string]string{kind + "_key": key})
+	return l.doSend(tok, map[string]string{"receive_id": chatID, "content": string(content), "msg_type": kind})
+}
+
+func (l *Feishu) uploadMedia(tok, endpoint, fileField string, item bus.MediaItem, fields map[string]string, responseKey string) (string, error) {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	for k, v := range fields {
+		if err := w.WriteField(k, v); err != nil {
+			return "", err
+		}
+	}
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name=%q; filename=%q`, fileField, filepath.Base(item.Filename)))
+	if item.ContentType != "" {
+		h.Set("Content-Type", item.ContentType)
+	}
+	part, err := w.CreatePart(h)
+	if err != nil {
+		return "", err
+	}
+	if _, err := part.Write(item.Bytes); err != nil {
+		return "", err
+	}
+	if err := w.Close(); err != nil {
+		return "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, l.apiBaseURL+endpoint, &body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	resp, err := l.httpClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("upload HTTP %d: %s", resp.StatusCode, respBody)
+	}
+	var apiResp struct {
+		Code int               `json:"code"`
+		Msg  string            `json:"msg"`
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &apiResp); err != nil {
+		return "", err
+	}
+	if apiResp.Code != 0 {
+		return "", fmt.Errorf("upload code=%d msg=%s", apiResp.Code, apiResp.Msg)
+	}
+	if apiResp.Data[responseKey] == "" {
+		return "", fmt.Errorf("upload response missing %s", responseKey)
+	}
+	return apiResp.Data[responseKey], nil
 }
 
 // sendMarkdownCard sends a JSON 2.0 interactive card with one markdown body.
@@ -217,7 +296,7 @@ func (l *Feishu) doSend(tok string, payload map[string]string) error {
 		return fmt.Errorf("feishu marshal: %w", err)
 	}
 	req, err := http.NewRequest(http.MethodPost,
-		feishuSendURL+"?receive_id_type=chat_id",
+		l.apiBaseURL+"/open-apis/im/v1/messages?receive_id_type=chat_id",
 		bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -407,30 +486,53 @@ func (l *Feishu) HandleWebhook(body []byte) (responseBody []byte, status int, er
 	return []byte(`{"ok":true}`), http.StatusOK, nil
 }
 
-// dispatchInbound translates a Feishu message event into a
-// bus.InboundMessage. Drops self-sent messages (sender_type != "user")
-// and non-text messages. Feishu's `content` is a JSON-encoded string
-// inside the event JSON — `{"text":"hello"}` — which we have to
-// re-decode separately.
+// dispatchInbound translates a Feishu message event into a bus message.
+// File/image resources are downloaded while the event token is valid and
+// handed to the gateway for session-workspace materialization.
 func (l *Feishu) dispatchInbound(ev feishuMessageEvent) {
 	if ev.Sender.SenderType != "user" {
 		return
 	}
-	if ev.Message.MessageType != "text" {
-		// We support only text in V1. Feishu's "post" / "image" / "file"
-		// types each have their own content shape; defer until users ask.
-		slog.Debug("feishu non-text message skipped",
-			"account", l.accountID, "type", ev.Message.MessageType)
+	var text string
+	var media []bus.MediaItem
+	switch ev.Message.MessageType {
+	case "text":
+		var content struct {
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal([]byte(ev.Message.Content), &content); err != nil {
+			return
+		}
+		text = content.Text
+	case "file", "image":
+		var content struct {
+			FileKey  string `json:"file_key"`
+			ImageKey string `json:"image_key"`
+			FileName string `json:"file_name"`
+		}
+		if err := json.Unmarshal([]byte(ev.Message.Content), &content); err != nil {
+			return
+		}
+		key, resourceType := content.FileKey, "file"
+		if ev.Message.MessageType == "image" {
+			key, resourceType = content.ImageKey, "image"
+		}
+		data, contentType, err := l.downloadMessageResource(ev.Message.MessageID, key, resourceType)
+		if err != nil {
+			slog.Warn("feishu resource download failed", "message", ev.Message.MessageID, "type", resourceType, "error", err)
+			return
+		}
+		name := content.FileName
+		if name == "" {
+			name = resourceType + mimeExtFromContentType(contentType)
+		}
+		media = []bus.MediaItem{{Filename: name, ContentType: contentType, Bytes: data}}
+		text = "请查看我发送的附件。"
+	default:
+		slog.Debug("feishu unsupported message skipped", "account", l.accountID, "type", ev.Message.MessageType)
 		return
 	}
-	var content struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal([]byte(ev.Message.Content), &content); err != nil {
-		slog.Debug("feishu content parse failed", "error", err)
-		return
-	}
-	if content.Text == "" {
+	if text == "" && len(media) == 0 {
 		return
 	}
 
@@ -450,19 +552,66 @@ func (l *Feishu) dispatchInbound(ev feishuMessageEvent) {
 		"account", l.accountID,
 		"from", ev.Sender.SenderID.OpenID,
 		"chat", ev.Message.ChatID,
-		"len", len(content.Text),
+		"len", len(text),
 		"mentions", feishuMentionNames(ev))
 
 	l.bus.Inbound <- bus.InboundMessage{
-		Channel:   "feishu",
-		AccountID: l.accountID,
-		ChatID:    ev.Message.ChatID,
-		UserID:    ev.Sender.SenderID.OpenID,
-		MessageID: msgID,
-		Text:      content.Text,
-		PeerKind:  peerKind,
-		Mentions:  feishuMentionNames(ev),
+		Channel:    "feishu",
+		AccountID:  l.accountID,
+		ChatID:     ev.Message.ChatID,
+		UserID:     ev.Sender.SenderID.OpenID,
+		MessageID:  msgID,
+		Text:       text,
+		MediaItems: media,
+		PeerKind:   peerKind,
+		Mentions:   feishuMentionNames(ev),
 	}
+}
+
+func (l *Feishu) downloadMessageResource(messageID, key, resourceType string) ([]byte, string, error) {
+	if messageID == "" || key == "" {
+		return nil, "", errors.New("missing message_id or resource key")
+	}
+	tok, err := l.tenantAccessToken(context.Background())
+	if err != nil {
+		return nil, "", err
+	}
+	u := fmt.Sprintf("%s/open-apis/im/v1/messages/%s/resources/%s?type=%s", l.apiBaseURL, messageID, key, resourceType)
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := l.httpClient.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 25*1024*1024+1))
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, data)
+	}
+	if len(data) > 25*1024*1024 {
+		return nil, "", errors.New("resource exceeds 25MB")
+	}
+	return data, resp.Header.Get("Content-Type"), nil
+}
+
+func mimeExtFromContentType(contentType string) string {
+	switch strings.Split(contentType, ";")[0] {
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/gif":
+		return ".gif"
+	case "application/pdf":
+		return ".pdf"
+	}
+	return ".bin"
 }
 
 func feishuMentionNames(ev feishuMessageEvent) []string {

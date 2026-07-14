@@ -8,27 +8,34 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
 )
 
-func TestWithMessageTimestampsUsesExplicitChatterTimezone(t *testing.T) {
-	store := newFakeMemoryStore()
-	store.put(testAgentID, chatterUID, "USER.md", "# Current Chatter\n- Timezone: Asia/Shanghai")
+func TestConversationGapContextDoesNotRewriteMessageText(t *testing.T) {
+	old := time.Date(2026, 5, 21, 15, 9, 0, 0, time.UTC).UnixMilli()
+	now := time.Date(2026, 6, 21, 15, 9, 0, 0, time.UTC).UnixMilli()
+	got := withConversationGapContext([]provider.Message{
+		{Role: "assistant", Content: "旧回复", Timestamp: old},
+		{Role: "user", Content: "新问题", Timestamp: now},
+	})
 
-	a := &Agent{
-		memory:  NewMemoryWithStoreForUser("", store, ownerUID, testAgentID),
-		agentID: testAgentID,
+	if len(got) != 3 || got[0].Role != "system" {
+		t.Fatalf("messages = %#v, want timing context plus unchanged history", got)
 	}
-	ts := time.Date(2026, 6, 21, 15, 9, 0, 0, time.UTC).UnixMilli()
-
-	got := a.withMessageTimestampsForChatter([]provider.Message{{
-		Role:      "user",
-		Content:   "为什么是下午好",
-		Timestamp: ts,
-	}}, chatterUID)
-
-	if len(got) != 1 {
-		t.Fatalf("message count = %d, want 1", len(got))
+	if got[2].Content != "新问题" {
+		t.Fatalf("latest content = %q, want no timestamp prefix", got[2].Content)
 	}
-	if !strings.HasPrefix(got[0].Content, "[2026-06-21 23:09 Sun] ") {
-		t.Fatalf("timestamp prefix = %q, want Asia/Shanghai local time", got[0].Content)
+	if !strings.Contains(got[0].Content, "about 31 days") || !strings.Contains(got[0].Content, "do not repeat") {
+		t.Fatalf("gap context = %q", got[0].Content)
+	}
+}
+
+func TestConversationGapContextSkipsRecentTurns(t *testing.T) {
+	now := time.Now().UnixMilli()
+	msgs := []provider.Message{
+		{Role: "assistant", Content: "刚才的回复", Timestamp: now - time.Hour.Milliseconds()},
+		{Role: "user", Content: "继续", Timestamp: now},
+	}
+	got := withConversationGapContext(msgs)
+	if len(got) != len(msgs) || got[1].Content != "继续" {
+		t.Fatalf("recent messages changed: %#v", got)
 	}
 }
 
