@@ -295,7 +295,7 @@ func (d *DingTalk) sendSessionMarkdown(endpoint, text string) error {
 		body := map[string]any{
 			"msgtype": "markdown",
 			"markdown": map[string]string{
-				"title": sessionChunkTitle(i, len(chunks)),
+				"title": dingtalkMarkdownTitle(text, i, len(chunks)),
 				"text":  chunk,
 			},
 		}
@@ -317,11 +317,31 @@ func (d *DingTalk) sendSessionMarkdown(endpoint, text string) error {
 	return nil
 }
 
-func sessionChunkTitle(index, total int) string {
-	if total <= 1 {
-		return "FastClaw"
+const dingtalkTitleLimit = 20
+
+// dingtalkMarkdownTitle keeps the sidebar preview useful: DingTalk displays
+// a markdown message's title in places where it does not show the body.
+func dingtalkMarkdownTitle(text string, index, total int) string {
+	suffix := ""
+	if total > 1 {
+		suffix = fmt.Sprintf(" (%d/%d)", index+1, total)
 	}
-	return fmt.Sprintf("FastClaw (%d/%d)", index+1, total)
+	limit := max(1, dingtalkTitleLimit-len([]rune(suffix)))
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, "#>*+- \t")
+		line = strings.NewReplacer("**", "", "__", "", "`", "", "[", "", "]", "").Replace(line)
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		runes := []rune(line)
+		if len(runes) > limit {
+			line = string(runes[:limit])
+		}
+		return line + suffix
+	}
+	return "FastClaw" + suffix
 }
 
 func splitDingTalkMarkdown(text string, limit int) []string {
@@ -350,7 +370,7 @@ func (d *DingTalk) sendProactiveMarkdown(kind, targetID, text string) error {
 	chunks := splitDingTalkMarkdown(text, dingtalkMarkdownLimit)
 	for i, chunk := range chunks {
 		if err := d.sendProactive(context.Background(), kind, targetID, "sampleMarkdown", map[string]string{
-			"title": sessionChunkTitle(i, len(chunks)), "text": chunk,
+			"title": dingtalkMarkdownTitle(text, i, len(chunks)), "text": chunk,
 		}); err != nil {
 			return err
 		}

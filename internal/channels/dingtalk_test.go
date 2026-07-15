@@ -33,6 +33,17 @@ func TestDingTalkSendPrefersSessionWebhook(t *testing.T) {
 		if !strings.Contains(string(body), `"msgtype":"markdown"`) || !strings.Contains(string(body), "hello") {
 			t.Fatalf("session body = %s", body)
 		}
+		var payload struct {
+			Markdown struct {
+				Title string `json:"title"`
+			} `json:"markdown"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Markdown.Title != "hello" {
+			t.Fatalf("session title = %q, want message preview", payload.Markdown.Title)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"errcode":0}`))
 	}))
@@ -108,6 +119,13 @@ func TestDingTalkProactiveMarkdownIsChunked(t *testing.T) {
 			if len([]rune(body["msgParam"].(string))) > dingtalkMarkdownLimit+100 {
 				t.Fatalf("oversized msgParam: %d runes", len([]rune(body["msgParam"].(string))))
 			}
+			var param map[string]string
+			if err := json.Unmarshal([]byte(body["msgParam"].(string)), &param); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasPrefix(param["title"], "回复预览") || strings.Contains(param["title"], "FastClaw") {
+				t.Fatalf("proactive title = %q, want message preview", param["title"])
+			}
 			_, _ = w.Write([]byte(`{"processQueryKey":"sent"}`))
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
@@ -118,11 +136,20 @@ func TestDingTalkProactiveMarkdownIsChunked(t *testing.T) {
 	d, _ := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{})
 	d.httpClient = server.Client()
 	d.apiBase = server.URL
-	if err := d.Send("user:staff-1", strings.Repeat("文", dingtalkMarkdownLimit+500)); err != nil {
+	if err := d.Send("user:staff-1", "# 回复预览\n"+strings.Repeat("文", dingtalkMarkdownLimit+500)); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 	if sends.Load() != 2 {
 		t.Fatalf("proactive sends = %d, want 2", sends.Load())
+	}
+}
+
+func TestDingTalkMarkdownTitleUsesFirstMeaningfulLine(t *testing.T) {
+	if got := dingtalkMarkdownTitle("\n## **市场摘要**\n后续内容", 0, 1); got != "市场摘要" {
+		t.Fatalf("title = %q, want market summary", got)
+	}
+	if got := dingtalkMarkdownTitle("\n\n", 1, 2); got != "FastClaw (2/2)" {
+		t.Fatalf("empty title = %q", got)
 	}
 }
 
