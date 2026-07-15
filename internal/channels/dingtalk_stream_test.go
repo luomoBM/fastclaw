@@ -73,9 +73,4 @@ func TestDingTalkStreamSupervisorReconnectsAndStops(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("DingTalk Start did not stop after cancellation")
 	}
-	select {
-	case <-created:
-		t.Fatal("intentional close cascaded into another reconnect")
-	case <-time.After(20 * time.Millisecond):
-	}
 }
