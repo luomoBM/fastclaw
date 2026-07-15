@@ -359,7 +359,9 @@ func TestDingTalkOutboundImageUploadsThenSendsProactively(t *testing.T) {
 		case "/v1.0/robot/oToMessages/batchSend":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
-			if body["msgKey"] != "sampleImageMsg" || !strings.Contains(body["msgParam"].(string), "media-1") {
+			var param map[string]string
+			_ = json.Unmarshal([]byte(body["msgParam"].(string)), &param)
+			if body["msgKey"] != "sampleMarkdown" || !strings.Contains(param["text"], `![photo.png](media-1)`) || param["title"] != "photo.png" {
 				t.Fatalf("media send body = %#v", body)
 			}
 			sent.Store(true)
@@ -419,6 +421,89 @@ func TestDingTalkOutboundImagePrefersSessionMarkdown(t *testing.T) {
 	}
 	if !strings.Contains(sessionBody, "caption") || !strings.Contains(sessionBody, `![photo.png](media-1)`) {
 		t.Fatalf("session body = %s", sessionBody)
+	}
+}
+
+func TestDingTalkOutboundImageReusesUploadForProactiveFallback(t *testing.T) {
+	var uploadCalls atomic.Int32
+	var proactiveParam map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/media/upload":
+			uploadCalls.Add(1)
+			_, _ = w.Write([]byte(`{"errcode":0,"media_id":"media-1"}`))
+		case "/session":
+			w.WriteHeader(http.StatusBadRequest)
+		case "/v1.0/robot/oToMessages/batchSend":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["msgKey"] != "sampleMarkdown" {
+				t.Fatalf("msgKey = %#v", body["msgKey"])
+			}
+			if err := json.Unmarshal([]byte(body["msgParam"].(string)), &proactiveParam); err != nil {
+				t.Fatalf("decode msgParam: %v", err)
+			}
+			_, _ = w.Write([]byte(`{"processQueryKey":"sent"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	endpoints := &memoryReplyEndpoints{values: map[string]string{
+		"dingtalk|ding-client|user:staff-1": server.URL + "/session",
+	}}
+	d, _ := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), endpoints)
+	d.httpClient = server.Client()
+	d.apiBase, d.oapiBase = server.URL, server.URL
+	if err := d.SendMessage(bus.OutboundMessage{
+		ChatID: "user:staff-1", Text: "caption",
+		MediaItems: []bus.MediaItem{{Filename: "photo.png", ContentType: "image/png", Bytes: []byte("png-data")}},
+	}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if uploadCalls.Load() != 1 {
+		t.Fatalf("upload calls = %d, want 1", uploadCalls.Load())
+	}
+	if !strings.Contains(proactiveParam["text"], "caption") || !strings.Contains(proactiveParam["text"], `![photo.png](media-1)`) {
+		t.Fatalf("proactive markdown = %#v", proactiveParam)
+	}
+}
+
+func TestDingTalkOutboundLongTextPlacesImageOnlyInFinalChunk(t *testing.T) {
+	var sentTexts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/media/upload":
+			_, _ = w.Write([]byte(`{"errcode":0,"media_id":"media-1"}`))
+		case "/v1.0/robot/oToMessages/batchSend":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			var param map[string]string
+			_ = json.Unmarshal([]byte(body["msgParam"].(string)), &param)
+			sentTexts = append(sentTexts, param["text"])
+			_, _ = w.Write([]byte(`{"processQueryKey":"sent"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, _ := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{})
+	d.httpClient = server.Client()
+	d.apiBase, d.oapiBase = server.URL, server.URL
+	if err := d.SendMessage(bus.OutboundMessage{
+		ChatID: "user:staff-1", Text: strings.Repeat("文", dingtalkMarkdownLimit+100),
+		MediaItems: []bus.MediaItem{{Filename: "photo.png", ContentType: "image/png", Bytes: []byte("png-data")}},
+	}); err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if len(sentTexts) != 2 || strings.Contains(sentTexts[0], "media-1") || !strings.Contains(sentTexts[1], `![photo.png](media-1)`) {
+		t.Fatalf("sent chunks = %#v", sentTexts)
 	}
 }
 

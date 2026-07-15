@@ -15,7 +15,7 @@ import (
 
 func channelsCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "channels", Short: "Manage IM channel bindings"}
-	cmd.AddCommand(channelsListCmd(), channelsConnectCmd(), channelsDeleteCmd())
+	cmd.AddCommand(channelsListCmd(), channelsConnectCmd(), channelsDeleteCmd(), channelsSendCmd())
 	return cmd
 }
 

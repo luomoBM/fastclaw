@@ -26,6 +26,7 @@ const dingtalkReplyEndpointFallbackTTL = time.Hour
 const (
 	dingtalkDefaultAPIBase = "https://api.dingtalk.com"
 	dingtalkMarkdownLimit  = 3800
+	DingTalkMediaMaxBytes  = 25 * 1024 * 1024
 )
 
 // ChannelReplyEndpointStore is the narrow persistence seam needed by
@@ -59,14 +60,37 @@ type DingTalk struct {
 }
 
 func NewDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, endpoints ChannelReplyEndpointStore) (*DingTalk, error) {
+	if mb == nil {
+		return nil, errors.New("dingtalk: message bus is required")
+	}
+	return newDingTalk(clientID, clientSecret, accountID, mb, endpoints)
+}
+
+// DingTalkSender exposes only outbound operations from a short-lived client.
+type DingTalkSender struct {
+	client *DingTalk
+}
+
+// NewDingTalkSender creates a short-lived outbound-only client. It does not
+// expose Stream lifecycle operations or require a MessageBus.
+func NewDingTalkSender(clientID, clientSecret, accountID string, endpoints ChannelReplyEndpointStore) (*DingTalkSender, error) {
+	client, err := newDingTalk(clientID, clientSecret, accountID, nil, endpoints)
+	if err != nil {
+		return nil, err
+	}
+	return &DingTalkSender{client: client}, nil
+}
+
+func (s *DingTalkSender) SendMessage(msg bus.OutboundMessage) error {
+	return s.client.SendMessage(msg)
+}
+
+func newDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, endpoints ChannelReplyEndpointStore) (*DingTalk, error) {
 	clientID = strings.TrimSpace(clientID)
 	clientSecret = strings.TrimSpace(clientSecret)
 	accountID = strings.TrimSpace(accountID)
 	if clientID == "" || clientSecret == "" || accountID == "" {
 		return nil, errors.New("dingtalk: clientID, clientSecret, and accountID are required")
-	}
-	if mb == nil {
-		return nil, errors.New("dingtalk: message bus is required")
 	}
 	d := &DingTalk{
 		clientID: clientID, clientSecret: clientSecret, accountID: accountID,
@@ -135,40 +159,39 @@ func (d *DingTalk) SendMessage(msg bus.OutboundMessage) error {
 	if text == "" && len(msg.MediaItems) == 0 {
 		return nil
 	}
+	preparedText, remaining, err := d.prepareOutboundMarkdown(text, msg.MediaItems)
+	if err != nil {
+		return err
+	}
 	if endpoint, lookupErr := d.replyEndpoint(msg.ChatID); lookupErr == nil && endpoint != "" {
-		sessionText, remaining, prepareErr := d.prepareSessionReply(text, msg.MediaItems)
-		if prepareErr == nil && sessionText != "" {
-			if err := d.sendSessionMarkdown(endpoint, sessionText); err == nil {
+		if preparedText != "" {
+			if err := d.sendSessionMarkdown(endpoint, preparedText); err == nil {
 				return d.sendMediaItems(kind, targetID, remaining)
 			}
 			// sessionWebhook is a secret URL. Transport errors may embed it, so
 			// never attach the raw error to structured logs.
 			slog.Warn("DingTalk session reply failed; falling back to proactive API", "account", d.accountID, "target", msg.ChatID)
-		} else if prepareErr != nil {
-			// Upload errors may contain a query-string access token. Keep the
-			// diagnostic categorical at this boundary.
-			slog.Warn("DingTalk session image preparation failed; falling back to proactive API", "account", d.accountID, "target", msg.ChatID)
 		}
 	}
-	if text != "" {
-		if err := d.sendProactiveMarkdown(kind, targetID, text); err != nil {
+	if preparedText != "" {
+		if err := d.sendProactiveMarkdown(kind, targetID, preparedText); err != nil {
 			return err
 		}
 	}
-	return d.sendMediaItems(kind, targetID, msg.MediaItems)
+	return d.sendMediaItems(kind, targetID, remaining)
 }
 
-// prepareSessionReply embeds images as DingTalk markdown media references.
+// prepareOutboundMarkdown embeds images as DingTalk markdown media references.
 // Native files are intentionally left for proactive delivery because the
 // session webhook does not support them reliably.
-func (d *DingTalk) prepareSessionReply(text string, items []bus.MediaItem) (string, []bus.MediaItem, error) {
+func (d *DingTalk) prepareOutboundMarkdown(text string, items []bus.MediaItem) (string, []bus.MediaItem, error) {
 	remaining := make([]bus.MediaItem, 0, len(items))
 	for _, item := range items {
 		if !strings.HasPrefix(item.ContentType, "image/") {
 			remaining = append(remaining, item)
 			continue
 		}
-		if len(item.Bytes) > 25*1024*1024 {
+		if len(item.Bytes) > DingTalkMediaMaxBytes {
 			return "", nil, fmt.Errorf("attachment %q exceeds 25 MB", item.Filename)
 		}
 		mediaID, err := d.uploadMedia(context.Background(), item, "image")
@@ -329,6 +352,11 @@ func dingtalkMarkdownTitle(text string, index, total int) string {
 	limit := max(1, dingtalkTitleLimit-len([]rune(suffix)))
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "![") {
+			if end := strings.Index(line[2:], "]("); end >= 0 {
+				line = line[2 : end+2]
+			}
+		}
 		line = strings.TrimLeft(line, "#>*+- \t")
 		line = strings.NewReplacer("**", "", "__", "", "`", "", "[", "", "]", "").Replace(line)
 		line = strings.TrimSpace(line)
@@ -488,7 +516,7 @@ func mustJSON(v any) string {
 
 func (d *DingTalk) sendMediaItems(kind, targetID string, items []bus.MediaItem) error {
 	for _, item := range items {
-		if len(item.Bytes) > 25*1024*1024 {
+		if len(item.Bytes) > DingTalkMediaMaxBytes {
 			return fmt.Errorf("dingtalk attachment %q exceeds 25 MB", item.Filename)
 		}
 		mediaType := "file"
@@ -641,12 +669,11 @@ func (d *DingTalk) downloadInboundMedia(ctx context.Context, downloadCode, filen
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return bus.MediaItem{}, fmt.Errorf("附件下载失败（HTTP %d）", resp.StatusCode)
 	}
-	const maxBytes = 25 * 1024 * 1024
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, DingTalkMediaMaxBytes+1))
 	if err != nil {
 		return bus.MediaItem{}, errors.New("附件读取失败")
 	}
-	if len(data) > maxBytes {
+	if len(data) > DingTalkMediaMaxBytes {
 		return bus.MediaItem{}, errors.New("附件超过 25 MB")
 	}
 	contentType := resp.Header.Get("Content-Type")
