@@ -29,13 +29,14 @@ func (d *DingTalk) newStreamClient() dingTalkStreamClient {
 
 // Start supervises a sequence of SDK clients. The upstream SDK does not expose
 // a connection-done channel, so a process-wide SDK logger observes only its
-// fixed disconnect log categories and wakes every DingTalk supervisor. Waking
-// all accounts is harmless and avoids associating secret-bearing log arguments
-// with a particular client.
+// fixed disconnect log categories and wakes every DingTalk supervisor. The
+// logger cannot identify the source account, so the hub coalesces a real fault
+// into one coordinated reconnect and suppresses signals from deliberate Close
+// calls. It never inspects or forwards secret-bearing log arguments.
 func (d *DingTalk) Start(ctx context.Context) error {
 	disconnected, unsubscribe := dingTalkDisconnects.subscribe()
 	defer unsubscribe()
-	backoff := time.Second
+	backoff := d.streamReconnectBase
 	for {
 		for len(disconnected) > 0 {
 			<-disconnected
@@ -59,14 +60,23 @@ func (d *DingTalk) Start(ctx context.Context) error {
 			backoff = min(backoff*2, 30*time.Second)
 			continue
 		}
-		backoff = time.Second
+		connectedAt := time.Now()
 		select {
 		case <-ctx.Done():
-			cli.Close()
+			dingTalkDisconnects.closeIntentionally(cli)
 			return nil
 		case <-disconnected:
 			slog.Warn("DingTalk Stream disconnected; reconnecting", "account", d.accountID)
-			cli.Close()
+			dingTalkDisconnects.closeIntentionally(cli)
+			if time.Since(connectedAt) >= d.streamStableAfter {
+				backoff = d.streamReconnectBase
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			backoff = min(backoff*2, 30*time.Second)
 		}
 	}
 }
@@ -75,6 +85,9 @@ type dingTalkDisconnectHub struct {
 	once sync.Once
 	mu   sync.Mutex
 	subs map[chan struct{}]struct{}
+
+	suppressUntil time.Time
+	lastBroadcast time.Time
 }
 
 var dingTalkDisconnects dingTalkDisconnectHub
@@ -98,12 +111,29 @@ func (h *dingTalkDisconnectHub) subscribe() (<-chan struct{}, func()) {
 func (h *dingTalkDisconnectHub) broadcast() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	now := time.Now()
+	if now.Before(h.suppressUntil) || now.Sub(h.lastBroadcast) < time.Second {
+		return
+	}
+	h.lastBroadcast = now
 	for ch := range h.subs {
 		select {
 		case ch <- struct{}{}:
 		default:
 		}
 	}
+}
+
+// closeIntentionally suppresses the SDK read-error log produced by Close.
+// The logger is process-wide and cannot identify which account emitted a log,
+// so this prevents a deliberate unregister from cascading into reconnects for
+// unrelated accounts. A real disconnect is coalesced into one coordinated
+// reconnect signal by broadcast's debounce window.
+func (h *dingTalkDisconnectHub) closeIntentionally(cli dingTalkStreamClient) {
+	h.mu.Lock()
+	h.suppressUntil = time.Now().Add(time.Second)
+	h.mu.Unlock()
+	cli.Close()
 }
 
 type dingTalkSDKLogger struct{ hub *dingTalkDisconnectHub }

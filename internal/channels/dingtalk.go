@@ -54,6 +54,8 @@ type DingTalk struct {
 	botUserID string
 
 	streamClientFactory func() dingTalkStreamClient
+	streamReconnectBase time.Duration
+	streamStableAfter   time.Duration
 }
 
 func NewDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, endpoints ChannelReplyEndpointStore) (*DingTalk, error) {
@@ -73,6 +75,8 @@ func NewDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, e
 		oapiBase: "https://oapi.dingtalk.com",
 	}
 	d.streamClientFactory = d.newStreamClient
+	d.streamReconnectBase = time.Second
+	d.streamStableAfter = 30 * time.Second
 	return d, nil
 }
 

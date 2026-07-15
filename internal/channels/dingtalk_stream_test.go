@@ -16,6 +16,7 @@ type fakeDingTalkStreamClient struct {
 	closed    chan struct{}
 	startOnce sync.Once
 	closeOnce sync.Once
+	onClose   func()
 }
 
 func newFakeDingTalkStreamClient() *fakeDingTalkStreamClient {
@@ -27,7 +28,14 @@ func (c *fakeDingTalkStreamClient) Start(context.Context) error {
 	c.startOnce.Do(func() { close(c.started) })
 	return nil
 }
-func (c *fakeDingTalkStreamClient) Close() { c.closeOnce.Do(func() { close(c.closed) }) }
+func (c *fakeDingTalkStreamClient) Close() {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		if c.onClose != nil {
+			c.onClose()
+		}
+	})
+}
 
 func TestDingTalkStreamSupervisorReconnectsAndStops(t *testing.T) {
 	d, err := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{})
@@ -37,9 +45,12 @@ func TestDingTalkStreamSupervisorReconnectsAndStops(t *testing.T) {
 	created := make(chan *fakeDingTalkStreamClient, 3)
 	d.streamClientFactory = func() dingTalkStreamClient {
 		client := newFakeDingTalkStreamClient()
+		client.onClose = dingTalkDisconnects.broadcast
 		created <- client
 		return client
 	}
+	d.streamReconnectBase = time.Millisecond
+	d.streamStableAfter = time.Hour
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -61,5 +72,10 @@ func TestDingTalkStreamSupervisorReconnectsAndStops(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("DingTalk Start did not stop after cancellation")
+	}
+	select {
+	case <-created:
+		t.Fatal("intentional close cascaded into another reconnect")
+	case <-time.After(20 * time.Millisecond):
 	}
 }
