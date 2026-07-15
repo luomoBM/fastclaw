@@ -18,6 +18,21 @@ type lifecycleChannel struct {
 	stopOnce  sync.Once
 }
 
+type delayedStopChannel struct {
+	*lifecycleChannel
+	canceled chan struct{}
+	release  chan struct{}
+}
+
+func (c *delayedStopChannel) Start(ctx context.Context) error {
+	c.startOnce.Do(func() { close(c.started) })
+	<-ctx.Done()
+	close(c.canceled)
+	<-c.release
+	c.stopOnce.Do(func() { close(c.stopped) })
+	return nil
+}
+
 func newLifecycleChannel(name, accountID string) *lifecycleChannel {
 	return &lifecycleChannel{
 		name: name, accountID: accountID,
@@ -78,4 +93,37 @@ func TestManagerReplacingChannelStopsPreviousInstance(t *testing.T) {
 	m.RegisterSingletonAndStart(replacement)
 	waitLifecycle(t, old.stopped, "stop replaced instance")
 	waitLifecycle(t, replacement.started, "start replacement instance")
+}
+
+func TestManagerUnregisterWinsRaceWithReplacement(t *testing.T) {
+	mb := bus.New()
+	m := NewManager(mb)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Start(ctx)
+
+	old := &delayedStopChannel{
+		lifecycleChannel: newLifecycleChannel("dingtalk", "ding-app"),
+		canceled:         make(chan struct{}),
+		release:          make(chan struct{}),
+	}
+	m.RegisterSingletonAndStart(old)
+	waitLifecycle(t, old.started, "start old instance")
+
+	replacement := newLifecycleChannel("dingtalk", "ding-app")
+	replaced := make(chan struct{})
+	go func() {
+		m.RegisterSingletonAndStart(replacement)
+		close(replaced)
+	}()
+	waitLifecycle(t, old.canceled, "receive replacement cancellation")
+	m.Unregister("dingtalk", "ding-app")
+	close(old.release)
+	waitLifecycle(t, replaced, "finish stale replacement")
+
+	select {
+	case <-replacement.started:
+		t.Fatal("replacement started after a newer unregister")
+	case <-time.After(50 * time.Millisecond):
+	}
 }

@@ -119,6 +119,10 @@ func (d *DingTalk) BotUsername() string {
 func (d *DingTalk) Start(ctx context.Context) error {
 	cli := dingstream.NewStreamClient(
 		dingstream.WithAppCredential(dingstream.NewAppCredentialConfig(d.clientID, d.clientSecret)),
+		// The SDK's reconnect loop uses context.Background and exposes its
+		// control flag without synchronization, so it cannot be stopped safely.
+		// Manager-level lifecycle ownership is preferable to a leaked reconnect.
+		dingstream.WithAutoReconnect(false),
 	)
 	cli.RegisterChatBotCallbackRouter(func(callbackCtx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
 		return nil, d.handleCallback(callbackCtx, data)
@@ -127,8 +131,6 @@ func (d *DingTalk) Start(ctx context.Context) error {
 		return fmt.Errorf("dingtalk stream start: %w", err)
 	}
 	<-ctx.Done()
-	// Disable the SDK's background reconnect before closing intentionally.
-	cli.AutoReconnect = false
 	cli.Close()
 	return nil
 }
@@ -146,19 +148,54 @@ func (d *DingTalk) SendMessage(msg bus.OutboundMessage) error {
 	if text == "" && len(msg.MediaItems) == 0 {
 		return nil
 	}
-	if text != "" {
-		if endpoint, lookupErr := d.replyEndpoint(msg.ChatID); lookupErr == nil && endpoint != "" {
-			if err := d.sendSessionMarkdown(endpoint, text); err == nil {
-				return d.sendMediaItems(kind, targetID, msg.MediaItems)
-			} else {
-				slog.Warn("DingTalk session reply failed; falling back to proactive API", "account", d.accountID, "target", msg.ChatID, "error", err)
+	if endpoint, lookupErr := d.replyEndpoint(msg.ChatID); lookupErr == nil && endpoint != "" {
+		sessionText, remaining, prepareErr := d.prepareSessionReply(text, msg.MediaItems)
+		if prepareErr == nil && sessionText != "" {
+			if err := d.sendSessionMarkdown(endpoint, sessionText); err == nil {
+				return d.sendMediaItems(kind, targetID, remaining)
 			}
+			// sessionWebhook is a secret URL. Transport errors may embed it, so
+			// never attach the raw error to structured logs.
+			slog.Warn("DingTalk session reply failed; falling back to proactive API", "account", d.accountID, "target", msg.ChatID)
+		} else if prepareErr != nil {
+			// Upload errors may contain a query-string access token. Keep the
+			// diagnostic categorical at this boundary.
+			slog.Warn("DingTalk session image preparation failed; falling back to proactive API", "account", d.accountID, "target", msg.ChatID)
 		}
+	}
+	if text != "" {
 		if err := d.sendProactiveMarkdown(kind, targetID, text); err != nil {
 			return err
 		}
 	}
 	return d.sendMediaItems(kind, targetID, msg.MediaItems)
+}
+
+// prepareSessionReply embeds images as DingTalk markdown media references.
+// Native files are intentionally left for proactive delivery because the
+// session webhook does not support them reliably.
+func (d *DingTalk) prepareSessionReply(text string, items []bus.MediaItem) (string, []bus.MediaItem, error) {
+	remaining := make([]bus.MediaItem, 0, len(items))
+	for _, item := range items {
+		if !strings.HasPrefix(item.ContentType, "image/") {
+			remaining = append(remaining, item)
+			continue
+		}
+		if len(item.Bytes) > 25*1024*1024 {
+			return "", nil, fmt.Errorf("attachment %q exceeds 25 MB", item.Filename)
+		}
+		mediaID, err := d.uploadMedia(context.Background(), item, "image")
+		if err != nil {
+			return "", nil, err
+		}
+		ref := fmt.Sprintf("![%s](%s)", filepath.Base(item.Filename), mediaID)
+		if text == "" {
+			text = ref
+		} else {
+			text += "\n\n" + ref
+		}
+	}
+	return text, remaining, nil
 }
 
 func (d *DingTalk) SendTyping(string) error { return nil }
@@ -186,9 +223,6 @@ func (d *DingTalk) handleCallback(ctx context.Context, data *chatbot.BotCallback
 	}
 	peerKind := "dm"
 	targetID := strings.TrimSpace(data.SenderStaffId)
-	if targetID == "" {
-		targetID = strings.TrimSpace(data.SenderId)
-	}
 	if data.ConversationType != "1" {
 		peerKind = "group"
 		if !data.IsInAtList {
@@ -197,7 +231,7 @@ func (d *DingTalk) handleCallback(ctx context.Context, data *chatbot.BotCallback
 		targetID = strings.TrimSpace(data.ConversationId)
 	}
 	if targetID == "" {
-		return errors.New("dingtalk inbound message has no target identifier")
+		return errors.New("dingtalk inbound message has no staff or conversation identifier")
 	}
 	target := peerKindTarget(peerKind) + ":" + targetID
 	if data.SessionWebhook != "" && d.endpoints != nil {
@@ -326,41 +360,48 @@ func splitDingTalkMarkdown(text string, limit int) []string {
 }
 
 func (d *DingTalk) sendProactiveMarkdown(kind, targetID, text string) error {
-	token, err := d.getAccessToken(context.Background(), false)
+	chunks := splitDingTalkMarkdown(text, dingtalkMarkdownLimit)
+	for i, chunk := range chunks {
+		if err := d.sendProactive(context.Background(), kind, targetID, "sampleMarkdown", map[string]string{
+			"title": sessionChunkTitle(i, len(chunks)), "text": chunk,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *DingTalk) sendProactive(ctx context.Context, kind, targetID, msgKey string, msgParam map[string]string) error {
+	path := "/v1.0/robot/oToMessages/batchSend"
+	payload := map[string]any{
+		"robotCode": d.clientID, "msgKey": msgKey, "msgParam": mustJSON(msgParam),
+	}
+	if kind == "group" {
+		path = "/v1.0/robot/groupMessages/send"
+		payload["openConversationId"] = targetID
+	} else {
+		payload["userIds"] = []string{targetID}
+	}
+	token, err := d.getAccessToken(ctx, false)
 	if err != nil {
 		return err
 	}
-	chunks := splitDingTalkMarkdown(text, dingtalkMarkdownLimit)
-	for i, chunk := range chunks {
-		payload := map[string]any{
-			"robotCode": d.clientID,
-			"msgKey":    "sampleMarkdown",
-			"msgParam":  mustJSON(map[string]string{"title": sessionChunkTitle(i, len(chunks)), "text": chunk}),
+	status, _, err := d.postJSON(ctx, d.apiBase+path, payload, token)
+	if err != nil {
+		return fmt.Errorf("dingtalk proactive send: %w", err)
+	}
+	if status == http.StatusUnauthorized {
+		token, err = d.getAccessToken(ctx, true)
+		if err != nil {
+			return err
 		}
-		path := "/v1.0/robot/oToMessages/batchSend"
-		if kind == "group" {
-			path = "/v1.0/robot/groupMessages/send"
-			payload["openConversationId"] = targetID
-		} else {
-			payload["userIds"] = []string{targetID}
-		}
-		status, _, sendErr := d.postJSON(context.Background(), d.apiBase+path, payload, token)
-		if sendErr != nil {
-			return fmt.Errorf("dingtalk proactive send: %w", sendErr)
-		}
-		if status == http.StatusUnauthorized {
-			token, err = d.getAccessToken(context.Background(), true)
-			if err != nil {
-				return err
-			}
-			status, _, sendErr = d.postJSON(context.Background(), d.apiBase+path, payload, token)
-		}
-		if sendErr != nil {
-			return fmt.Errorf("dingtalk proactive send: %w", sendErr)
-		}
-		if status < 200 || status >= 300 {
-			return fmt.Errorf("dingtalk proactive send: HTTP %d", status)
-		}
+		status, _, err = d.postJSON(ctx, d.apiBase+path, payload, token)
+	}
+	if err != nil {
+		return fmt.Errorf("dingtalk proactive send: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("dingtalk proactive send: HTTP %d", status)
 	}
 	return nil
 }
@@ -463,51 +504,66 @@ func (d *DingTalk) uploadMedia(ctx context.Context, item bus.MediaItem, mediaTyp
 	if err != nil {
 		return "", err
 	}
+	mediaID, authRejected, err := d.uploadMediaWithToken(ctx, item, mediaType, token)
+	if !authRejected {
+		return mediaID, err
+	}
+	token, err = d.getAccessToken(ctx, true)
+	if err != nil {
+		return "", err
+	}
+	mediaID, _, err = d.uploadMediaWithToken(ctx, item, mediaType, token)
+	return mediaID, err
+}
+
+func (d *DingTalk) uploadMediaWithToken(ctx context.Context, item bus.MediaItem, mediaType, token string) (string, bool, error) {
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 	part, err := w.CreateFormFile("media", filepath.Base(item.Filename))
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if _, err := part.Write(item.Bytes); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := w.Close(); err != nil {
-		return "", err
+		return "", false, err
 	}
 	values := url.Values{"access_token": {token}, "type": {mediaType}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.oapiBase+"/media/upload?"+values.Encode(), &body)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	req.Header.Set("Content-Type", w.FormDataContentType())
 	resp, err := d.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("dingtalk media upload: %w", err)
+		// The request URL contains the access token, so never wrap the
+		// transport error (net/http includes the URL in its text).
+		return "", false, errors.New("dingtalk media upload request failed")
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("dingtalk media upload: HTTP %d", resp.StatusCode)
+		return "", resp.StatusCode == http.StatusUnauthorized, fmt.Errorf("dingtalk media upload: HTTP %d", resp.StatusCode)
 	}
 	var result struct {
 		ErrCode int    `json:"errcode"`
 		MediaID string `json:"media_id"`
 	}
-	if json.Unmarshal(raw, &result) != nil || result.ErrCode != 0 || result.MediaID == "" {
-		return "", errors.New("dingtalk media upload rejected")
+	if json.Unmarshal(raw, &result) != nil {
+		return "", false, errors.New("dingtalk media upload response invalid")
 	}
-	return result.MediaID, nil
+	authRejected := result.ErrCode == 40014 || result.ErrCode == 42001
+	if result.ErrCode != 0 || result.MediaID == "" {
+		return "", authRejected, errors.New("dingtalk media upload rejected")
+	}
+	return result.MediaID, false, nil
 }
 
 func (d *DingTalk) sendProactiveMedia(ctx context.Context, kind, targetID string, item bus.MediaItem, mediaType, mediaID string) error {
-	token, err := d.getAccessToken(ctx, false)
-	if err != nil {
-		return err
-	}
 	msgKey := "sampleFile"
 	msgParam := map[string]string{
 		"mediaId": mediaID, "fileName": filepath.Base(item.Filename),
@@ -517,24 +573,7 @@ func (d *DingTalk) sendProactiveMedia(ctx context.Context, kind, targetID string
 		msgKey = "sampleImageMsg"
 		msgParam = map[string]string{"photoURL": mediaID}
 	}
-	payload := map[string]any{
-		"robotCode": d.clientID, "msgKey": msgKey, "msgParam": mustJSON(msgParam),
-	}
-	path := "/v1.0/robot/oToMessages/batchSend"
-	if kind == "group" {
-		path = "/v1.0/robot/groupMessages/send"
-		payload["openConversationId"] = targetID
-	} else {
-		payload["userIds"] = []string{targetID}
-	}
-	status, _, err := d.postJSON(ctx, d.apiBase+path, payload, token)
-	if err != nil {
-		return fmt.Errorf("dingtalk media send: %w", err)
-	}
-	if status < 200 || status >= 300 {
-		return fmt.Errorf("dingtalk media send: HTTP %d", status)
-	}
-	return nil
+	return d.sendProactive(ctx, kind, targetID, msgKey, msgParam)
 }
 
 func dingtalkContentFields(content any) (downloadCode, filename string) {

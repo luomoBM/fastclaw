@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -251,6 +252,17 @@ func TestDingTalkGroupRequiresBotMention(t *testing.T) {
 	}
 }
 
+func TestDingTalkDirectMessageRequiresStaffIDForTypedTarget(t *testing.T) {
+	d, _ := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{})
+	err := d.handleCallback(context.Background(), &chatbot.BotCallbackDataModel{
+		ConversationType: "1", MsgId: "msg-opaque", Msgtype: "text",
+		SenderId: "opaque-sender", Text: chatbot.BotCallbackDataTextModel{Content: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "staff") {
+		t.Fatalf("missing staff ID error = %v", err)
+	}
+}
+
 func TestDingTalkInboundImageDownloadsIntoMediaItem(t *testing.T) {
 	imageBytes := []byte("fake-png")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -344,5 +356,84 @@ func TestDingTalkOutboundImageUploadsThenSendsProactively(t *testing.T) {
 	}
 	if !uploaded.Load() || !sent.Load() {
 		t.Fatalf("uploaded=%v sent=%v", uploaded.Load(), sent.Load())
+	}
+}
+
+func TestDingTalkOutboundImagePrefersSessionMarkdown(t *testing.T) {
+	var sessionBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/media/upload":
+			_, _ = w.Write([]byte(`{"errcode":0,"media_id":"media-1"}`))
+		case "/session":
+			raw, _ := io.ReadAll(r.Body)
+			sessionBody = string(raw)
+			_, _ = w.Write([]byte(`{"errcode":0}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	endpoints := &memoryReplyEndpoints{values: map[string]string{
+		"dingtalk|ding-client|user:staff-1": server.URL + "/session",
+	}}
+	d, _ := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), endpoints)
+	d.httpClient = server.Client()
+	d.apiBase, d.oapiBase = server.URL, server.URL
+	err := d.SendMessage(bus.OutboundMessage{
+		ChatID: "user:staff-1", Text: "caption",
+		MediaItems: []bus.MediaItem{{Filename: "photo.png", ContentType: "image/png", Bytes: []byte("png-data")}},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if !strings.Contains(sessionBody, "caption") || !strings.Contains(sessionBody, `![photo.png](media-1)`) {
+		t.Fatalf("session body = %s", sessionBody)
+	}
+}
+
+func TestDingTalkOutboundMediaRefreshesRejectedToken(t *testing.T) {
+	var tokenCalls, uploadCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			n := tokenCalls.Add(1)
+			_, _ = fmt.Fprintf(w, `{"accessToken":"token-%d","expireIn":7200}`, n)
+		case "/media/upload":
+			n := uploadCalls.Add(1)
+			if n == 1 {
+				_, _ = w.Write([]byte(`{"errcode":40014}`))
+				return
+			}
+			if r.URL.Query().Get("access_token") != "token-2" {
+				t.Fatalf("refreshed upload token = %q", r.URL.Query().Get("access_token"))
+			}
+			_, _ = w.Write([]byte(`{"errcode":0,"media_id":"media-2"}`))
+		case "/v1.0/robot/oToMessages/batchSend":
+			if r.Header.Get("x-acs-dingtalk-access-token") != "token-2" {
+				t.Fatalf("send token = %q", r.Header.Get("x-acs-dingtalk-access-token"))
+			}
+			_, _ = w.Write([]byte(`{"processQueryKey":"sent"}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, _ := NewDingTalk("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{})
+	d.httpClient = server.Client()
+	d.apiBase, d.oapiBase = server.URL, server.URL
+	err := d.SendMessage(bus.OutboundMessage{
+		ChatID:     "user:staff-1",
+		MediaItems: []bus.MediaItem{{Filename: "file.txt", ContentType: "text/plain", Bytes: []byte("data")}},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if tokenCalls.Load() != 2 || uploadCalls.Load() != 2 {
+		t.Fatalf("token calls=%d upload calls=%d", tokenCalls.Load(), uploadCalls.Load())
 	}
 }

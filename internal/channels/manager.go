@@ -11,12 +11,15 @@ import (
 
 // Manager manages all channel instances and routes outbound messages.
 type Manager struct {
-	mu        sync.Mutex
-	replaceMu sync.Mutex
-	channels  map[string]Channel // key: "channel:accountID"
+	mu       sync.Mutex
+	channels map[string]Channel // key: "channel:accountID"
+	// generations assigns ownership of a launch to the most recent register
+	// or unregister operation for a key. A stale replacement may finish
+	// waiting for its predecessor, but it cannot launch afterward.
+	generations map[string]uint64
 	// active holds cancellable channel runs. Replacing or unregistering a
-	// channel cancels the old run and waits for Start to return before a new
-	// instance is launched for the same key.
+	// channel cancels the old run; replacement waits for Start to return before
+	// launching the current generation for the same key.
 	active map[string]*channelRun
 	// singleton tracks which registered channels are gated by the
 	// Leaser (one process at a time per (channel, accountID)). Set by
@@ -64,13 +67,14 @@ func NewManagerWithLeaser(mb *bus.MessageBus, leaser Leaser, holderID string) *M
 		leaser = NopLeaser{}
 	}
 	return &Manager{
-		channels:  make(map[string]Channel),
-		active:    make(map[string]*channelRun),
-		singleton: make(map[string]struct{}),
-		tgTokens:  make(map[string]struct{}),
-		bus:       mb,
-		leaser:    leaser,
-		holderID:  holderID,
+		channels:    make(map[string]Channel),
+		generations: make(map[string]uint64),
+		active:      make(map[string]*channelRun),
+		singleton:   make(map[string]struct{}),
+		tgTokens:    make(map[string]struct{}),
+		bus:         mb,
+		leaser:      leaser,
+		holderID:    holderID,
 	}
 }
 
@@ -97,6 +101,7 @@ func (m *Manager) Register(ch Channel) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := channelKey(ch.Name(), ch.AccountID())
+	m.generations[key]++
 	m.channels[key] = ch
 }
 
@@ -111,6 +116,7 @@ func (m *Manager) RegisterSingleton(ch Channel) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := channelKey(ch.Name(), ch.AccountID())
+	m.generations[key]++
 	m.channels[key] = ch
 	m.singleton[key] = struct{}{}
 }
@@ -134,13 +140,11 @@ func (m *Manager) RegisterSingletonAndStart(ch Channel) {
 }
 
 func (m *Manager) registerAndStart(ch Channel, singleton bool) {
-	// Serialize replacements so concurrent hot-connect requests cannot both
-	// observe the same prior run and leave routing pointed at the wrong one.
-	m.replaceMu.Lock()
-	defer m.replaceMu.Unlock()
 	m.mu.Lock()
 	key := channelKey(ch.Name(), ch.AccountID())
 	previous := m.active[key]
+	m.generations[key]++
+	generation := m.generations[key]
 	m.channels[key] = ch
 	if singleton {
 		m.singleton[key] = struct{}{}
@@ -156,7 +160,7 @@ func (m *Manager) registerAndStart(ch Channel, singleton bool) {
 	if ctx == nil {
 		return
 	}
-	m.launchChannel(ctx, key, ch, singleton, leaser, holderID, true)
+	m.launchChannel(ctx, key, generation, ch, singleton, leaser, holderID, true)
 }
 
 // Unregister removes a channel from the routing table and signals its
@@ -167,6 +171,7 @@ func (m *Manager) Unregister(channelType, accountID string) {
 	m.mu.Lock()
 	key := channelKey(channelType, accountID)
 	run := m.active[key]
+	m.generations[key]++
 	delete(m.channels, key)
 	delete(m.singleton, key)
 	m.mu.Unlock()
@@ -181,8 +186,10 @@ func (m *Manager) Start(ctx context.Context) {
 	m.rootCtx = ctx
 	chans := make(map[string]Channel, len(m.channels))
 	singletons := make(map[string]bool, len(m.channels))
+	generations := make(map[string]uint64, len(m.channels))
 	for k, v := range m.channels {
 		chans[k] = v
+		generations[k] = m.generations[k]
 		_, singletons[k] = m.singleton[k]
 	}
 	leaser := m.leaser
@@ -201,7 +208,7 @@ func (m *Manager) Start(ctx context.Context) {
 	// Start each channel
 	for key, ch := range chans {
 		singleton := singletons[key]
-		run := m.launchChannel(ctx, key, ch, singleton, leaser, holderID, false)
+		run := m.launchChannel(ctx, key, generations[key], ch, singleton, leaser, holderID, false)
 		if run != nil {
 			wg.Add(1)
 			go func(done <-chan struct{}) {
@@ -214,10 +221,15 @@ func (m *Manager) Start(ctx context.Context) {
 	wg.Wait()
 }
 
-func (m *Manager) launchChannel(parent context.Context, key string, ch Channel, singleton bool, leaser Leaser, holderID string, hot bool) *channelRun {
+func (m *Manager) launchChannel(parent context.Context, key string, generation uint64, ch Channel, singleton bool, leaser Leaser, holderID string, hot bool) *channelRun {
 	ctx, cancel := context.WithCancel(parent)
 	run := &channelRun{cancel: cancel, done: make(chan struct{})}
 	m.mu.Lock()
+	if m.generations[key] != generation {
+		m.mu.Unlock()
+		cancel()
+		return nil
+	}
 	if existing := m.active[key]; existing != nil {
 		m.mu.Unlock()
 		cancel()
