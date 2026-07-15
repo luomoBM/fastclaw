@@ -11,6 +11,7 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.6.1
 	github.com/lib/pq v1.12.3
 	github.com/minio/minio-go/v7 v7.0.100
+	github.com/open-dingtalk/dingtalk-stream-sdk-go v0.9.1
 	github.com/redis/go-redis/v9 v9.17.0
 	github.com/slack-go/slack v0.19.0
 	github.com/spf13/cobra v1.10.2

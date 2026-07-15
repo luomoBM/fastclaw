@@ -7,6 +7,7 @@ const ASSETS: Record<string, string> = {
   slack: "/channels/slack.svg",
   line: "/channels/line.png",
   feishu: "/channels/feishu.png",
+  dingtalk: "/channels/dingtalk.svg",
   wechat: "/channels/wechat.svg",
 };
 
@@ -55,6 +56,8 @@ export function channelLabel(channel?: string): string {
       return "Slack";
     case "feishu":
       return "Feishu";
+    case "dingtalk":
+      return "DingTalk";
     case "web":
     case "":
     case undefined:

@@ -34,7 +34,7 @@ import (
 type channelOut struct {
 	Type           string `json:"type"`
 	AccountID      string `json:"accountId"`
-	BotUsername     string `json:"botUsername,omitempty"`
+	BotUsername    string `json:"botUsername,omitempty"`
 	BotToken       string `json:"botToken"` // masked
 	Enabled        bool   `json:"enabled"`
 	SharedIdentity bool   `json:"sharedIdentity"`
@@ -225,7 +225,7 @@ func flattenChannelRecords(rows []store.ChannelRecord, source string) []channelO
 			out = append(out, channelOut{
 				Type:           rec.Type,
 				AccountID:      accountID,
-				BotUsername:     accountID,
+				BotUsername:    accountID,
 				BotToken:       maskAPIKey(tok),
 				Enabled:        rec.Enabled,
 				SharedIdentity: rec.SharedIdentity,
@@ -401,6 +401,9 @@ func (s *Server) handleDisconnectAgentChannel(w http.ResponseWriter, r *http.Req
 			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
+		if channelType == "dingtalk" {
+			_ = s.dataStore.DeleteChannelReplyEndpoints(r.Context(), channelType, accountID)
+		}
 		// Drop the matching binding too.
 		if err := s.removeBinding(r, "", "", id, channelType, accountID); err != nil {
 			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -412,6 +415,67 @@ func (s *Server) handleDisconnectAgentChannel(w http.ResponseWriter, r *http.Req
 		return
 	}
 	jsonResponse(w, http.StatusNotFound, map[string]any{"error": "binding not found"})
+}
+
+// --- DingTalk ---
+
+type connectDingTalkRequest struct {
+	ClientID     string `json:"clientId"`
+	ClientSecret string `json:"clientSecret"`
+}
+
+var validateDingTalkCredentials = channels.DingTalkValidateCredentials
+
+func (s *Server) handleConnectAgentDingTalk(w http.ResponseWriter, r *http.Request) {
+	if !s.requireWritable(w, r) {
+		return
+	}
+	agentID := r.PathValue("id")
+	uid, aid, ok := s.resolveChannelBindingScope(w, r, agentID)
+	if !ok {
+		return
+	}
+	var req connectDingTalkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	clientID := strings.TrimSpace(req.ClientID)
+	clientSecret := strings.TrimSpace(req.ClientSecret)
+	if clientID == "" || clientSecret == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "clientId and clientSecret required"})
+		return
+	}
+	if err := validateDingTalkCredentials(r.Context(), clientID, clientSecret); err != nil {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	cc := config.ChannelConfig{
+		Enabled: true,
+		Accounts: map[string]config.AccountConfig{
+			clientID: {BotToken: clientSecret, UseLongConn: true},
+		},
+	}
+	if err := s.assertChannelCredentialUniqueOpt(r, "dingtalk", clientID, "", uid, aid, true); err != nil {
+		jsonResponse(w, http.StatusConflict, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.saveChannelRecord(r.Context(), uid, aid, "dingtalk", clientID, true, cc); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	if err := s.appendBinding(r, "", "", config.Binding{
+		AgentID: agentID,
+		Match:   config.Match{Channel: "dingtalk", AccountID: clientID},
+	}); err != nil {
+		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	s.invalidateOwner(uid, aid)
+	if ch, err := s.dataStore.LookupChannel(r.Context(), "dingtalk", clientID); err == nil && ch != nil {
+		s.hotRegisterChannelRecord(*ch)
+	}
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "clientId": clientID})
 }
 
 // appendBinding / removeBinding used to maintain a kind=setting,
@@ -1235,11 +1299,11 @@ func (s *Server) handleConnectAgentLINE(w http.ResponseWriter, r *http.Request) 
 		s.hotRegisterChannelRecord(*ch)
 	}
 	jsonResponse(w, http.StatusOK, map[string]any{
-		"ok":          true,
-		"botUserId":   userID,
-		"botName":     displayName,
-		"basicId":     basicID,
-		"webhookUrl":  lineWebhookPathFor(r, userID),
+		"ok":         true,
+		"botUserId":  userID,
+		"botName":    displayName,
+		"basicId":    basicID,
+		"webhookUrl": lineWebhookPathFor(r, userID),
 	})
 }
 

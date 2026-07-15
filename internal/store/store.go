@@ -239,6 +239,11 @@ type Store interface {
 	SaveChannel(ctx context.Context, ch *ChannelRecord) error
 	DeleteChannel(ctx context.Context, id string) error
 	LookupChannel(ctx context.Context, channelType, accountID string) (*ChannelRecord, error)
+	// Channel reply endpoints are short-lived, secret delivery URLs supplied
+	// by an inbound platform event (for example DingTalk sessionWebhook).
+	SaveChannelReplyEndpoint(ctx context.Context, channel, accountID, target, endpoint string, expiresAt time.Time) error
+	GetChannelReplyEndpoint(ctx context.Context, channel, accountID, target string) (string, error)
+	DeleteChannelReplyEndpoints(ctx context.Context, channel, accountID string) error
 
 	// --- Cron jobs (per agent) ---
 	//
@@ -621,7 +626,7 @@ type ChannelRecord struct {
 	ID             string `json:"id"`
 	UserID         string `json:"userId"`    // who bound this channel
 	AgentID        string `json:"agentId"`   // which agent it routes to
-	Type           string `json:"type"`      // wechat / telegram / discord / slack / line / feishu
+	Type           string `json:"type"`      // wechat / telegram / discord / slack / line / feishu / dingtalk
 	AccountID      string `json:"accountId"` // bot unique identifier (credential_key equivalent)
 	Enabled        bool   `json:"enabled"`
 	BotToken       string `json:"botToken,omitempty"`

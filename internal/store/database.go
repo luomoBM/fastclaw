@@ -401,7 +401,7 @@ func (d *DBStore) migrateUsersAddOwnerUserID(ctx context.Context) error {
 	}
 	// 2. Rows with IM-channel external_id but apikey_id is a user_id
 	//    (legacy platform-scoped namespace) → chatter
-	for _, ch := range []string{"wechat", "telegram", "discord", "line", "feishu", "slack"} {
+	for _, ch := range []string{"wechat", "telegram", "discord", "line", "feishu", "dingtalk", "slack"} {
 		if _, err := d.db.ExecContext(ctx, fmt.Sprintf(`
 			UPDATE users SET
 				role = 'channel_user',
@@ -1851,6 +1851,16 @@ func (d *DBStore) migrationSQL() []string {
 			UNIQUE (type, account_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_channels_user ON channels (user_id, agent_id)`,
+		`CREATE TABLE IF NOT EXISTS channel_reply_endpoints (
+			channel TEXT NOT NULL,
+			account_id TEXT NOT NULL,
+			target TEXT NOT NULL,
+			endpoint TEXT NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (channel, account_id, target)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_channel_reply_endpoints_expires ON channel_reply_endpoints (expires_at)`,
 	}
 }
 
@@ -4181,6 +4191,51 @@ func (d *DBStore) ReleaseChannelLease(ctx context.Context, channel, accountID, h
 			`DELETE FROM channel_leases WHERE channel = ? AND account_id = ? AND holder_id = ?`,
 			channel, accountID, holderID)
 	}
+	return err
+}
+
+// --- Short-lived channel reply endpoints ---
+
+func (d *DBStore) SaveChannelReplyEndpoint(ctx context.Context, channel, accountID, target, endpoint string, expiresAt time.Time) error {
+	if channel == "" || accountID == "" || target == "" || endpoint == "" {
+		return errors.New("channel reply endpoint requires channel, account, target, and endpoint")
+	}
+	q := `INSERT INTO channel_reply_endpoints (channel, account_id, target, endpoint, expires_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT (channel, account_id, target) DO UPDATE SET
+		endpoint = excluded.endpoint, expires_at = excluded.expires_at, updated_at = excluded.updated_at`
+	if d.dialect == "postgres" {
+		q = `INSERT INTO channel_reply_endpoints (channel, account_id, target, endpoint, expires_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6)
+			ON CONFLICT (channel, account_id, target) DO UPDATE SET
+			endpoint = EXCLUDED.endpoint, expires_at = EXCLUDED.expires_at, updated_at = EXCLUDED.updated_at`
+	}
+	_, err := d.db.ExecContext(ctx, q, channel, accountID, target, endpoint, expiresAt.UTC(), time.Now().UTC())
+	return err
+}
+
+func (d *DBStore) GetChannelReplyEndpoint(ctx context.Context, channel, accountID, target string) (string, error) {
+	q := fmt.Sprintf(`SELECT endpoint FROM channel_reply_endpoints
+		WHERE channel = %s AND account_id = %s AND target = %s AND expires_at > %s`,
+		d.ph(1), d.ph(2), d.ph(3), d.ph(4))
+	var endpoint string
+	err := d.db.QueryRowContext(ctx, q, channel, accountID, target, time.Now().UTC()).Scan(&endpoint)
+	if errors.Is(err, sql.ErrNoRows) {
+		deleteQ := fmt.Sprintf(`DELETE FROM channel_reply_endpoints
+			WHERE channel = %s AND account_id = %s AND target = %s AND expires_at <= %s`,
+			d.ph(1), d.ph(2), d.ph(3), d.ph(4))
+		_, _ = d.db.ExecContext(ctx, deleteQ, channel, accountID, target, time.Now().UTC())
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", err
+	}
+	return endpoint, nil
+}
+
+func (d *DBStore) DeleteChannelReplyEndpoints(ctx context.Context, channel, accountID string) error {
+	q := fmt.Sprintf(`DELETE FROM channel_reply_endpoints WHERE channel = %s AND account_id = %s`, d.ph(1), d.ph(2))
+	_, err := d.db.ExecContext(ctx, q, channel, accountID)
 	return err
 }
 

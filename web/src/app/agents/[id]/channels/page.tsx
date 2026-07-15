@@ -42,6 +42,7 @@ import {
   connectAgentSlack,
   connectAgentLINE,
   connectAgentFeishu,
+  connectAgentDingTalk,
   startAgentWeChatLogin,
   pollAgentWeChatLoginStatus,
   disconnectAgentChannel,
@@ -94,6 +95,12 @@ const CATALOG: { type: string; label: string; description: string; available: bo
     description: "Connect a Feishu custom-app bot via webhook (App ID + App Secret).",
     available: true,
   },
+  {
+    type: "dingtalk",
+    label: "DingTalk",
+    description: "Connect a DingTalk internal-app bot via Stream mode (Client ID + Client Secret).",
+    available: true,
+  },
 ];
 
 export default function AgentChannelsPage() {
@@ -110,6 +117,7 @@ export default function AgentChannelsPage() {
   const [lineOpen, setLineOpen] = useState(false);
   const [wechatOpen, setWechatOpen] = useState(false);
   const [feishuOpen, setFeishuOpen] = useState(false);
+  const [dingtalkOpen, setDingTalkOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<AgentChannel | null>(null);
 
   const refresh = useCallback(() => {
@@ -197,6 +205,7 @@ export default function AgentChannelsPage() {
                   else if (entry.type === "line") setLineOpen(true);
                   else if (entry.type === "wechat") setWechatOpen(true);
                   else if (entry.type === "feishu") setFeishuOpen(true);
+                  else if (entry.type === "dingtalk") setDingTalkOpen(true);
                 }}
               />
             );
@@ -242,6 +251,13 @@ export default function AgentChannelsPage() {
       <ConnectFeishuDialog
         open={feishuOpen}
         onOpenChange={setFeishuOpen}
+        agentId={agentId}
+        onConnected={refresh}
+      />
+
+      <ConnectDingTalkDialog
+        open={dingtalkOpen}
+        onOpenChange={setDingTalkOpen}
         agentId={agentId}
         onConnected={refresh}
       />
@@ -388,6 +404,7 @@ function ChannelIcon({ type }: { type: string }) {
     slack: "/channels/slack.svg",
     line: "/channels/line.png",
     feishu: "/channels/feishu.png",
+    dingtalk: "/channels/dingtalk.svg",
     wechat: "/channels/wechat.svg",
   };
   if (asset[type]) {
@@ -1379,6 +1396,149 @@ function ConnectFeishuDialog({
               <Button
                 onClick={submit}
                 disabled={submitting || !appId.trim() || !appSecret.trim()}
+              >
+                {submitting ? "Validating…" : "Connect"}
+              </Button>
+            </>
+          )}
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function ConnectDingTalkDialog({
+  open,
+  onOpenChange,
+  agentId,
+  onConnected,
+}: {
+  open: boolean;
+  onOpenChange: (v: boolean) => void;
+  agentId: string;
+  onConnected: () => void;
+}) {
+  const [clientId, setClientId] = useState("");
+  const [clientSecret, setClientSecret] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const [connected, setConnected] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setClientId("");
+      setClientSecret("");
+      setSubmitting(false);
+      setError("");
+      setConnected(false);
+    }
+  }, [open]);
+
+  const submit = async () => {
+    if (!agentId || !clientId.trim() || !clientSecret.trim()) return;
+    setSubmitting(true);
+    setError("");
+    const res = await connectAgentDingTalk(
+      agentId,
+      clientId.trim(),
+      clientSecret.trim(),
+    );
+    setSubmitting(false);
+    if (res.error || !res.ok) {
+      setError(res.error || "Failed to connect");
+      return;
+    }
+    setConnected(true);
+    onConnected();
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <img
+              src="/channels/dingtalk.svg"
+              alt="DingTalk"
+              className="h-5 w-5 object-contain"
+            />
+            Connect DingTalk app
+          </DialogTitle>
+          <DialogDescription>
+            Create an internal app in the{" "}
+            <a
+              href="https://open-dev.dingtalk.com/"
+              target="_blank"
+              rel="noreferrer"
+              className="underline"
+            >
+              DingTalk Developer Console
+            </a>
+            , enable the robot capability and Stream mode, then copy its{" "}
+            <strong>Client ID</strong> and <strong>Client Secret</strong>. CorpId
+            and AgentId are not required.
+          </DialogDescription>
+        </DialogHeader>
+
+        {connected ? (
+          <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+              <span className="text-sm font-medium">Credentials valid</span>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              fastclaw is opening the DingTalk Stream connection. Direct
+              messages and group messages that explicitly @ the bot will be
+              forwarded to this agent.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-3 py-2">
+            <div className="rounded-lg border bg-muted/30 p-3 text-xs text-muted-foreground">
+              No public webhook URL is needed. Grant the app robot message and
+              media permissions before connecting.
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="dingtalk-client-id">Client ID</Label>
+              <Input
+                id="dingtalk-client-id"
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                placeholder="ding..."
+                className="font-mono text-sm"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="dingtalk-client-secret">Client Secret</Label>
+              <Input
+                id="dingtalk-client-secret"
+                value={clientSecret}
+                onChange={(e) => setClientSecret(e.target.value)}
+                placeholder="..."
+                type="password"
+                className="font-mono text-sm"
+              />
+            </div>
+            {error && <p className="text-xs text-destructive">{error}</p>}
+          </div>
+        )}
+
+        <DialogFooter>
+          {connected ? (
+            <Button onClick={() => onOpenChange(false)}>Done</Button>
+          ) : (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => onOpenChange(false)}
+                disabled={submitting}
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={submit}
+                disabled={submitting || !clientId.trim() || !clientSecret.trim()}
               >
                 {submitting ? "Validating…" : "Connect"}
               </Button>

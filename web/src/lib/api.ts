@@ -1740,11 +1740,11 @@ export async function bindAgent(agentId: string, apiKeyId: string): Promise<{ ok
   return res.json();
 }
 
-// --- Per-agent IM channels (Telegram, ...) ---
+// --- Per-agent IM channels ---
 
 export interface AgentChannel {
-  type: string;        // "telegram"
-  accountId: string;   // bot username for Telegram
+  type: string;        // e.g. "telegram" or "dingtalk"
+  accountId: string;   // channel-specific stable account identifier
   botUsername?: string;
   botToken: string;    // server-masked
   enabled: boolean;
@@ -1923,6 +1923,19 @@ export async function connectAgentFeishu(
       encryptKey,
       useLongConn,
     }),
+  });
+  return res.json();
+}
+
+export async function connectAgentDingTalk(
+  agentId: string,
+  clientId: string,
+  clientSecret: string,
+): Promise<{ ok: boolean; clientId?: string; error?: string }> {
+  const res = await apiFetch(`/api/agents/${agentId}/channels/dingtalk`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ clientId, clientSecret }),
   });
   return res.json();
 }

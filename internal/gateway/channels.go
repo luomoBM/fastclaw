@@ -55,6 +55,8 @@ func registerChannelInstance(rec store.ConfigRecord, mb *bus.MessageBus, chanMgr
 		return registerWeChatChannels(rec, cc, mb, chanMgr, st, hot)
 	case "feishu":
 		return registerFeishuChannels(cc, mb, chanMgr, hot)
+	case "dingtalk":
+		return registerDingTalkChannels(cc, mb, chanMgr, st, hot)
 	}
 	return nil
 }
@@ -77,6 +79,8 @@ func registerChannelFromRecord(rec store.ChannelRecord, mb *bus.MessageBus, chan
 		return registerWeChatChannels(cfgRec, cc, mb, chanMgr, st, hot)
 	case "feishu":
 		return registerFeishuChannels(cc, mb, chanMgr, hot)
+	case "dingtalk":
+		return registerDingTalkChannels(cc, mb, chanMgr, st, hot)
 	}
 	return nil
 }
@@ -283,6 +287,21 @@ func registerFeishuChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chan
 	return nil
 }
 
+func registerDingTalkChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, st store.Store, hot bool) error {
+	for clientID, acct := range chCfg.Accounts {
+		secret := acct.BotToken
+		if secret == "" {
+			secret = chCfg.BotToken
+		}
+		dt, err := channels.NewDingTalk(clientID, secret, clientID, mb, st)
+		if err != nil {
+			return err
+		}
+		registerSingleton(chanMgr, dt, hot)
+	}
+	return nil
+}
+
 func registerWeChatChannels(rec store.ConfigRecord, chCfg config.ChannelConfig, mb *bus.MessageBus, chanMgr *channels.Manager, st store.Store, hot bool) error {
 	// WeChat is multi-account by design — every QR scan mints a new
 	// (botToken, ilink_user_id, baseURL) triple keyed under a fresh
@@ -361,4 +380,3 @@ func purgeWeChatAccount(st store.Store, rowID, deadAccount string) error {
 	rec.Data = data
 	return st.SaveConfig(ctx, rec)
 }
-
