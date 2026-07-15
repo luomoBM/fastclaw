@@ -52,3 +52,22 @@ func TestDeleteChannelReplyEndpointsRemovesOnlyOneAccount(t *testing.T) {
 		t.Fatalf("other account endpoint was removed: %v", err)
 	}
 }
+
+func TestSavingReplyEndpointPurgesOtherExpiredSecrets(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+	ctx := context.Background()
+	if err := db.SaveChannelReplyEndpoint(ctx, "dingtalk", "old-app", "user:old", "https://expired.invalid/hook", time.Now().Add(-time.Second)); err != nil {
+		t.Fatalf("save expired endpoint: %v", err)
+	}
+	if err := db.SaveChannelReplyEndpoint(ctx, "dingtalk", "new-app", "user:new", "https://fresh.invalid/hook", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("save fresh endpoint: %v", err)
+	}
+	var count int
+	if err := db.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM channel_reply_endpoints WHERE account_id = ?`, "old-app").Scan(&count); err != nil {
+		t.Fatalf("count expired endpoints: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expired endpoint count = %d, want 0", count)
+	}
+}

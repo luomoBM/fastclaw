@@ -17,10 +17,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
-	dingstream "github.com/open-dingtalk/dingtalk-stream-sdk-go/client"
-
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
 )
 
 const dingtalkReplyEndpointFallbackTTL = time.Hour
@@ -54,6 +52,8 @@ type DingTalk struct {
 
 	botMu     sync.RWMutex
 	botUserID string
+
+	streamClientFactory func() dingTalkStreamClient
 }
 
 func NewDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, endpoints ChannelReplyEndpointStore) (*DingTalk, error) {
@@ -66,12 +66,14 @@ func NewDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, e
 	if mb == nil {
 		return nil, errors.New("dingtalk: message bus is required")
 	}
-	return &DingTalk{
+	d := &DingTalk{
 		clientID: clientID, clientSecret: clientSecret, accountID: accountID,
 		bus: mb, endpoints: endpoints,
 		httpClient: &http.Client{Timeout: 15 * time.Second}, apiBase: dingtalkDefaultAPIBase,
 		oapiBase: "https://oapi.dingtalk.com",
-	}, nil
+	}
+	d.streamClientFactory = d.newStreamClient
+	return d, nil
 }
 
 func DingTalkValidateCredentials(ctx context.Context, clientID, clientSecret string) error {
@@ -114,25 +116,6 @@ func (d *DingTalk) BotUsername() string {
 	d.botMu.RLock()
 	defer d.botMu.RUnlock()
 	return d.botUserID
-}
-
-func (d *DingTalk) Start(ctx context.Context) error {
-	cli := dingstream.NewStreamClient(
-		dingstream.WithAppCredential(dingstream.NewAppCredentialConfig(d.clientID, d.clientSecret)),
-		// The SDK's reconnect loop uses context.Background and exposes its
-		// control flag without synchronization, so it cannot be stopped safely.
-		// Manager-level lifecycle ownership is preferable to a leaked reconnect.
-		dingstream.WithAutoReconnect(false),
-	)
-	cli.RegisterChatBotCallbackRouter(func(callbackCtx context.Context, data *chatbot.BotCallbackDataModel) ([]byte, error) {
-		return nil, d.handleCallback(callbackCtx, data)
-	})
-	if err := cli.Start(ctx); err != nil {
-		return fmt.Errorf("dingtalk stream start: %w", err)
-	}
-	<-ctx.Done()
-	cli.Close()
-	return nil
 }
 
 func (d *DingTalk) Send(chatID, text string) error {

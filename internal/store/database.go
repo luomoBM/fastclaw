@@ -4200,6 +4200,13 @@ func (d *DBStore) SaveChannelReplyEndpoint(ctx context.Context, channel, account
 	if channel == "" || accountID == "" || target == "" || endpoint == "" {
 		return errors.New("channel reply endpoint requires channel, account, target, and endpoint")
 	}
+	// Opportunistically purge every expired secret whenever fresh endpoint
+	// traffic arrives. This bounds retention without a separate scheduler and
+	// works for both SQLite and Postgres.
+	cleanupQ := fmt.Sprintf(`DELETE FROM channel_reply_endpoints WHERE expires_at <= %s`, d.ph(1))
+	if _, err := d.db.ExecContext(ctx, cleanupQ, time.Now().UTC()); err != nil {
+		return fmt.Errorf("purge expired channel reply endpoints: %w", err)
+	}
 	q := `INSERT INTO channel_reply_endpoints (channel, account_id, target, endpoint, expires_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT (channel, account_id, target) DO UPDATE SET
