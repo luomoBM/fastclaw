@@ -384,6 +384,16 @@ func (m *Manager) Get(channel, accountID string) Channel {
 	return m.channels[channelKey(channel, accountID)]
 }
 
+// StartReplyStream asks an adapter for an optional live reply surface.
+func (m *Manager) StartReplyStream(ctx context.Context, msg bus.InboundMessage) (ReplyStream, bool) {
+	ch := m.Get(msg.Channel, msg.AccountID)
+	streamer, ok := ch.(ReplyStreamChannel)
+	if !ok {
+		return nil, false
+	}
+	return streamer.StartReplyStream(ctx, msg)
+}
+
 func channelKey(channel, accountID string) string {
 	if accountID == "" {
 		return channel + ":"

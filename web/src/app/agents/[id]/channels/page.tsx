@@ -1420,6 +1420,9 @@ function ConnectDingTalkDialog({
 }) {
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
+  const [replyMode, setReplyMode] = useState<"markdown" | "card">("markdown");
+  const [cardTemplateId, setCardTemplateId] = useState("");
+  const [cardStreamIntervalMs, setCardStreamIntervalMs] = useState("1000");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
   const [connected, setConnected] = useState(false);
@@ -1428,6 +1431,9 @@ function ConnectDingTalkDialog({
     if (!open) {
       setClientId("");
       setClientSecret("");
+      setReplyMode("markdown");
+      setCardTemplateId("");
+      setCardStreamIntervalMs("1000");
       setSubmitting(false);
       setError("");
       setConnected(false);
@@ -1442,6 +1448,11 @@ function ConnectDingTalkDialog({
       agentId,
       clientId.trim(),
       clientSecret.trim(),
+      {
+        replyMode,
+        cardTemplateId: cardTemplateId.trim(),
+        cardStreamIntervalMs: Number(cardStreamIntervalMs) || 1000,
+      },
     );
     setSubmitting(false);
     if (res.error || !res.ok) {
@@ -1509,6 +1520,46 @@ function ConnectDingTalkDialog({
                 autoFocus
               />
             </div>
+            <div className="space-y-1.5 border-t pt-3">
+              <Label htmlFor="dingtalk-reply-mode">Reply format</Label>
+              <select
+                id="dingtalk-reply-mode"
+                value={replyMode}
+                onChange={(e) => setReplyMode(e.target.value as "markdown" | "card")}
+                className="flex h-9 w-full rounded-md border bg-background px-3 text-sm"
+              >
+                <option value="markdown">Markdown (default)</option>
+                <option value="card">AI Card — stream answer</option>
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Markdown sends the completed reply. AI Card updates one reply while the model generates.
+              </p>
+            </div>
+            {replyMode === "card" && (
+              <>
+                <div className="space-y-1.5">
+                  <Label htmlFor="dingtalk-card-template">AI Card template ID</Label>
+                  <Input
+                    id="dingtalk-card-template"
+                    value={cardTemplateId}
+                    onChange={(e) => setCardTemplateId(e.target.value)}
+                    placeholder="your-template-id.schema"
+                    className="font-mono text-sm"
+                  />
+                  <p className="text-xs text-muted-foreground">Publish a compatible AI Card template in this DingTalk app first.</p>
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="dingtalk-card-interval">Update interval (ms)</Label>
+                  <Input
+                    id="dingtalk-card-interval"
+                    type="number"
+                    min="200"
+                    value={cardStreamIntervalMs}
+                    onChange={(e) => setCardStreamIntervalMs(e.target.value)}
+                  />
+                </div>
+              </>
+            )}
             <div className="space-y-1.5">
               <Label htmlFor="dingtalk-client-secret">Client Secret</Label>
               <Input
@@ -1538,7 +1589,7 @@ function ConnectDingTalkDialog({
               </Button>
               <Button
                 onClick={submit}
-                disabled={submitting || !clientId.trim() || !clientSecret.trim()}
+                disabled={submitting || !clientId.trim() || !clientSecret.trim() || (replyMode === "card" && !cardTemplateId.trim())}
               >
                 {submitting ? "Validating…" : "Connect"}
               </Button>

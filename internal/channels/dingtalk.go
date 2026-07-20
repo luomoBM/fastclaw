@@ -57,13 +57,31 @@ type DingTalk struct {
 	streamClientFactory func() dingTalkStreamClient
 	streamReconnectBase time.Duration
 	streamStableAfter   time.Duration
+	card                DingTalkCardOptions
+}
+
+// DingTalkCardOptions is intentionally small for v1: cards stream only the
+// user-visible answer. Markdown remains the default delivery mode.
+type DingTalkCardOptions struct {
+	ReplyMode            string
+	CardTemplateID       string
+	CardStreamIntervalMS int
 }
 
 func NewDingTalk(clientID, clientSecret, accountID string, mb *bus.MessageBus, endpoints ChannelReplyEndpointStore) (*DingTalk, error) {
+	return NewDingTalkWithOptions(clientID, clientSecret, accountID, mb, endpoints, DingTalkCardOptions{})
+}
+
+func NewDingTalkWithOptions(clientID, clientSecret, accountID string, mb *bus.MessageBus, endpoints ChannelReplyEndpointStore, card DingTalkCardOptions) (*DingTalk, error) {
 	if mb == nil {
 		return nil, errors.New("dingtalk: message bus is required")
 	}
-	return newDingTalk(clientID, clientSecret, accountID, mb, endpoints)
+	d, err := newDingTalk(clientID, clientSecret, accountID, mb, endpoints)
+	if err != nil {
+		return nil, err
+	}
+	d.card = normalizeDingTalkCardOptions(card)
+	return d, nil
 }
 
 // DingTalkSender exposes only outbound operations from a short-lived client.

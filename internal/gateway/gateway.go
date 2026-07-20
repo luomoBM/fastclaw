@@ -502,6 +502,19 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 			}
 		}
 
+		// DingTalk card mode owns one visible reply while the model is
+		// generating. The optional capability keeps every other IM adapter on
+		// the established typing-indicator + final-message path.
+		replyStream, cardStreamed := chanMgr.StartReplyStream(ctx, task.Message)
+		cardDelivered := false
+		if cardStreamed && ctx.Err() != nil {
+			replyStream.Abort(context.Background())
+			return "", nil
+		}
+		if cardStreamed {
+			ctx = agent.ContextWithReplyDeltaSink(ctx, replyStream.WriteDelta)
+		}
+
 		reply := ag.HandleMessage(ctx, task.Message)
 		close(typingDone)
 		// Extract `![alt](workspace/relative/path)` markdown image refs
@@ -543,8 +556,17 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		if webStreamed && len(items) == 0 {
 			return reply, nil
 		}
+		if cardStreamed {
+			// Finish receives the post-processed Markdown body so card and
+			// fallback display exactly the same text. A failed finalization
+			// deliberately falls through to normal Markdown delivery.
+			cardDelivered = replyStream.Finish(ctx, text)
+			if cardDelivered && len(items) == 0 {
+				return reply, nil
+			}
+		}
 		outText := text
-		if webStreamed {
+		if webStreamed || cardDelivered {
 			outText = ""
 		}
 		out := bus.OutboundMessage{

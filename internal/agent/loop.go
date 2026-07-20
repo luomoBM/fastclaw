@@ -747,6 +747,7 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 		}
 		if chunk.Content != "" {
 			contentBuilder.WriteString(chunk.Content)
+			emitReplyDelta(ctx, chunk.Content)
 			if emitDeltas {
 				// Push the incremental delta. The web chat panel
 				// appends it to the bubble in progress; consumers

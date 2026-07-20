@@ -13,6 +13,22 @@ type ChatEvent struct {
 }
 
 type chatEventsKey struct{}
+type replyDeltaSinkKey struct{}
+
+// ContextWithReplyDeltaSink attaches a best-effort live output sink for IM
+// adapters. It is independent of web chat events, which remain unchanged.
+func ContextWithReplyDeltaSink(ctx context.Context, sink func(string)) context.Context {
+	return context.WithValue(ctx, replyDeltaSinkKey{}, sink)
+}
+
+func emitReplyDelta(ctx context.Context, delta string) {
+	if delta == "" {
+		return
+	}
+	if sink, _ := ctx.Value(replyDeltaSinkKey{}).(func(string)); sink != nil {
+		sink(delta)
+	}
+}
 
 // ChatEventsFromContext retrieves the events channel from context, if present.
 //

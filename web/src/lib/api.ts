@@ -1931,11 +1931,12 @@ export async function connectAgentDingTalk(
   agentId: string,
   clientId: string,
   clientSecret: string,
+  options?: { replyMode?: "markdown" | "card"; cardTemplateId?: string; cardStreamIntervalMs?: number },
 ): Promise<{ ok: boolean; clientId?: string; error?: string }> {
   const res = await apiFetch(`/api/agents/${agentId}/channels/dingtalk`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientId, clientSecret }),
+    body: JSON.stringify({ clientId, clientSecret, ...options }),
   });
   return res.json();
 }
@@ -1956,7 +1957,7 @@ export async function updateAgentChannel(
   agentId: string,
   type: string,
   accountId: string,
-  patch: { sharedIdentity?: boolean },
+  patch: { sharedIdentity?: boolean; replyMode?: "markdown" | "card"; cardTemplateId?: string; cardStreamIntervalMs?: number },
 ): Promise<{ ok: boolean; error?: string }> {
   const res = await apiFetch(
     `/api/agents/${agentId}/channels/${encodeURIComponent(type)}/${encodeURIComponent(accountId)}`,

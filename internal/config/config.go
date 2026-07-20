@@ -498,6 +498,19 @@ type AccountConfig struct {
 	// unused (the WS connection is authenticated by appID/appSecret)
 	// and no public URL needs to be reachable.
 	UseLongConn bool `json:"useLongConn,omitempty"`
+	// DingTalk holds delivery settings that only apply to DingTalk accounts.
+	// Keeping these account-scoped prevents one bot's card template from being
+	// accidentally used by another bot.
+	DingTalk *DingTalkAccountConfig `json:"dingtalk,omitempty"`
+}
+
+// DingTalkAccountConfig controls how one DingTalk bot renders replies.
+// Markdown remains the compatible default; card mode is opt-in because each
+// DingTalk app must publish its own AI-card template.
+type DingTalkAccountConfig struct {
+	ReplyMode            string `json:"replyMode,omitempty"` // markdown | card
+	CardTemplateID       string `json:"cardTemplateId,omitempty"`
+	CardStreamIntervalMS int    `json:"cardStreamIntervalMs,omitempty"`
 }
 
 type Binding struct {

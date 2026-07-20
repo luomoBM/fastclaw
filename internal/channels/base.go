@@ -39,13 +39,13 @@ const SplitMessageMarker = "<|split|>"
 //
 // Output shape:
 //
-//   2-column tables  → "header1: header2" line, then one
-//                      "cell1: cell2" line per row. This is the most
-//                      common shape LLMs emit (label / value lists)
-//                      and reads cleanly as plain text.
-//   3+ column tables → cells joined with " · " (middle dot) per row,
-//                      no separator. Loses alignment but stays on one
-//                      line per row and scans as tabular at a glance.
+//	2-column tables  → "header1: header2" line, then one
+//	                   "cell1: cell2" line per row. This is the most
+//	                   common shape LLMs emit (label / value lists)
+//	                   and reads cleanly as plain text.
+//	3+ column tables → cells joined with " · " (middle dot) per row,
+//	                   no separator. Loses alignment but stays on one
+//	                   line per row and scans as tabular at a glance.
 //
 // Cells are trimmed; the GFM escape `\|` round-trips back to a literal
 // `|` inside a cell. The separator row is dropped in every shape.
@@ -241,4 +241,20 @@ type Channel interface {
 	SendMessage(msg bus.OutboundMessage) error
 	// SendTyping sends a typing indicator to the specified chat.
 	SendTyping(chatID string) error
+}
+
+// ReplyStream is an optional live-reply surface implemented by channels that
+// can update one visible message while an agent is generating. Writes must be
+// non-blocking with respect to the model stream; Finish returns false when the
+// caller should fall back to its ordinary final-message delivery.
+type ReplyStream interface {
+	WriteDelta(string)
+	Finish(context.Context, string) bool
+	Abort(context.Context)
+}
+
+// ReplyStreamChannel is deliberately separate from Channel so existing IM
+// adapters do not need to know about streaming replies.
+type ReplyStreamChannel interface {
+	StartReplyStream(context.Context, bus.InboundMessage) (ReplyStream, bool)
 }

@@ -340,7 +340,10 @@ func (s *Server) handleUpdateAgentChannel(w http.ResponseWriter, r *http.Request
 	}
 
 	var req struct {
-		SharedIdentity *bool `json:"sharedIdentity"`
+		SharedIdentity       *bool  `json:"sharedIdentity"`
+		ReplyMode            string `json:"replyMode"`
+		CardTemplateID       string `json:"cardTemplateId"`
+		CardStreamIntervalMS int    `json:"cardStreamIntervalMs"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -368,10 +371,54 @@ func (s *Server) handleUpdateAgentChannel(w http.ResponseWriter, r *http.Request
 	if req.SharedIdentity != nil {
 		target.SharedIdentity = *req.SharedIdentity
 	}
+	if channelType == "dingtalk" && (req.ReplyMode != "" || req.CardTemplateID != "" || req.CardStreamIntervalMS != 0) {
+		mode := strings.ToLower(strings.TrimSpace(req.ReplyMode))
+		if mode != "" && mode != "markdown" && mode != "card" {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "replyMode must be markdown or card"})
+			return
+		}
+		if mode == "card" && strings.TrimSpace(req.CardTemplateID) == "" {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "cardTemplateId required for card reply mode"})
+			return
+		}
+		if req.CardStreamIntervalMS != 0 && req.CardStreamIntervalMS < 200 {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "cardStreamIntervalMs must be at least 200"})
+			return
+		}
+		cc := config.ChannelConfig{Enabled: target.Enabled}
+		if raw, err := json.Marshal(target.Data); err == nil {
+			_ = json.Unmarshal(raw, &cc)
+		}
+		if cc.Accounts == nil {
+			cc.Accounts = map[string]config.AccountConfig{}
+		}
+		acct := cc.Accounts[accountID]
+		if acct.BotToken == "" {
+			acct.BotToken = target.BotToken
+		}
+		if acct.DingTalk == nil {
+			acct.DingTalk = &config.DingTalkAccountConfig{}
+		}
+		if mode != "" {
+			acct.DingTalk.ReplyMode = mode
+		}
+		if req.CardTemplateID != "" {
+			acct.DingTalk.CardTemplateID = strings.TrimSpace(req.CardTemplateID)
+		}
+		if req.CardStreamIntervalMS != 0 {
+			acct.DingTalk.CardStreamIntervalMS = req.CardStreamIntervalMS
+		}
+		cc.Accounts[accountID] = acct
+		raw, _ := json.Marshal(cc)
+		var data map[string]interface{}
+		_ = json.Unmarshal(raw, &data)
+		target.Data = data
+	}
 	if err := s.dataStore.SaveChannel(r.Context(), target); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+	s.hotRegisterChannelRecord(*target)
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -420,8 +467,11 @@ func (s *Server) handleDisconnectAgentChannel(w http.ResponseWriter, r *http.Req
 // --- DingTalk ---
 
 type connectDingTalkRequest struct {
-	ClientID     string `json:"clientId"`
-	ClientSecret string `json:"clientSecret"`
+	ClientID             string `json:"clientId"`
+	ClientSecret         string `json:"clientSecret"`
+	ReplyMode            string `json:"replyMode"`
+	CardTemplateID       string `json:"cardTemplateId"`
+	CardStreamIntervalMS int    `json:"cardStreamIntervalMs"`
 }
 
 var validateDingTalkCredentials = channels.DingTalkValidateCredentials
@@ -446,6 +496,22 @@ func (s *Server) handleConnectAgentDingTalk(w http.ResponseWriter, r *http.Reque
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "clientId and clientSecret required"})
 		return
 	}
+	mode := strings.ToLower(strings.TrimSpace(req.ReplyMode))
+	if mode == "" {
+		mode = "markdown"
+	}
+	if mode != "markdown" && mode != "card" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "replyMode must be markdown or card"})
+		return
+	}
+	if mode == "card" && strings.TrimSpace(req.CardTemplateID) == "" {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "cardTemplateId required for card reply mode"})
+		return
+	}
+	if req.CardStreamIntervalMS != 0 && req.CardStreamIntervalMS < 200 {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "cardStreamIntervalMs must be at least 200"})
+		return
+	}
 	if err := validateDingTalkCredentials(r.Context(), clientID, clientSecret); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
@@ -453,7 +519,7 @@ func (s *Server) handleConnectAgentDingTalk(w http.ResponseWriter, r *http.Reque
 	cc := config.ChannelConfig{
 		Enabled: true,
 		Accounts: map[string]config.AccountConfig{
-			clientID: {BotToken: clientSecret, UseLongConn: true},
+			clientID: {BotToken: clientSecret, UseLongConn: true, DingTalk: &config.DingTalkAccountConfig{ReplyMode: mode, CardTemplateID: strings.TrimSpace(req.CardTemplateID), CardStreamIntervalMS: req.CardStreamIntervalMS}},
 		},
 	}
 	if err := s.assertChannelCredentialUniqueOpt(r, "dingtalk", clientID, "", uid, aid, true); err != nil {

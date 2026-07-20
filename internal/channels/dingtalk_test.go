@@ -153,6 +153,98 @@ func TestDingTalkMarkdownTitleUsesFirstMeaningfulLine(t *testing.T) {
 	}
 }
 
+func TestDingTalkCardStreamCreatesAndFinalizesOneCard(t *testing.T) {
+	var createBody, streamBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/v1.0/card/instances/createAndDeliver":
+			if r.Method != http.MethodPost {
+				t.Fatalf("create method = %s", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&createBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{"outTrackId":"card-1"}`))
+		case "/v1.0/card/streaming":
+			if r.Method != http.MethodPut {
+				t.Fatalf("stream method = %s", r.Method)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&streamBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card", CardTemplateID: "template.schema", CardStreamIntervalMS: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.httpClient, d.apiBase = server.Client(), server.URL
+	stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{Channel: "dingtalk", AccountID: "ding-client", ChatID: "user:staff-1"})
+	if !ok {
+		t.Fatal("card stream was not started")
+	}
+	stream.WriteDelta("hello ")
+	stream.WriteDelta("world")
+	if !stream.Finish(context.Background(), "# hello\nworld") {
+		t.Fatal("card stream did not finish")
+	}
+	if createBody["cardTemplateId"] != "template.schema" || createBody["openSpaceId"] != "dtv1.card//IM_ROBOT.staff-1" {
+		t.Fatalf("create body = %#v", createBody)
+	}
+	params := createBody["cardData"].(map[string]any)["cardParamMap"].(map[string]any)
+	if params["config"] != `{"autoLayout":true,"enableForward":true}` {
+		t.Fatalf("card layout config = %#v", params["config"])
+	}
+	if streamBody["outTrackId"] != "card-1" || streamBody["content"] != "# hello\nworld" || streamBody["isFinalize"] != true {
+		t.Fatalf("stream body = %#v", streamBody)
+	}
+	if _, ok := streamBody["guid"].(string); !ok || streamBody["guid"] == "" || streamBody["isError"] != false {
+		t.Fatalf("streaming protocol fields = %#v", streamBody)
+	}
+}
+
+func TestDingTalkCardStreamDisabledWithoutTemplate(t *testing.T) {
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{ChatID: "user:staff-1"}); ok || stream != nil {
+		t.Fatal("card stream should require a template")
+	}
+}
+
+func TestDingTalkCardStreamFallsBackWhenDeliveryIsRejected(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/v1.0/card/instances/createAndDeliver":
+			// DingTalk can report a per-recipient delivery failure in an
+			// otherwise-successful HTTP response.
+			_, _ = w.Write([]byte(`{"result":{"deliverResults":[{"success":false,"errorMsg":"recipient unavailable"}]}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card", CardTemplateID: "template.schema"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.httpClient, d.apiBase = server.Client(), server.URL
+	if stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{ChatID: "user:staff-1"}); ok || stream != nil {
+		t.Fatal("card stream should fall back when DingTalk rejects delivery")
+	}
+}
+
 func TestDingTalkValidateCredentialsRejectsMissingToken(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"code":"InvalidParameter","message":"bad credentials"}`))

@@ -293,7 +293,14 @@ func registerDingTalkChannels(chCfg config.ChannelConfig, mb *bus.MessageBus, ch
 		if secret == "" {
 			secret = chCfg.BotToken
 		}
-		dt, err := channels.NewDingTalk(clientID, secret, clientID, mb, st)
+		var card channels.DingTalkCardOptions
+		if acct.DingTalk != nil {
+			card = channels.DingTalkCardOptions{
+				ReplyMode: acct.DingTalk.ReplyMode, CardTemplateID: acct.DingTalk.CardTemplateID,
+				CardStreamIntervalMS: acct.DingTalk.CardStreamIntervalMS,
+			}
+		}
+		dt, err := channels.NewDingTalkWithOptions(clientID, secret, clientID, mb, st, card)
 		if err != nil {
 			return err
 		}
