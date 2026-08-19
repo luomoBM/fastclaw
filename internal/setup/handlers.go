@@ -87,17 +87,28 @@ func loadAgentSkillEntriesForUser(ctx context.Context, st store.Store, userID st
 	}
 	out := map[string]map[string]config.SkillEntryCfg{}
 	for _, ar := range agents {
-		rec, err := st.GetConfigByName(ctx, store.KindSetting, "", ar.ID, "skills.entries")
-		if err != nil || rec == nil || len(rec.Data) == 0 {
+		entries, err := loadAgentSkillEntries(ctx, st, ar.ID)
+		if err != nil || len(entries) == 0 {
 			continue
 		}
-		blob, _ := json.Marshal(rec.Data)
-		var entries map[string]config.SkillEntryCfg
-		if json.Unmarshal(blob, &entries) == nil && len(entries) > 0 {
-			out[ar.ID] = entries
-		}
+		out[ar.ID] = entries
 	}
 	return out, nil
+}
+
+// loadAgentSkillEntries reads one agent-scope skills.entries row.
+// A missing row is not an error — nil entries means "no overrides".
+func loadAgentSkillEntries(ctx context.Context, st store.Store, agentID string) (map[string]config.SkillEntryCfg, error) {
+	rec, err := st.GetConfigByName(ctx, store.KindSetting, "", agentID, "skills.entries")
+	if err != nil || rec == nil || len(rec.Data) == 0 {
+		return nil, err
+	}
+	blob, _ := json.Marshal(rec.Data)
+	var entries map[string]config.SkillEntryCfg
+	if err := json.Unmarshal(blob, &entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // saveAgentSkillEntries upserts the agent-scope skills.entries row.
@@ -543,6 +554,7 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		Prefs   *config.PrefsCfg `json:"prefs"`
 		Sandbox *json.RawMessage `json:"sandbox"`
 		Skills  *struct {
+			Entries      map[string]config.SkillEntryCfg            `json:"entries"`
 			AgentEntries map[string]map[string]config.SkillEntryCfg `json:"agentEntries"`
 		} `json:"skills"`
 	}
@@ -566,9 +578,22 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 	// through the namespace sweep, and re-writing them here would
 	// re-build the legacy shape we just split apart.
 	merged.Skills.AgentEntries = nil
+	// Snapshot the stored global skill entries before the request body
+	// is unmarshalled over them. The dashboard round-trips masked
+	// secrets ("sk-1****abcd") — mergeSkillEntry resolves those back to
+	// the stored originals so a no-op save can't clobber real keys.
+	existingSkillEntries := make(map[string]config.SkillEntryCfg, len(merged.Skills.Entries))
+	for name, entry := range merged.Skills.Entries {
+		existingSkillEntries[name] = entry
+	}
 	if err := json.Unmarshal(buf, merged); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
+	}
+	if raw.Skills != nil {
+		for name, in := range raw.Skills.Entries {
+			merged.Skills.Entries[name] = mergeSkillEntry(existingSkillEntries[name], in)
+		}
 	}
 	if err := s.saveUserConfig(r, merged); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
@@ -599,6 +624,13 @@ func (s *Server) handleUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			}
 			if !s.authorizeScope(w, r, scope.Agent, agentID, scopeWrite) {
 				return
+			}
+			// Resolve masked secrets back to the stored originals before
+			// persisting — same protection as the global entries path.
+			if existing, err := loadAgentSkillEntries(r.Context(), s.dataStore, agentID); err == nil {
+				for name, in := range entries {
+					entries[name] = mergeSkillEntry(existing[name], in)
+				}
 			}
 			if err := saveAgentSkillEntries(r.Context(), s.dataStore, agentID, entries); err != nil {
 				jsonResponse(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})

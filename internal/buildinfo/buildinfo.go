@@ -71,3 +71,27 @@ func IsHostExecAllowed() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("FASTCLAW_ALLOW_HOST_EXEC")))
 	return v == "1" || v == "true" || v == "yes"
 }
+
+// IsSandboxEnforced reports whether a configured sandbox acts as a hard
+// execution BOUNDARY (every exec / file tool locked inside it) versus an
+// optional TOOL the agent opts into per call (exec with sandbox:true).
+//
+// Hosted multi-tenant deploys are always enforced: the host is shared
+// infrastructure and chatters are strangers, so nothing may touch it.
+// Self-hosted installs default to NOT enforced — the operator's own
+// machine is the natural execution environment ("install ffmpeg for me"
+// must work on the host), and the sandbox exists to provide an isolated,
+// pre-provisioned toolbox (python, node, camoufox-cli, …), not to wall
+// the operator out of their own laptop.
+//
+// A self-hosted operator who exposes agents to untrusted IM chatters
+// (WeChat, Discord, Feishu, …) and wants the old sandbox-or-nothing
+// boundary back opts in with FASTCLAW_SANDBOX_ENFORCE=1 (or true/yes).
+// Read per call, same as IsHostedDeploy.
+func IsSandboxEnforced() bool {
+	if IsHostedDeploy() {
+		return true
+	}
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("FASTCLAW_SANDBOX_ENFORCE")))
+	return v == "1" || v == "true" || v == "yes"
+}

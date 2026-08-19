@@ -94,11 +94,26 @@ func daemonStatusCmd() *cobra.Command {
 }
 
 func daemonLogsCmd() *cobra.Command {
+	return newLogsCmd("logs", "Show daemon log output")
+}
+
+// logCmd is the top-level `fastclaw log` shortcut for `daemon logs`,
+// with `logs` as an alias so both spellings work.
+func logCmd() *cobra.Command {
+	cmd := newLogsCmd("log", "Show gateway daemon logs (shortcut for `daemon logs`)")
+	cmd.Aliases = []string{"logs"}
+	return cmd
+}
+
+// newLogsCmd builds the shared log-viewing command registered both as
+// `fastclaw daemon logs` and the top-level `fastclaw log`.
+func newLogsCmd(use, short string) *cobra.Command {
 	var follow bool
 	var lines int
 	cmd := &cobra.Command{
-		Use:   "logs",
-		Short: "Show daemon log output",
+		Use:   use,
+		Short: short,
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, logFile, _, err := daemon.Paths()
 			if err != nil {

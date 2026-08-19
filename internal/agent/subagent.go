@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -98,12 +97,7 @@ func (a *Agent) runSubagentLoop(ctx context.Context, task string, maxIterations 
 		toolDefs = append(toolDefs, t)
 	}
 
-	type sig struct {
-		name string
-		hash [32]byte
-	}
-	var lastSig sig
-	consecutiveCount := 0
+	var loopDetector toolLoopDetector
 	allFailedRounds := 0
 	const failedRoundsLimit = 3
 
@@ -167,30 +161,6 @@ func (a *Agent) runSubagentLoop(ctx context.Context, task string, maxIterations 
 			RawAssistant: resp.RawAssistant,
 		})
 
-		// Loop detection: same shape as HandleMessage but on private state.
-		loopDetected := false
-		for _, tc := range resp.ToolCalls {
-			s := sig{name: tc.Function.Name, hash: sha256.Sum256([]byte(tc.Function.Arguments))}
-			if s.name == lastSig.name && s.hash == lastSig.hash {
-				consecutiveCount++
-			} else {
-				consecutiveCount = 1
-				lastSig = s
-			}
-			if consecutiveCount >= 3 {
-				slog.Warn("subagent tool-loop detected", "agent", a.name, "tool", tc.Function.Name)
-				messages = append(messages, provider.Message{
-					Role:    "system",
-					Content: "Loop detected: same tool with same arguments 3 times. Stop and produce the deliverable from what you have.",
-				})
-				loopDetected = true
-				break
-			}
-		}
-		if loopDetected {
-			break
-		}
-
 		// Second heartbeat: tools are about to run. Surface their names
 		// so the UI can show "running web_search" / "running exec
 		// (camoufox-cli open …)" instead of just a spinner.
@@ -207,6 +177,7 @@ func (a *Agent) runSubagentLoop(ctx context.Context, task string, maxIterations 
 
 		results := a.engine.executeToolsConcurrently(ctx, a.registry, resp.ToolCalls, a.workspacePath)
 		roundAllFailed := true
+		loopDetected := false
 		for idx, r := range results {
 			tc := resp.ToolCalls[idx]
 			resultContent, _ := extractToolMeta(r.result)
@@ -219,11 +190,21 @@ func (a *Agent) runSubagentLoop(ctx context.Context, task string, maxIterations 
 				ToolCallID: tc.ID,
 				Name:       r.toolName,
 			})
+			if loopDetector.Observe(tc, resultContent) && !loopDetected {
+				slog.Warn("subagent tool loop detected", "agent", a.name, "tool", tc.Function.Name)
+				loopDetected = true
+			}
+		}
+		if loopDetected {
+			messages = append(messages, repeatedToolCallWarning("Loop detected: same tool with same arguments and same result 3 times. Stop and produce the deliverable from what you have."))
 		}
 		if roundAllFailed {
 			allFailedRounds++
 		} else {
 			allFailedRounds = 0
+		}
+		if loopDetected {
+			break
 		}
 	}
 

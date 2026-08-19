@@ -245,6 +245,14 @@ type RateLimitCfg struct {
 	RPM int `json:"rpm,omitempty"`
 }
 
+// WorkspaceHistoryCfg toggles the opt-in per-session workspace version
+// history (git snapshots committed at turn boundary). LocalFS-backed
+// workspaces only — S3-backed stores skip history entirely. Known
+// limitation: no retention policy yet — every dirty turn adds a commit.
+type WorkspaceHistoryCfg struct {
+	Enabled bool `json:"enabled"`
+}
+
 type MemoryCfg struct {
 	AutoPersist AutoPersistCfg `json:"autoPersist,omitempty"`
 	FTS         FTSCfg         `json:"fts,omitempty"`
@@ -299,6 +307,7 @@ type Config struct {
 	TaskQueue     TaskQueueCfg               `json:"taskQueue,omitempty"`
 	Skills        SkillsCfg                  `json:"skills,omitempty"`
 	Memory        MemoryCfg                  `json:"memory,omitempty"`
+	WorkspaceHistory WorkspaceHistoryCfg    `json:"workspaceHistory,omitempty"`
 	Privacy       PrivacyCfg                 `json:"privacy,omitempty"`
 	SkillsLearner SkillsLearnerCfg           `json:"skillsLearner,omitempty"`
 	Prefs         PrefsCfg                   `json:"prefs,omitempty"`
@@ -388,6 +397,9 @@ type AgentDefaults struct {
 	// so this is the only way for the agent to remember a chatter across
 	// sessions.
 	AutoPersist *bool `json:"autoPersist,omitempty"`
+	// WorkspaceHistory — same pointer semantics as AutoPersist: nil = inherit
+	// system workspaceHistory.enabled, non-nil = authoritative for this agent.
+	WorkspaceHistory *bool `json:"workspaceHistory,omitempty"`
 }
 
 // AgentEntry is the in-memory shape of one agent row, used during
@@ -436,6 +448,9 @@ type AgentEntry struct {
 	// (long-term facts) — the chatbot-mode persistence path since that
 	// mode's curated tool allowlist excludes write_file.
 	AutoPersist *bool `json:"autoPersist,omitempty"`
+	// WorkspaceHistory — same pointer semantics as AutoPersist: nil = inherit
+	// system workspaceHistory.enabled, non-nil = authoritative for this agent.
+	WorkspaceHistory *bool `json:"workspaceHistory,omitempty"`
 }
 
 // PromptMode controls which framework sections BuildSystemPromptAs emits.
@@ -572,6 +587,9 @@ type AgentFileConfig struct {
 	// AutoPersist mirrors AgentEntry.AutoPersist. Nil = inherit;
 	// non-nil = authoritative for this agent.
 	AutoPersist *bool `json:"autoPersist,omitempty"`
+	// WorkspaceHistory — same pointer semantics as AutoPersist: nil = inherit
+	// system workspaceHistory.enabled, non-nil = authoritative for this agent.
+	WorkspaceHistory *bool `json:"workspaceHistory,omitempty"`
 	// Admins gates write-mode slash commands (/new /reset /undo /retry /compact
 	// /model /personality) in IM channels. Keyed by channel name ("discord",
 	// "telegram", "slack", ...), each value is the platform-side user IDs
@@ -652,6 +670,10 @@ type ResolvedAgent struct {
 	// runPostTurn hook fires AutoPersistMemory (the LLM-driven distill-
 	// to-USER.md/MEMORY.md pass) every N turns.
 	AutoPersist *bool
+	// WorkspaceHistory — nil = inherit system workspaceHistory.enabled,
+	// non-nil = authoritative for this agent. Drives whether runPostTurn
+	// snapshots the session workspace into the git history repo.
+	WorkspaceHistory *bool
 }
 
 type TeamEntry struct {
@@ -755,6 +777,7 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		Thinking:             cfg.Agents.Defaults.Thinking,
 		Sandbox:              cfg.Sandbox,
 		PolicyPreset:         cfg.Agents.Defaults.PolicyPreset,
+		WorkspaceHistory:       cfg.Agents.Defaults.WorkspaceHistory,
 	}
 
 	if entry.MaxTokens > 0 {
@@ -788,6 +811,10 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 	if entry.AutoPersist != nil {
 		v := *entry.AutoPersist
 		resolved.AutoPersist = &v
+	}
+	if entry.WorkspaceHistory != nil {
+		v := *entry.WorkspaceHistory
+		resolved.WorkspaceHistory = &v
 	}
 
 	if len(cfg.MCPServers) > 0 {

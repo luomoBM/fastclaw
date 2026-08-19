@@ -76,7 +76,7 @@ func cronListCmd() *cobra.Command {
 }
 
 func cronCreateCmd() *cobra.Command {
-	var agentName, name, typ, schedule, message, channel, accountID, chatID, timezone string
+	var agentName, name, typ, schedule, message, channel, accountID, chatID, timezone, chatterID string
 	cmd := &cobra.Command{
 		Use:   "create",
 		Short: "Create a scheduled job",
@@ -101,6 +101,7 @@ func cronCreateCmd() *cobra.Command {
 			job := &store.CronJobRecord{
 				ID:        uuid.NewString(),
 				UserID:    ag.UserID,
+				ChatterID: chatterID,
 				AgentID:   ag.ID,
 				Name:      name,
 				Type:      typ,
@@ -131,6 +132,7 @@ func cronCreateCmd() *cobra.Command {
 	cmd.Flags().StringVar(&accountID, "account", "", "target channel account id")
 	cmd.Flags().StringVar(&chatID, "chat", "", "target chat id")
 	cmd.Flags().StringVar(&timezone, "timezone", "Asia/Shanghai", "IANA timezone")
+	cmd.Flags().StringVar(&chatterID, "chatter", "", "chatter (per-sender app_user) that owns this job; empty means owner/system-created")
 	_ = cmd.MarkFlagRequired("agent")
 	_ = cmd.MarkFlagRequired("schedule")
 	_ = cmd.MarkFlagRequired("message")

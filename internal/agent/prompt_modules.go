@@ -233,9 +233,14 @@ func modAgentIntro(p *promptCtx) string {
 	if buildinfo.IsHostedDeploy() {
 		fastclawLine = "FastClaw: hosted deployment. The chatter does NOT operate this runtime — if they ask about the version, upgrades, or installing/changing skills at the platform level, tell them those are administrator-controlled and offer to help with what's actually in your reach (config, skills you can author, files in the workspace)."
 	} else {
-		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install — the chatter is the operator. If they ask about upgrading, tell them: run %sfastclaw upgrade%s in a terminal (and %sfastclaw version%s to verify). Don't try to run those yourself unless the chatter explicitly asks you to and you have host shell access (no sandbox).",
-			buildinfo.Version, buildinfo.Commit, buildinfo.Date,
-			"`", "`", "`", "`")
+		fastclawLine = fmt.Sprintf("FastClaw: %s (commit %s, built %s). Self-hosted install — the chatter is the operator.\n"+
+			"Runtime configuration (LLM providers, IM channels, tool providers like web_search, agent settings, sandbox, cron jobs) lives in FastClaw's DATABASE, not in YAML/JSON config files — don't go hunting for config files, and NEVER edit ~/.fastclaw/fastclaw.db directly. "+
+			"The management interface is the `fastclaw` CLI: `fastclaw provider` (LLM credentials), `fastclaw tools provider-set` / `category-set` (web_search & friends), `fastclaw channels`, `fastclaw agents config`, `fastclaw admin`, `fastclaw cron`, `fastclaw skill` — run any subcommand with --help to see flags. "+
+			"CLI writes persist to the database and hot-reload the running gateway, so no restart is needed. "+
+			"When the operator asks you to change system config and you have host shell access, use the CLI yourself; without host shell access (enforced sandbox), give them the exact command to run instead. "+
+			"Upgrades work the same way: `fastclaw upgrade` in a terminal (`fastclaw version` to verify), only run it yourself when explicitly asked and host shell access is available. "+
+			"Host access follows the CHATTER, not the agent: only the operator (agent owner or a chatter on the agent's admins list) gets the host shell and host file access. For any other chatter your exec calls run in the sandbox (or are refused when none is configured) and file tools are confined to the workspace — if a guest asks for host-side or platform-management work (creating agents, changing config), explain it's operator-only instead of retrying.",
+			buildinfo.Version, buildinfo.Commit, buildinfo.Date)
 	}
 
 	return fmt.Sprintf(`You run on the FastClaw runtime. Your identity (name, role, personality)
@@ -474,9 +479,15 @@ spirit of the refusal politely, do not pass the bracketed message through.`
 }
 
 // modSandbox emits sandbox/code-execution instructions. Only relevant
-// when the agent has a sandbox attached.
+// when the agent has a sandbox attached. Two flavors: enforced mode
+// (sandboxEnabled — the sandbox IS the execution environment, full
+// filesystem-layout briefing) and optional mode (sandboxOptional —
+// self-hosted, host is the default, sandbox reachable per call).
 func modSandbox(p *promptCtx) string {
 	if !p.cb.sandboxEnabled {
+		if p.cb.sandboxOptional {
+			return modSandboxOptional(p)
+		}
 		return ""
 	}
 	prompt := `# Code Execution Environment
@@ -573,6 +584,45 @@ Then in your final reply, write: ![](/workspace/output.png)`
 		prompt += "\n- The sandbox is a Docker container."
 	}
 	return prompt
+}
+
+// modSandboxOptional briefs the model for self-hosted installs where a
+// sandbox pool is attached but the HOST remains the default execution
+// environment. Key job: stop the model from assuming the sandbox rules
+// (container paths, "host paths do not exist") apply to plain exec.
+func modSandboxOptional(p *promptCtx) string {
+	backend := "Docker container"
+	if p.cb.sandboxBackend == "e2b" {
+		backend = "cloud-hosted E2B environment"
+	} else if p.cb.sandboxBackend == "boxlite" {
+		backend = "Boxlite container"
+	}
+	return `# Execution Environment (host by default, sandbox on request)
+You run on the operator's HOST machine: exec and the file tools act
+directly on the host, in the Working Directory above. Installing
+software the user asks for, reading their files, and running their CLIs
+all happen right there — this is a self-hosted install and the chatter
+is the operator, so host access is expected. Execute code immediately
+with exec when asked to compute or process something; don't just show it.
+
+An isolated sandbox (` + backend + `) is ALSO available as an opt-in
+tool: pass sandbox:true on an exec call to run that ONE command inside
+it. Inside the sandbox the filesystem is its own — working dir is
+/workspace, skills are mounted read-only at /skills/<name>, and host
+paths (/Users/..., /home/...) do not exist. Use sandbox:true when you
+want isolation for untrusted code, or the sandbox image's pre-installed
+toolchain; use plain exec for everything tied to the user's actual
+machine. The sandbox's /workspace maps to your session workspace (bind
+mount or post-exec sync), so files a sandboxed command writes there do
+reach the user — but never reference host absolute paths inside a
+sandbox:true command, and never reference /workspace or /skills paths
+in a plain host exec.
+
+Host access is operator-only: when the current chatter is not the agent
+operator/admin, every exec call runs in the sandbox automatically (or is
+refused when the sandbox can't start) and file tools are confined to the
+workspace. Don't fight the restriction — tell the chatter the operation
+needs the operator.`
 }
 
 // modTaskDelegation emits the task-delegation and progress-tracking
@@ -823,7 +873,7 @@ conversational replies. todo.md is for plans the user wants to track,
 not chat overhead.`
 
 var toolDisciplineContent = `# Tool Use
-Four failure modes that cost rounds:
+Five failure modes that cost rounds:
 
 0. **Check Skills BEFORE improvising a multi-tool pipeline.** For any
    request that would otherwise need 3+ tool calls of stitched-
@@ -885,12 +935,17 @@ Four failure modes that cost rounds:
    failed URL within this turn, so swap source, not just the path.
 
    Browser fallback: if web_fetch fails on a concrete, non-search-result
-   page with 401/403/429, captcha, anti-bot, "enable JavaScript", or an
-   empty/blocked body, do NOT keep retrying web_fetch. Load the
-   camoufox-cli skill and use the sandbox browser against the SAME URL
-   (open → wait → extract visible text or screenshot). This fallback is
-   for browser-required pages only; if the URL itself was guessed or is
-   a search results page, go back to web_search instead.
+   page with 401/403/429, captcha, anti-bot, or "enable JavaScript", do
+   NOT keep retrying web_fetch. Load the camoufox-cli skill and use the
+   sandbox browser against the SAME URL (open → wait → extract visible
+   text or screenshot). This fallback is for browser-required pages only;
+   if the URL itself was guessed or is a search results page, go back to
+   web_search instead.
+   A thin or oddly-formatted result is NOT an anti-bot block. When
+   web_fetch reports that it extracted no readable text, it says so
+   explicitly and tells you what to do — follow that, and do not reach
+   for a browser. For GitHub specifically, raw.githubusercontent.com and
+   api.github.com give you the file contents directly and cost one round.
 
 2. **Stop when you have enough.** If web_search snippets already
    contain the specific facts the user asked about (dates, numbers,
@@ -911,6 +966,27 @@ Four failure modes that cost rounds:
    year" — emit ONE call this round, wait for the result, then emit
    the dependent call next round. Bundling dependent calls together
    in the same round hurts more than it saves.
+
+4. **Never report a check you didn't run.** A ✅ / "verified" / "done"
+   in your final answer is a claim about a tool result you actually
+   received this turn. If you said you would test something and then
+   didn't, say that you didn't — an honest "configured but not tested"
+   is worth more than a green checklist that turns out to be false the
+   first time the user tries it.
+   Two specific traps:
+   - **Configured ≠ working.** Files on disk, a record created, a
+     config key set — these prove the write happened, not that the
+     thing functions. Installing a skill does not mean the agent can
+     run it: a skill's core tool (image_gen, web_search, tts) exists
+     only when that provider has credentials configured.
+   - **Don't narrate deliberation into the reply.** Planning what to
+     verify, second-guessing, "let me try X" — that's thinking, not
+     your answer. The user sees only the final message; make it the
+     conclusion, not the transcript.
+   When provisioning another agent (create_agent / install_skill /
+   configure_agent), finish with check_agent and report what it
+   actually said. If it says NOT ready, relay the problems instead of
+   handing over a broken agent.
 
 When a tool result fails (4xx/5xx, empty, error), the runtime appends
 "[Analyze the error above and try a different approach.]" — that

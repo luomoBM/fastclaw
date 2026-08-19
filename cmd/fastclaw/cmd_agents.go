@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/daemon"
+	"github.com/fastclaw-ai/fastclaw/internal/gateway"
 )
 
 // agentsCmd is a thin CLI front-end for the same agent CRUD the
@@ -27,6 +29,7 @@ func agentsCmd() *cobra.Command {
 	addAgentsSubcommand(cmd, agentsInitCmd())
 	addAgentsSubcommand(cmd, agentsRemoveCmd())
 	addAgentsSubcommand(cmd, agentsConfigCmd())
+	addAgentsSubcommand(cmd, agentsDoctorCmd())
 	addAgentsSubcommand(cmd, agentsFilesCmd())
 	return cmd
 }
@@ -194,6 +197,53 @@ func agentsRemoveCmd() *cobra.Command {
 		},
 	}
 	return cmd
+}
+
+// agentsDoctorCmd answers "is this agent actually able to do its job",
+// which is a different question from "was it configured".
+//
+// Provisioning an agent touches several independent things — a record, a
+// model, skills on disk, provider credentials for the tools those skills
+// drive — and each one reports success on its own. The combination is
+// what can be broken: an illustration agent whose skill installed
+// perfectly and whose image_gen was never wired looks healthy in every
+// individual check and produces nothing.
+func agentsDoctorCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "doctor <name>",
+		Short: "Check whether an agent is actually able to do its job",
+		Long: `Report an agent's readiness: model configured, skills installed, and
+whether the tools those skills declare they need are actually available.
+
+Skills declare their requirements in SKILL.md frontmatter:
+
+  metadata:
+    fastclaw:
+      requires:
+        tools: [image_gen]
+        bins: [ffmpeg]
+        env: [SOME_API_KEY]
+
+Exits non-zero when the agent is not ready, so it can gate a provisioning
+script.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := openStoreFromEnv()
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			report, err := gateway.DiagnoseAgent(context.Background(), st, args[0])
+			if err != nil {
+				return err
+			}
+			fmt.Print(report)
+			if strings.Contains(report, "VERDICT: NOT ready") {
+				return fmt.Errorf("agent is not ready")
+			}
+			return nil
+		},
+	}
 }
 
 func agentsConfigCmd() *cobra.Command {

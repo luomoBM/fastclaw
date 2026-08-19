@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,17 +33,31 @@ func versionCmd() *cobra.Command {
 
 // upgradeCmd downloads and installs the latest release.
 func upgradeCmd() *cobra.Command {
-	return &cobra.Command{
+	var force bool
+	cmd := &cobra.Command{
 		Use:     "upgrade",
 		Aliases: []string{"update"},
 		Short:   "Upgrade FastClaw to the latest version",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return doUpgrade()
+			return doUpgrade(force)
 		},
 	}
+	cmd.Flags().BoolVar(&force, "force", false, "replace a from-source build with the release binary")
+	return cmd
 }
 
-func doUpgrade() error {
+// devBuildRE matches the `git describe` suffix of a from-source build
+// (e.g. v0.46.1-68-gcada95e): commits-ahead count plus g-prefixed SHA.
+var devBuildRE = regexp.MustCompile(`-\d+-g[0-9a-f]{7,}`)
+
+// isDevBuild reports whether v identifies a from-source build (plain
+// `go build`, or `make install` from a commit that isn't a release tag)
+// rather than a published release.
+func isDevBuild(v string) bool {
+	return v == "dev" || strings.HasSuffix(v, "-dirty") || devBuildRE.MatchString(v)
+}
+
+func doUpgrade(force bool) error {
 	const repo = "fastclaw-ai/fastclaw"
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", repo)
 
@@ -75,6 +91,14 @@ func doUpgrade() error {
 		fmt.Printf("✅ Already up to date (%s)\n", version)
 		return nil
 	}
+
+	// A from-source build is usually AHEAD of the latest release; the
+	// tag-inequality check below can't tell newer from older, so without
+	// this guard `upgrade` silently downgrades a dev build.
+	if !force && isDevBuild(version) {
+		return fmt.Errorf("current binary %s is a from-source build; replacing it with release %s would likely be a downgrade.\nUse `make install` to update from source, or re-run with --force to install the release anyway", version, release.TagName)
+	}
+
 	fmt.Printf("📦 New version available: %s → %s\n", version, release.TagName)
 
 	// 3. Find the right asset for this platform
@@ -182,10 +206,35 @@ func doUpgrade() error {
 	return nil
 }
 
+// replaceBinary swaps dst for the binary at src via rename, never by
+// writing into the existing file: macOS caches code-signature validity
+// per inode, so an in-place overwrite leaves a stale cache entry and the
+// kernel SIGKILLs every subsequent launch even though `codesign -vv`
+// still passes. Renaming allocates a fresh inode and sidesteps the
+// cache; it is also the only way to replace a running exe on Windows,
+// which allows renaming but not rewriting.
 func replaceBinary(dst, src string) error {
 	srcData, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(dst, srcData, 0o755)
+	tmpNew := dst + ".new"
+	if err := os.WriteFile(tmpNew, srcData, 0o755); err != nil {
+		return err
+	}
+	old := dst + ".old"
+	os.Remove(old)
+	if err := os.Rename(dst, old); err != nil && !os.IsNotExist(err) {
+		os.Remove(tmpNew)
+		return err
+	}
+	if err := os.Rename(tmpNew, dst); err != nil {
+		os.Rename(old, dst)
+		os.Remove(tmpNew)
+		return err
+	}
+	// On Windows this fails while the old exe is still running; the
+	// leftover .old file is harmless and reclaimed on the next upgrade.
+	os.Remove(old)
+	return nil
 }

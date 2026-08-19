@@ -33,6 +33,10 @@ func (d *Direct) Execute(ctx context.Context, req toolproviders.Request) (toolpr
 	ctx, cancel := context.WithTimeout(ctx, directTimeout)
 	defer cancel()
 
+	// Swap HTML-shell URLs for their plain-text equivalent (GitHub blob
+	// -> raw) before spending a request on markup we'd only strip.
+	a.URL = NormalizeURL(a.URL)
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
 	if err != nil {
 		return toolproviders.Response{}, err

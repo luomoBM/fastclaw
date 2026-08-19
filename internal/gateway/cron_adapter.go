@@ -36,6 +36,7 @@ func (a *cronStoreAdapter) GetDueCronJobs(ctx context.Context, now time.Time) ([
 			ID:          r.ID,
 			AgentID:     r.AgentID,
 			OwnerUserID: owner,
+			ChatterID:   r.ChatterID,
 			Name:        r.Name,
 			Type:        r.Type,
 			Schedule:    r.Schedule,

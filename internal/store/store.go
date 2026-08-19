@@ -735,10 +735,14 @@ type GoalRecord struct {
 
 // CronJobRecord holds a scheduled job. agent_id is mandatory; user_id is
 // also stored so "list a user's crons" doesn't need a join against
-// agents and ownership checks can short-circuit.
+// agents and ownership checks can short-circuit. chatter_id records the
+// chatter (per-sender app_user / web login) that asked the agent to
+// create the job, so list_cron_jobs can isolate rows per chatter even
+// when multiple chatters share one public agent.
 type CronJobRecord struct {
 	ID        string     `json:"id"`
 	UserID    string     `json:"userId,omitempty"`
+	ChatterID string     `json:"chatterId,omitempty"`
 	AgentID   string     `json:"agentId"`
 	Name      string     `json:"name"`
 	Type      string     `json:"type"`

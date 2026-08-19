@@ -186,6 +186,11 @@ func attachSandboxToAgents(
 		for _, ag := range agentMgr.All() {
 			ag.SetSandboxPool(systemPool)
 		}
+		if buildinfo.IsSandboxEnforced() {
+			slog.Info("sandbox attached (enforced): all exec routed into sandbox", "user", userID)
+		} else {
+			slog.Info("sandbox attached (optional): host exec stays default, exec(sandbox:true) opts in per call", "user", userID)
+		}
 		return systemPool
 	}
 	if pathSandboxRequired() {
@@ -271,6 +276,9 @@ func assembleConfig(ctx context.Context, st store.Store, userID, agentID string)
 		}
 	}
 	if err := scope.SettingInto(ctx, st, NSMemory, userID, agentID, &cfg.Memory); err != nil {
+		return nil, err
+	}
+	if err := scope.SettingInto(ctx, st, NSWorkspaceHistory, userID, agentID, &cfg.WorkspaceHistory); err != nil {
 		return nil, err
 	}
 	if err := scope.SettingInto(ctx, st, NSPrivacy, userID, agentID, &cfg.Privacy); err != nil {
@@ -734,6 +742,10 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 				v := *agentOverride.AutoPersist
 				rc.AutoPersist = &v
 			}
+			if agentOverride.WorkspaceHistory != nil {
+				v := *agentOverride.WorkspaceHistory
+				rc.WorkspaceHistory = &v
+			}
 		}
 		// Same story for providers: assembleConfig was called with
 		// agentID="" so cfg.Providers (now in rc.Providers) only
@@ -776,6 +788,15 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 		agent.WithSessionStore(session.NewStoreAdapter(st, userID)),
 		agent.WithMemoryStore(agent.NewMemoryStoreAdapter(st)),
 		agent.WithDataStore(st),
+		// Capability probe for check_agent. Only this layer can answer
+		// it: provider-backed tools (image_gen, web_search, tts) are
+		// registered per agent from the merged config, so "does agent X
+		// have image_gen" is a config question, not a runtime one — and
+		// it is precisely the question that decides whether a freshly
+		// provisioned illustration agent can draw anything at all.
+		agent.WithToolAvailability(func(_ context.Context, agentID string) (map[string]bool, error) {
+			return agentToolAvailability(cfg, agentID), nil
+		}),
 	}
 	if ws != nil {
 		managerOpts = append(managerOpts, agent.WithWorkspaceStore(ws))

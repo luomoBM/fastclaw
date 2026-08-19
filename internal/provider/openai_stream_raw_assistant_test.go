@@ -140,6 +140,30 @@ func TestChatStreamRawAssistantIncludesToolCalls(t *testing.T) {
 	}
 }
 
+func TestToAPIMessagesRebuildAssistantKeepsReasoningContent(t *testing.T) {
+	msgs := []Message{
+		{Role: "user", Content: "hi"},
+		{
+			Role:      "assistant",
+			Content:   "",
+			Thinking:  "need to browse before answering",
+			ToolCalls: []ToolCall{{ID: "call_abc", Type: "function", Function: FunctionCall{Name: "web_fetch", Arguments: `{"url":"https://example.com"}`}}},
+		},
+		{Role: "tool", ToolCallID: "call_abc", Content: "ok"},
+	}
+
+	wire := toAPIMessages(msgs)
+	if len(wire) != 3 {
+		t.Fatalf("toAPIMessages returned %d msgs, want 3", len(wire))
+	}
+	if !strings.Contains(string(wire[1]), `"reasoning_content":"need to browse before answering"`) {
+		t.Fatalf("rebuilt assistant message missing reasoning_content:\n%s", string(wire[1]))
+	}
+	if !strings.Contains(string(wire[1]), `"tool_calls"`) {
+		t.Fatalf("rebuilt assistant message missing tool_calls:\n%s", string(wire[1]))
+	}
+}
+
 // Avoid an unused import on io when go vet is strict; keep one
 // reference so future edits don't break compile if io is needed.
 var _ = io.EOF

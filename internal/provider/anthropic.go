@@ -207,11 +207,8 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 					})
 				} else if part.Type == "image_url" && part.ImageURL != nil {
 					blocks = append(blocks, map[string]interface{}{
-						"type": "image",
-						"source": map[string]string{
-							"type": "url",
-							"url":  part.ImageURL.URL,
-						},
+						"type":   "image",
+						"source": anthropicImageSource(part.ImageURL.URL),
 					})
 				}
 			}
@@ -373,6 +370,47 @@ func anthropicContentHasBlockType(raw json.RawMessage, types ...string) bool {
 		}
 	}
 	return false
+}
+
+// anthropicImageSource converts our OpenAI-style image_url value to the
+// source union expected by Anthropic Messages. Remote images use a URL
+// source, but a browser-pasted image arrives as a data URL and MUST be
+// split into media_type + raw base64 data. Sending a data URL as
+// source.type="url" is not valid Anthropic wire format; some compatible
+// providers silently ignore it instead of returning a schema error, which
+// makes the model hallucinate that it inspected an image it never received.
+func anthropicImageSource(raw string) map[string]string {
+	header, data, ok := strings.Cut(raw, ",")
+	if !ok || !strings.HasPrefix(strings.ToLower(header), "data:") {
+		return map[string]string{"type": "url", "url": raw}
+	}
+
+	meta := strings.Split(header[len("data:"):], ";")
+	mediaType := strings.ToLower(strings.TrimSpace(meta[0]))
+	isBase64 := false
+	for _, flag := range meta[1:] {
+		if strings.EqualFold(strings.TrimSpace(flag), "base64") {
+			isBase64 = true
+			break
+		}
+	}
+	if !strings.HasPrefix(mediaType, "image/") || !isBase64 || data == "" {
+		return map[string]string{"type": "url", "url": raw}
+	}
+
+	// FileReader emits one unbroken base64 line, but stripping whitespace
+	// also makes persisted/legacy data URLs safe to replay.
+	data = strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+			return -1
+		}
+		return r
+	}, data)
+	return map[string]string{
+		"type":       "base64",
+		"media_type": mediaType,
+		"data":       data,
+	}
 }
 
 // parseToolInput decodes a stored tool_use Arguments string into the

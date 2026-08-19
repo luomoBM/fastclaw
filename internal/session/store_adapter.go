@@ -325,7 +325,7 @@ func (a *StoreAdapter) BuildWebSession(ctx context.Context, m store.SessionMeta)
 	if preview == "" {
 		return nil
 	}
-	title := displaySessionTitle(m.Title, m.Key, preview)
+	title := displaySessionTitle(m.Title, m.Key, m.ChatID, preview)
 	return &WebSession{
 		ID:            m.Key,
 		Channel:       channel,
@@ -345,9 +345,10 @@ func (a *StoreAdapter) BuildWebSession(ctx context.Context, m store.SessionMeta)
 // session_key as their title.  Treating that value as a real custom title
 // prevents the UI's otherwise-correct title -> preview -> id fallback from
 // ever reaching the first user message.
-func displaySessionTitle(storedTitle, sessionKey, preview string) string {
+func displaySessionTitle(storedTitle, sessionKey, chatID, preview string) string {
 	title := strings.TrimSpace(storedTitle)
-	if title == "" || title == sessionKey {
+	isChatID := chatID != "" && (title == chatID || title == "web_"+chatID)
+	if title == "" || title == sessionKey || isChatID {
 		return preview
 	}
 	return title

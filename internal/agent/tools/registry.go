@@ -293,6 +293,14 @@ type Registry struct {
 	// confusing "sh: python: command not found" instead of a clear
 	// "sandbox required but unavailable" error.
 	sandboxRequired bool
+	// sandboxProvider lazily resolves the per-session sandbox executor in
+	// OPTIONAL sandbox mode (self-hosted installs, where the host shell
+	// stays the default execution path). The exec tool calls it only when
+	// the model passes sandbox:true, so sessions that never ask for the
+	// sandbox never start a container. Set per-turn by bindSession; nil
+	// when no pool is configured or when sandbox is enforced (enforced
+	// mode swaps the whole toolset via SetExecutor instead).
+	sandboxProvider func(ctx context.Context) (sandbox.Executor, error)
 	// callerIsAdmin marks the chatter driving the current turn as the
 	// agent owner / per-channel admin. Set per-turn by the agent loop
 	// via SetCallerIsAdmin from isAdminChatter(msg); the file tools
@@ -472,6 +480,41 @@ func (r *Registry) readSystemFileForUser(ctx context.Context, userID, name strin
 	return r.systemFileStore.GetWorkspaceFile(ctx, r.agentID, userID, name)
 }
 
+// HasTool reports whether a tool of that name is currently registered.
+// Tool availability is dynamic — image_gen, web_search and tts appear
+// only once provider credentials exist — so this is the authoritative
+// answer to "can this agent actually do X", as opposed to whether a
+// skill claiming to do X is installed.
+func (r *Registry) HasTool(name string) bool {
+	if r == nil {
+		return false
+	}
+	return r.GetFunc(name) != nil
+}
+
+// ExecRunsOnHost reports whether shell commands from this registry land
+// on the operator's own machine, as opposed to inside a sandbox
+// container. It is the ONLY safe basis for probing the environment a
+// command will run in — the host's PATH says nothing about the
+// container's, and vice versa.
+//
+// False whenever a sandbox could service the call: an executor is bound
+// (enforced mode), a sandbox is required, a lazy provider is installed
+// (optional mode, reachable via exec(sandbox:true)), or the caller isn't
+// an admin (guests are forced into the sandbox — see makeExecToolFull).
+// Deliberately conservative: "might be sandboxed" answers false, because
+// a wrong "yes, host" produces confident claims about an environment we
+// never looked at.
+func (r *Registry) ExecRunsOnHost() bool {
+	if r == nil {
+		return false
+	}
+	if r.executor != nil || r.sandboxRequired || r.sandboxProvider != nil {
+		return false
+	}
+	return r.callerIsAdmin
+}
+
 // SetSandboxRequired flips the exec tool's host-shell fallback off. Call
 // with true whenever the runtime decides this agent must run inside a
 // sandbox executor (e.g., user enabled cfg.Sandbox after boot, so
@@ -481,6 +524,12 @@ func (r *Registry) readSystemFileForUser(ctx context.Context, userID, name strin
 // instead of leaking onto the host shell.
 func (r *Registry) SetSandboxRequired(required bool) {
 	r.sandboxRequired = required
+}
+
+// SetSandboxProvider installs (or clears, with nil) the lazy executor
+// resolver for optional-sandbox mode. See the sandboxProvider field doc.
+func (r *Registry) SetSandboxProvider(fn func(ctx context.Context) (sandbox.Executor, error)) {
+	r.sandboxProvider = fn
 }
 
 // SetSessionID scopes the registry's workspace.Store calls (write_file /

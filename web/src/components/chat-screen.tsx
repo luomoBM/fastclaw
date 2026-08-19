@@ -6,7 +6,7 @@ import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { fileUrl, getAgent, getAgentKnowledgeFile, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, getScopePreview, getScopePreviewLogs, listAgentFiles, listProjects, renameChatSession, revealAgentWorkspace, sendChatStream, steerChat, uploadAgentFiles, getSkills, type ChatHistoryMessage, type ChatStreamEvent, type KnowledgeSource, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile } from "@/lib/api";
+import { fileUrl, getAgent, getAgentKnowledgeFile, getChangedFiles, getChatHistoryWithCursor, getChatSessions, getChatTodo, getMe, getScopePreview, getScopePreviewLogs, getSessionHistory, listAgentFiles, listProjects, renameChatSession, restoreSessionHistory, revealAgentWorkspace, sendChatStream, steerChat, uploadAgentFiles, getSkills, type ChatHistoryMessage, type ChatStreamEvent, type KnowledgeSource, type ScopePreview, type SkillInfo, type TodoItem, type ToolResultMetadata, type WorkspaceFile, type WorkspaceHistoryEntry } from "@/lib/api";
 import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Folder, FolderSearch, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square, FolderOpen, RefreshCw, Eye, Code2, RotateCcw, ListChecks, Terminal, ExternalLink, MoreHorizontal, PanelLeftClose, PanelLeftOpen, BookOpen } from "lucide-react";
 import Link from "next/link";
 import { ChatMarkdown } from "@/components/chat-markdown";
@@ -222,6 +222,28 @@ interface ChatSession {
 
 function generateSessionId() {
   return `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const PASTED_IMAGE_EXTENSIONS: Record<string, string> = {
+  "image/avif": "avif",
+  "image/gif": "gif",
+  "image/heic": "heic",
+  "image/heif": "heif",
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/svg+xml": "svg",
+  "image/webp": "webp",
+};
+
+// Clipboard image files are commonly all named `image.png`. Give every
+// paste a unique, useful name so uploading a second screenshot doesn't
+// overwrite the first one in the session workspace.
+function namePastedImage(file: File, pasteId: number, index: number): File {
+  const extension = PASTED_IMAGE_EXTENSIONS[file.type.toLowerCase()] || "png";
+  return new globalThis.File([file], `pasted-image-${pasteId}-${index + 1}.${extension}`, {
+    type: file.type || `image/${extension}`,
+    lastModified: Date.now(),
+  });
 }
 
 /** Convert raw history messages into UI ChatMessages, grouping tool calls with results. */
@@ -572,6 +594,7 @@ export function ChatScreen() {
   const stickToBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const pasteIdRef = useRef(0);
 
   // Dedupe events arriving on both the active POST stream and the
   // parallel /api/chat/subscribe SSE — both subscribe to the same
@@ -1844,6 +1867,33 @@ export function ChatScreen() {
     setAttachments((prev) => [...prev, ...newFiles]);
   }, []);
 
+  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (!canAttach) return;
+
+    // `items` is the most reliable source for screenshots, while `files`
+    // covers browsers that expose clipboard files without DataTransferItems.
+    const itemImages = Array.from(e.clipboardData.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    const clipboardImages = itemImages.length > 0
+      ? itemImages
+      : Array.from(e.clipboardData.files).filter((file) => file.type.startsWith("image/"));
+
+    if (clipboardImages.length === 0) return;
+
+    // The image is represented by the preview chips, so don't also paste
+    // the browser's text/html fallback (often a huge data URL) into input.
+    e.preventDefault();
+    pasteIdRef.current += 1;
+    const pasteId = Date.now() * 1000 + pasteIdRef.current;
+    const pastedFiles = clipboardImages.map((file, index) =>
+      namePastedImage(file, pasteId, index),
+    );
+    setAttachments((prev) => [...prev, ...pastedFiles]);
+    setSlashOpen(false);
+  }, [canAttach]);
+
   const removeAttachment = useCallback((idx: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== idx));
   }, []);
@@ -2491,6 +2541,7 @@ export function ChatScreen() {
                     ref={textareaRef}
                     value={input}
                     onChange={handleInputChange}
+                    onPaste={handlePaste}
                     onKeyDown={handleKeyDown}
                     onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
                     placeholder={
@@ -2588,6 +2639,7 @@ export function ChatScreen() {
                     ref={textareaRef}
                     value={input}
                     onChange={handleInputChange}
+                    onPaste={handlePaste}
                     onKeyDown={handleKeyDown}
                     onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
                     placeholder={
@@ -3363,6 +3415,10 @@ function WorkspacePanel({
   // just this task's output), and whether to show all files instead.
   const [changed, setChanged] = useState<{ files: WorkspaceFile[]; available: boolean }>({ files: [], available: false });
   const [showAll, setShowAll] = useState(false);
+  // Workspace version history dropdown (per-session git snapshots).
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<WorkspaceHistoryEntry[]>([]);
+  const [restoring, setRestoring] = useState(false);
   // Self-hosted-only "open in Finder" affordance. We learn the deploy
   // mode from /api/me on mount; it doesn't change at runtime, so one
   // fetch per panel instance is enough. Hosted deployments leave this
@@ -3488,6 +3544,44 @@ function WorkspacePanel({
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  // Workspace version history: load commits when the dropdown opens;
+  // restore checks out the whole session workspace to that commit and
+  // refreshes the file tree/viewer.
+  const toggleHistory = useCallback(async () => {
+    if (historyOpen) {
+      setHistoryOpen(false);
+      return;
+    }
+    if (!sessionId) return;
+    setHistoryOpen(true);
+    try {
+      setHistory(await getSessionHistory(agentId, sessionId));
+    } catch {
+      setHistory([]);
+    }
+  }, [historyOpen, agentId, sessionId]);
+
+  const handleRestore = useCallback(
+    async (commit: string) => {
+      if (!sessionId || restoring) return;
+      // eslint-disable-next-line no-alert
+      if (!window.confirm("将此会话的工作区回滚到该版本？当前未提交的文件修改会被覆盖。")) return;
+      setRestoring(true);
+      try {
+        await restoreSessionHistory(agentId, sessionId, commit);
+        setHistoryOpen(false);
+        setPreviewing(null);
+        await refresh();
+      } catch (error) {
+        // eslint-disable-next-line no-alert
+        alert("回滚失败：" + String(error));
+      } finally {
+        setRestoring(false);
+      }
+    },
+    [agentId, sessionId, restoring, refresh],
+  );
 
   // Switching conversations swaps the file tree to the new scope — clear the
   // selected file too, so the viewer never shows a file from the previous
@@ -3673,6 +3767,47 @@ function WorkspacePanel({
                 >
                   <RefreshCw className={`h-4 w-4 ${loading ? "animate-spin" : ""}`} />
                 </button>
+                {sessionId && !projectId && (
+                  <span className="relative">
+                    <button
+                      onClick={toggleHistory}
+                      disabled={restoring}
+                      className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground disabled:opacity-50"
+                      title="版本历史（回滚工作区）"
+                    >
+                      <RotateCcw className={`h-4 w-4 ${restoring ? "animate-spin" : ""}`} />
+                    </button>
+                    {historyOpen && (
+                      <div className="absolute right-0 top-8 z-20 w-72 rounded-md border border-border bg-popover p-1 shadow-lg">
+                        <div className="px-2 py-1 text-xs font-medium text-muted-foreground">版本历史</div>
+                        {history.length === 0 ? (
+                          <div className="px-2 py-3 text-center text-xs text-muted-foreground">暂无历史快照</div>
+                        ) : (
+                          history.slice(0, 20).map((entry) => (
+                            <div
+                              key={entry.hash}
+                              className="flex items-center justify-between gap-2 rounded px-2 py-1 hover:bg-muted/50"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="truncate text-xs">{entry.message}</div>
+                                <div className="text-[10px] text-muted-foreground">
+                                  {entry.hash.slice(0, 7)} · {new Date(entry.time * 1000).toLocaleString()}
+                                </div>
+                              </div>
+                              <button
+                                onClick={() => handleRestore(entry.hash)}
+                                disabled={restoring}
+                                className="shrink-0 rounded bg-muted px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-50"
+                              >
+                                回滚
+                              </button>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    )}
+                  </span>
+                )}
               </>
             )}
             <button

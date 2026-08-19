@@ -77,13 +77,20 @@ type StoreJob struct {
 	ID          string
 	AgentID     string
 	OwnerUserID string
-	Name        string
-	Type        string
-	Schedule    string
-	Message     string
-	Channel     string
-	ChatID      string
-	AccountID   string
+	// ChatterID is the per-sender app_user / web login that created the
+	// job. The scheduler stamps it onto the fired InboundMessage.UserID
+	// so the replayed turn is attributed to the same chatter that asked
+	// for the reminder (instead of a synthetic "cron" identity). Legacy
+	// rows written before this column carry "" — the scheduler falls
+	// back to "cron" for those, preserving the old behavior.
+	ChatterID string
+	Name      string
+	Type      string
+	Schedule  string
+	Message   string
+	Channel   string
+	ChatID    string
+	AccountID string
 	// Timezone is the IANA zone the schedule is interpreted in —
 	// captured from the chatter at creation time. Legacy rows carry
 	// "UTC" (the old hardcoded value); empty means server-local.
@@ -277,11 +284,20 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 			text = fmt.Sprintf("[Cron Job: %s] This is a scheduled task trigger.", j.Name)
 		}
 
+		// Attribute the fired turn to the chatter that created the job so
+		// its session history / memory land on the right per-sender app_user.
+		// Legacy rows (chatter_id empty, written before this column) fall
+		// back to the "cron" sentinel to preserve the old routing.
+		actorID := j.ChatterID
+		if actorID == "" {
+			actorID = "cron"
+		}
+
 		s.bus.Inbound <- bus.InboundMessage{
 			Channel:     j.Channel,
 			AccountID:   j.AccountID,
 			ChatID:      j.ChatID,
-			UserID:      "cron",
+			UserID:      actorID,
 			OwnerUserID: j.OwnerUserID,
 			AgentID:     j.AgentID,
 			Text:        text,

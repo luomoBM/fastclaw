@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -96,12 +97,29 @@ func main() {
 	rootCmd := &cobra.Command{
 		Use:   "fastclaw",
 		Short: "FastClaw - Multi-User AI Agent Platform",
+		// Long-running services (gateway, daemon) narrate at INFO; one-shot
+		// CLI commands must not. Every `fastclaw agents ls` was prefixing
+		// its output with two lines of storage/migration chatter, which is
+		// noise for a human and context pollution for an agent shelling out
+		// to us — eight CLI calls in one turn meant sixteen wasted lines,
+		// every one of them re-sent to the model on the next request.
+		//
+		// runGateway raises the level back to INFO for its own process.
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+				Level: cliLogLevel(),
+			})))
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if isInteractiveTerminal(os.Stdin, os.Stdout) {
+				return runChat(cmd.Context(), chatOptions{})
+			}
 			return runGateway(18953)
 		},
 	}
 
 	rootCmd.AddCommand(gatewayCmd())
+	rootCmd.AddCommand(chatCmd())
 	rootCmd.AddCommand(skillCmd())
 	rootCmd.AddCommand(versionCmd())
 	rootCmd.AddCommand(upgradeCmd())
@@ -110,6 +128,7 @@ func main() {
 	rootCmd.AddCommand(sandboxCmd())
 	rootCmd.AddCommand(policyCmd())
 	rootCmd.AddCommand(daemonCmd())
+	rootCmd.AddCommand(logCmd())
 	rootCmd.AddCommand(adminCmd())
 	rootCmd.AddCommand(apikeyCmd())
 	rootCmd.AddCommand(agentsCmd())
@@ -126,11 +145,32 @@ func main() {
 	}
 }
 
+// cliLogLevel is the slog level for one-shot CLI commands: quiet by
+// default, opened up via FASTCLAW_LOG_LEVEL for debugging. Warnings and
+// errors still print, so nothing that needs the operator's attention is
+// suppressed — only the routine "here's what I'm doing" narration.
+func cliLogLevel() slog.Level {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("FASTCLAW_LOG_LEVEL"))) {
+	case "debug":
+		return slog.LevelDebug
+	case "info":
+		return slog.LevelInfo
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelWarn
+	}
+}
+
 func gatewayCmd() *cobra.Command {
 	var port int
 	cmd := &cobra.Command{
 		Use:   "gateway",
-		Short: "Start the FastClaw gateway",
+		Short: "Start the FastClaw gateway (foreground; use `fastclaw daemon` for background management)",
+		// NoArgs so `fastclaw gateway restart` errors instead of silently
+		// starting a second foreground gateway — restart/stop/status live
+		// under `fastclaw daemon`.
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runGateway(port)
 		},

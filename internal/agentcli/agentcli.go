@@ -53,6 +53,14 @@ type InitOptions struct {
 	Email       string
 	Password    string
 	DisplayName string
+
+	// OwnerUserID pins ownership by account ID and takes precedence over
+	// Username. Callers that already know exactly whose agent this is —
+	// notably the in-chat provisioning tools, which must create agents
+	// for the chatter driving the turn — set this. Without it, Init's
+	// convenience fallback ("first active super_admin") would silently
+	// hand a multi-tenant deployment's new agent to the wrong account.
+	OwnerUserID string
 }
 
 // InitResult describes what Init created or updated.
@@ -170,6 +178,17 @@ func ensureOwner(ctx context.Context, st store.Store, opts InitOptions) (*users.
 	accts, err := users.NewAccounts(st)
 	if err != nil {
 		return nil, false, "", err
+	}
+	// An explicit owner ID short-circuits every heuristic below. It is an
+	// error for it not to resolve — falling back to "some super_admin"
+	// when the caller named an owner would create the agent under the
+	// wrong account, which is worse than failing.
+	if opts.OwnerUserID != "" {
+		acct, err := accts.Get(ctx, opts.OwnerUserID)
+		if err != nil {
+			return nil, false, "", fmt.Errorf("owner %q not found: %w", opts.OwnerUserID, err)
+		}
+		return acct, false, "", nil
 	}
 	username := opts.Username
 	explicit := username != ""

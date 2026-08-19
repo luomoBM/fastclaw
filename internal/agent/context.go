@@ -31,6 +31,13 @@ type ContextBuilder struct {
 	thinking       string // off, low, medium, high, adaptive
 	sandboxEnabled bool
 	sandboxBackend string
+	// sandboxOptional marks the self-hosted "sandbox as a tool" mode: a
+	// sandbox pool is wired but the host stays the default execution
+	// environment, and the model opts in per call via exec(sandbox:true).
+	// Mutually exclusive with sandboxEnabled (the enforced-boundary mode);
+	// drives a slimmer prompt section that advertises the opt-in instead
+	// of the /workspace filesystem layout. See buildinfo.IsSandboxEnforced.
+	sandboxOptional bool
 	// promptMode selects how heavily the framework system prompt
 	// participates in the assembled prompt. Empty defaults to
 	// config.PromptModeAgent for backward compatibility. Chatbot and

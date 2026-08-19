@@ -254,6 +254,10 @@ func webFetchTool(ctx context.Context, r *Registry, rawArgs json.RawMessage) (st
 		maxLen = defaultMaxLen
 	}
 
+	// Swap HTML-shell URLs for their plain-text equivalent (GitHub blob
+	// -> raw) before spending a request on markup we'd only strip.
+	args.URL = webfetchprovider.NormalizeURL(args.URL)
+
 	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 

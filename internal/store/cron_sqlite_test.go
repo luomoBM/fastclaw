@@ -29,6 +29,7 @@ func TestCronJobSQLiteRoundTrip(t *testing.T) {
 	job := &CronJobRecord{
 		ID:        "test-once-1",
 		AgentID:   "user-test",
+		ChatterID: "chatter-7",
 		Name:      "test reminder",
 		Type:      "once",
 		Schedule:  futureTime.Format(time.RFC3339),
@@ -65,6 +66,9 @@ func TestCronJobSQLiteRoundTrip(t *testing.T) {
 	}
 	if due[0].ID != "test-once-1" {
 		t.Errorf("expected job ID test-once-1, got %s", due[0].ID)
+	}
+	if got := due[0].ChatterID; got != "chatter-7" {
+		t.Errorf("ChatterID round-trip failed: got %q, want chatter-7", got)
 	}
 
 	// Verify: GetNextDueTime should return the job's NextRun

@@ -129,10 +129,14 @@ func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
 		return slashResult{handled: true, reply: fmt.Sprintf("⚡ FastClaw\nAgent: %s\nModel: %s", a.name, a.model)}
 
 	case "/whoami":
+		adminLine := "no — operator-only actions (host shell, agent management, write-slash commands) are unavailable"
+		if a.isAdminChatter(msg) {
+			adminLine = "yes"
+		}
 		return slashResult{
 			handled: true,
-			reply: fmt.Sprintf("Channel: `%s`\nYour user ID: `%s`\nSender name: `%s`\n\n(Add this ID to `admins.%s` in the agent config to grant write-slash access.)",
-				msg.Channel, msg.UserID, msg.SenderName, msg.Channel),
+			reply: fmt.Sprintf("Channel: `%s`\nYour user ID: `%s`\nSender name: `%s`\nAdmin: %s\n\n(The operator can add this ID to `admins.%s` in the agent config to grant admin access.)",
+				msg.Channel, msg.UserID, msg.SenderName, adminLine, msg.Channel),
 		}
 
 	default:
@@ -186,6 +190,17 @@ func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 	if msg.Channel == "web" || msg.Channel == "api" {
 		return msg.UserID != "" && msg.UserID == a.ownerUserID
 	}
+	// Shared-identity channels rewrite EVERY speaker's UserID to the
+	// channel owner's id (routing.processInbound), which makes the
+	// owner-equality check below meaningless in groups: any group member
+	// would pass as the owner. The platform-side sender id is gone by
+	// this point, so there's nothing to match against an allowlist
+	// either — deny. DMs on a shared-identity channel are fine: the
+	// owner marked the channel as personally theirs, and a DM sender on
+	// their own bot is them by construction.
+	if msg.SharedIdentity && msg.PeerKind == "group" {
+		return false
+	}
 	list, ok := a.admins[msg.Channel]
 	if !ok || len(list) == 0 {
 		// No allowlist configured for this channel. Fall back to
@@ -201,6 +216,23 @@ func (a *Agent) isAdminChatter(msg bus.InboundMessage) bool {
 		}
 	}
 	return false
+}
+
+// isTrustedTurn decides whether the current turn may touch the HOST
+// (host-shell exec, file access outside the workspace) on a self-hosted
+// install. Admin chatters qualify (isAdminChatter). Heartbeat turns do
+// too: their instructions come from HEARTBEAT.md, which the
+// identity-file gate keeps writable only by admin chatters. Cron
+// replays and subagent spawns stay untrusted even though they're
+// runtime-originated — their payload text was authored in some earlier
+// chat turn whose chatter can't be verified here, so a guest could park
+// a hostile command in a cron job and have it replayed with elevated
+// rights.
+func (a *Agent) isTrustedTurn(msg bus.InboundMessage) bool {
+	if msg.Source == bus.SourceHeartbeat {
+		return true
+	}
+	return a.isAdminChatter(msg)
 }
 
 // slashRetry re-runs the last user message, discarding the last assistant response.

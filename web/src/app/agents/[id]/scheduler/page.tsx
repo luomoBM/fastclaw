@@ -241,6 +241,14 @@ function JobRow({
                 via {job.channel}
               </span>
             )}
+            {job.chatterId && (
+              <span
+                className="text-[11px] text-muted-foreground"
+                title="Per-sender user that created this job"
+              >
+                by {job.chatterId}
+              </span>
+            )}
           </div>
           <div className="flex items-start gap-1.5 text-xs text-muted-foreground">
             <MessageSquare className="size-3.5 mt-0.5 shrink-0" />

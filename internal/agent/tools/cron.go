@@ -66,7 +66,7 @@ func RegisterCronTools(r *Registry, st store.Store, userID, agentID string) {
 			"type":       "object",
 			"properties": map[string]interface{}{},
 		},
-		makeListCronJobs(st, userID, agentID),
+		makeListCronJobs(st, r, userID, agentID),
 	)
 
 	r.Register("delete_cron_job",
@@ -81,7 +81,7 @@ func RegisterCronTools(r *Registry, st store.Store, userID, agentID string) {
 			},
 			"required": []string{"id"},
 		},
-		makeDeleteCronJob(st, userID),
+		makeDeleteCronJob(st, r, agentID),
 	)
 }
 
@@ -105,6 +105,11 @@ func makeCreateCronJob(st store.Store, r *Registry, userID, agentID string) Tool
 		channel := r.MessageChannel()
 		accountID := r.MessageAccountID()
 		chatID := r.MessageChatID()
+		// Stamp the chatter that asked for the reminder onto the row so
+		// list_cron_jobs can isolate rows per chatter (otherwise two
+		// chatters of one public agent would see each other's reminders),
+		// and so the fired turn replays under that chatter's identity.
+		chatterID := r.ChatterUserID()
 
 		// The chatter's effective timezone governs how the schedule is
 		// read: zone-less 'once' datetimes and cron wall-clock fields
@@ -151,6 +156,7 @@ func makeCreateCronJob(st store.Store, r *Registry, userID, agentID string) Tool
 		job := &store.CronJobRecord{
 			ID:        id,
 			AgentID:   agentID,
+			ChatterID: chatterID,
 			Name:      args.Name,
 			Type:      jobType,
 			Schedule:  args.Schedule,
@@ -186,13 +192,26 @@ func makeCreateCronJob(st store.Store, r *Registry, userID, agentID string) Tool
 	}
 }
 
-func makeListCronJobs(st store.Store, userID, agentID string) ToolFunc {
+func makeListCronJobs(st store.Store, r *Registry, userID, agentID string) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 		jobs, err := st.ListCronJobsByAgent(ctx, agentID)
 		if err != nil {
 			return "", fmt.Errorf("list cron jobs: %w", err)
 		}
-		filtered := jobs
+		// Isolate rows per chatter: a public agent serving multiple senders
+		// must not leak one chatter's reminders to another. Rows are only
+		// visible to the chatter that created them; legacy rows with an
+		// empty chatter_id (written before per-chatter attribution) are
+		// hidden from every chatter here — they remain visible to the agent
+		// owner via the web dashboard / CLI. This mirrors the OwnerKeyFor
+		// tenancy boundary background shells already enforce.
+		chatterID := r.ChatterUserID()
+		filtered := jobs[:0:0]
+		for _, j := range jobs {
+			if j.ChatterID != "" && j.ChatterID == chatterID {
+				filtered = append(filtered, j)
+			}
+		}
 
 		if len(filtered) == 0 {
 			return "No cron jobs found for this agent.", nil
@@ -203,7 +222,7 @@ func makeListCronJobs(st store.Store, userID, agentID string) ToolFunc {
 	}
 }
 
-func makeDeleteCronJob(st store.Store, userID string) ToolFunc {
+func makeDeleteCronJob(st store.Store, r *Registry, agentID string) ToolFunc {
 	return func(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 		var args deleteCronJobArgs
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
@@ -211,6 +230,16 @@ func makeDeleteCronJob(st store.Store, userID string) ToolFunc {
 		}
 		if args.ID == "" {
 			return "", fmt.Errorf("id is required")
+		}
+		// Enforce the same per-chatter tenancy as list_cron_jobs: a job
+		// created by one chatter must not be deletable by another. We
+		// load the row first and verify it belongs to the calling chatter
+		// (and this agent). A mismatch is reported as "not found" so the
+		// error doesn't leak the row's existence to a non-owner.
+		job, err := st.GetCronJob(ctx, args.ID)
+		if err != nil || job == nil || job.AgentID != agentID ||
+			job.ChatterID == "" || job.ChatterID != r.ChatterUserID() {
+			return "", fmt.Errorf("cron job %q not found", args.ID)
 		}
 		if err := st.DeleteCronJob(ctx, args.ID); err != nil {
 			return "", fmt.Errorf("delete cron job: %w", err)

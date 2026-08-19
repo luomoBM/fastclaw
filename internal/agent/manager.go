@@ -1,11 +1,14 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -50,6 +53,29 @@ type managerOpts struct {
 	quotaStore      usage.QuotaStore
 	userID          string
 	globalSkillsCfg config.SkillsCfg
+	// toolAvailability answers "which tools would agent X have at
+	// runtime". Only the gateway can say — tool registration depends on
+	// per-agent provider credentials — so it is injected rather than
+	// derived here. Nil makes check_agent report tool status as
+	// unverified instead of guessing.
+	toolAvailability func(ctx context.Context, agentID string) (map[string]bool, error)
+	// onAgentChanged is invoked after in-chat provisioning mutates an
+	// agent, so a running gateway can reload rather than require a
+	// restart.
+	onAgentChanged func()
+}
+
+// WithToolAvailability supplies the capability probe behind check_agent.
+// Without it a freshly provisioned agent can be reported "configured"
+// while being unable to do the one thing its skill exists for.
+func WithToolAvailability(fn func(ctx context.Context, agentID string) (map[string]bool, error)) ManagerOption {
+	return func(o *managerOpts) { o.toolAvailability = fn }
+}
+
+// WithAgentChangeHook registers a callback fired after in-chat agent
+// provisioning, so the gateway can pick up the new/changed agent.
+func WithAgentChangeHook(fn func()) ManagerOption {
+	return func(o *managerOpts) { o.onAgentChanged = fn }
 }
 
 func WithSessionStore(st session.SessionStore) ManagerOption {
@@ -258,6 +284,46 @@ func (m *Manager) buildAgent(rc config.ResolvedAgent, prov provider.Provider, mb
 		// scope-prefs lookup, hence wired here and re-applied by
 		// ReloadWorkspaceFiles after every ctxBuilder rebuild.
 		ag.ctxBuilder.SetTimezoneResolver(ag.chatterLocation)
+
+		// In-chat provisioning. Goes through the same Go API as the CLI
+		// and the admin UI, so "set me up a new agent" behaves the same
+		// whether or not a sandbox is configured — the previous path
+		// (model composes `fastclaw ...`, exec runs it) only ever worked
+		// when exec reached the operator's host.
+		ownerID := rc.UserID
+		if ownerID == "" {
+			ownerID = m.uid
+		}
+		resolveTargetSkills := func(ctx context.Context, ref string) (string, error) {
+			rec, err := agentcli.Resolve(ctx, m.opts.dataStore, ref)
+			if err != nil {
+				return "", err
+			}
+			if rec.UserID != ownerID {
+				return "", fmt.Errorf("agent %q belongs to a different account — refusing to install into it", ref)
+			}
+			home, err := config.AgentHomeDir(rec.ID)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Join(home, "skills"), nil
+		}
+		tools.RegisterAgentAdmin(ag.registry, tools.AgentAdminDeps{
+			Store:            m.opts.dataStore,
+			OwnerUserID:      ownerID,
+			AgentHomeDir:     config.AgentHomeDir,
+			ToolAvailability: m.opts.toolAvailability,
+			OnChanged:        m.opts.onAgentChanged,
+		})
+		// install_skill / search_skills were written but never registered —
+		// the tools existed as dead code, which is why provisioning had to
+		// shell out to the CLI in the first place.
+		tools.RegisterSkillInstallForTarget(
+			ag.registry,
+			filepath.Join(rc.Home, "skills"),
+			resolveTargetSkills,
+			func() { ag.refreshSkillsFromStore(m.uid) },
+		)
 	}
 	// Stamp agentID even when no workspaceStore is wired (single-user
 	// local mode), so usage metering can record per-agent rollups.

@@ -7,12 +7,14 @@ func TestDisplaySessionTitle(t *testing.T) {
 		name        string
 		storedTitle string
 		sessionKey  string
+		chatID      string
 		preview     string
 		want        string
 	}{
 		{
 			name:       "empty title uses first user message",
 			sessionKey: "s-1783753587119-lvlph0",
+			chatID:     "s-1783753500000-browser",
 			preview:    "帮我分析一下这个问题",
 			want:       "帮我分析一下这个问题",
 		},
@@ -20,6 +22,23 @@ func TestDisplaySessionTitle(t *testing.T) {
 			name:        "legacy session id title uses first user message",
 			storedTitle: "s-1783753587119-lvlph0",
 			sessionKey:  "s-1783753587119-lvlph0",
+			chatID:      "s-1783753500000-browser",
+			preview:     "帮我分析一下这个问题",
+			want:        "帮我分析一下这个问题",
+		},
+		{
+			name:        "legacy chat id title uses first user message",
+			storedTitle: "s-1783753500000-browser",
+			sessionKey:  "s-1783753587119-lvlph0",
+			chatID:      "s-1783753500000-browser",
+			preview:     "帮我分析一下这个问题",
+			want:        "帮我分析一下这个问题",
+		},
+		{
+			name:        "legacy prefixed chat id title uses first user message",
+			storedTitle: "web_s-1783753500000-browser",
+			sessionKey:  "s-1783753587119-lvlph0",
+			chatID:      "s-1783753500000-browser",
 			preview:     "帮我分析一下这个问题",
 			want:        "帮我分析一下这个问题",
 		},
@@ -27,6 +46,7 @@ func TestDisplaySessionTitle(t *testing.T) {
 			name:        "custom title is preserved",
 			storedTitle: "故障排查",
 			sessionKey:  "s-1783753587119-lvlph0",
+			chatID:      "s-1783753500000-browser",
 			preview:     "帮我分析一下这个问题",
 			want:        "故障排查",
 		},
@@ -34,6 +54,7 @@ func TestDisplaySessionTitle(t *testing.T) {
 			name:        "surrounding whitespace is normalized",
 			storedTitle: "  故障排查  ",
 			sessionKey:  "s-1783753587119-lvlph0",
+			chatID:      "s-1783753500000-browser",
 			preview:     "帮我分析一下这个问题",
 			want:        "故障排查",
 		},
@@ -41,7 +62,7 @@ func TestDisplaySessionTitle(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := displaySessionTitle(tt.storedTitle, tt.sessionKey, tt.preview); got != tt.want {
+			if got := displaySessionTitle(tt.storedTitle, tt.sessionKey, tt.chatID, tt.preview); got != tt.want {
 				t.Fatalf("displaySessionTitle() = %q, want %q", got, tt.want)
 			}
 		})

@@ -3,6 +3,7 @@ package daemon
 import (
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,6 +67,16 @@ func Start(port int) error {
 		return fmt.Errorf("daemon already running (PID %d)", st.PID)
 	}
 
+	// The pidfile says nothing is running, but the port may still be
+	// held by a process we don't track (typically a foreground
+	// `fastclaw gateway` whose pidfile entry was lost). Starting the
+	// wrapper anyway would just crash-loop its gateway child on bind,
+	// so surface the conflict instead.
+	if conn, derr := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 500*time.Millisecond); derr == nil {
+		conn.Close()
+		return fmt.Errorf("port %d is already in use by a process the daemon does not manage (perhaps a foreground `fastclaw gateway`); stop it first: lsof -ti tcp:%d | xargs kill", port, port)
+	}
+
 	pidFile, logFile, logDir, err := Paths()
 	if err != nil {
 		return err
@@ -109,6 +120,7 @@ func Start(port int) error {
 	lf.Close()
 
 	fmt.Printf("Daemon started (PID %d)\n", cmd.Process.Pid)
+	fmt.Printf("Web:  http://127.0.0.1:%d\n", port)
 	fmt.Printf("Logs: %s\n", logFile)
 	return nil
 }
@@ -260,20 +272,39 @@ func Stop() error {
 }
 
 // WritePIDFile writes the current process PID. Called from runGateway.
+//
+// If the file already tracks a different LIVE process that is not our
+// parent, it is left untouched: a second gateway racing for a busy port
+// would otherwise clobber the healthy instance's entry and then delete
+// the file on its own exit, orphaning the running gateway from
+// `fastclaw daemon stop/restart`. The parent-pid exception keeps the
+// daemon flow intact — the wrapper (RunLoop) writes its own pid first
+// and the gateway child it spawns takes over the file, which is what
+// lets `daemon stop` signal the gateway directly.
 func WritePIDFile() error {
 	pidFile, _, _, err := Paths()
 	if err != nil {
 		return err
 	}
+	if pid, rerr := readPID(pidFile); rerr == nil &&
+		pid != os.Getpid() && pid != os.Getppid() && isProcessAlive(pid) {
+		return fmt.Errorf("pid file %s already tracks running process %d; not overwriting", pidFile, pid)
+	}
 	return writePID(pidFile, os.Getpid())
 }
 
-// RemovePIDFile removes the PID file. Called on clean shutdown.
+// RemovePIDFile removes the PID file, but only if it still records this
+// process — an exiting failed second instance must not delete the entry
+// of the healthy one. Called on clean shutdown.
 func RemovePIDFile() {
-	pidFile, _, _, _ := Paths()
-	if pidFile != "" {
-		os.Remove(pidFile)
+	pidFile, _, _, err := Paths()
+	if err != nil || pidFile == "" {
+		return
 	}
+	if pid, rerr := readPID(pidFile); rerr != nil || pid != os.Getpid() {
+		return
+	}
+	os.Remove(pidFile)
 }
 
 // SignalReload asks the gateway running at pid to reload its in-memory

@@ -24,6 +24,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
+	"github.com/fastclaw-ai/fastclaw/internal/agent/tools"
+	"github.com/fastclaw-ai/fastclaw/internal/agentcli"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
 	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
@@ -59,6 +61,53 @@ var toolProviderRegistry = func() *toolproviders.Registry {
 // ToolProviderRegistry exposes the registry for callers that want to list
 // available providers (admin API).
 func ToolProviderRegistry() *toolproviders.Registry { return toolProviderRegistry }
+
+// DiagnoseAgent renders the readiness report for one agent, resolving
+// its merged config so the capability probe is populated. Shared by
+// `fastclaw agents doctor` and the in-chat check_agent tool.
+func DiagnoseAgent(ctx context.Context, st store.Store, agentRef string) (string, error) {
+	rec, err := agentcli.Resolve(ctx, st, agentRef)
+	if err != nil {
+		return "", err
+	}
+	cfg, err := assembleConfig(ctx, st, rec.UserID, rec.ID)
+	if err != nil {
+		return "", fmt.Errorf("assemble config for %s: %w", rec.ID, err)
+	}
+	deps := tools.AgentAdminDeps{
+		Store:        st,
+		OwnerUserID:  rec.UserID,
+		AgentHomeDir: config.AgentHomeDir,
+		ToolAvailability: func(context.Context, string) (map[string]bool, error) {
+			return agentToolAvailability(cfg, rec.ID), nil
+		},
+	}
+	return tools.DiagnoseAgent(ctx, deps, rec.ID, rec.Name), nil
+}
+
+// agentToolAvailability reports which provider-backed tools the given
+// agent would have registered, using the same merged-config resolution
+// registerAgentToolChains uses to actually register them. Built-in tools
+// that always exist (exec, web_fetch's direct fallback, file ops) are not
+// listed — this answers the question that has a non-obvious answer:
+// which optional capabilities does this agent really have.
+//
+// Deriving it from the same source as registration is the point. A
+// hand-maintained list would drift, and a drifted capability report is
+// worse than none: it is what lets a provisioning run announce an agent
+// as ready when its core tool was never wired.
+func agentToolAvailability(cfg *config.Config, agentID string) map[string]bool {
+	resolved := cfg.MergedAgentConfig(config.AgentEntry{ID: agentID})
+	out := make(map[string]bool, 4)
+	for _, category := range []string{"web_search", "image_gen", "tts", "web_fetch"} {
+		out[category] = buildToolChainFromResolved(resolved, category) != nil
+	}
+	// web_fetch always exists — a direct built-in fetcher is registered
+	// at agent construction and a configured chain only swaps the
+	// backend.
+	out["web_fetch"] = true
+	return out
+}
 
 // registerAgentToolChains wires every provider-backed tool category onto
 // the given agents using their merged config view (system + user + agent
@@ -825,22 +874,23 @@ func readSystemSandboxCfg(st store.Store) config.SandboxCfg {
 // with kind="setting". Adding a new namespace is a one-line append; the
 // scope.Setting / SettingInto helpers handle merging across scopes.
 const (
-	NSAgentDefaults  = "agents.defaults"
-	NSSandbox        = "sandbox"
-	NSObjectStore    = "objectstore"
-	NSHooks          = "hooks"
-	NSPlugins        = "plugins"
-	NSTaskQueue      = "taskqueue"
-	NSToolProviders  = "tools.providers"
-	NSToolCategories = "tools.categories"
-	NSSkillsInstall  = "skills.install"
-	NSSkillsEntries  = "skills.entries"
-	NSMemory         = "memory"
-	NSPrivacy        = "privacy"
-	NSSkillsLearner  = "skillsLearner"
-	NSHeartbeat      = "heartbeat"
-	NSTeams          = "teams"
-	NSBindings       = "bindings"
+	NSAgentDefaults    = "agents.defaults"
+	NSSandbox          = "sandbox"
+	NSObjectStore      = "objectstore"
+	NSHooks            = "hooks"
+	NSPlugins          = "plugins"
+	NSTaskQueue        = "taskqueue"
+	NSToolProviders    = "tools.providers"
+	NSToolCategories   = "tools.categories"
+	NSSkillsInstall    = "skills.install"
+	NSSkillsEntries    = "skills.entries"
+	NSMemory           = "memory"
+	NSWorkspaceHistory = "workspaceHistory"
+	NSPrivacy          = "privacy"
+	NSSkillsLearner    = "skillsLearner"
+	NSHeartbeat        = "heartbeat"
+	NSTeams            = "teams"
+	NSBindings         = "bindings"
 )
 
 // registerChannelsFromStore loads every enabled channel from the
