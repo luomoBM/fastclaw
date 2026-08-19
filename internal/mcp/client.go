@@ -26,6 +26,13 @@ type jsonRPCRequest struct {
 	Params  interface{} `json:"params"`
 }
 
+// jsonRPCNotification is a JSON-RPC notification: a request with no id,
+// so the server must not reply to it.
+type jsonRPCNotification struct {
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+}
+
 type jsonRPCResponse struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      int             `json:"id"`

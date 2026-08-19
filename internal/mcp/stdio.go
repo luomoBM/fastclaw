@@ -70,7 +70,32 @@ func (c *StdioClient) Connect() error {
 		ProtocolVersion: "2024-11-05",
 		ClientInfo:      clientInfo{Name: "fastclaw", Version: "0.1.0"},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// The MCP lifecycle requires an initialized notification after the
+	// initialize response; strict servers (rmcp-based ones such as mempal)
+	// reject and exit if a request like tools/list arrives first.
+	return c.sendNotification("notifications/initialized")
+}
+
+// sendNotification writes a JSON-RPC notification (no id, no response
+// expected) to the server's stdin.
+func (c *StdioClient) sendNotification(method string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	data, err := json.Marshal(jsonRPCNotification{JSONRPC: "2.0", Method: method})
+	if err != nil {
+		return fmt.Errorf("marshal notification: %w", err)
+	}
+
+	data = append(data, '\n')
+	if _, err := c.stdin.Write(data); err != nil {
+		return fmt.Errorf("write to stdin: %w", err)
+	}
+	return nil
 }
 
 func (c *StdioClient) sendRequest(method string, params interface{}) (*jsonRPCResponse, error) {

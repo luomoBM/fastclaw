@@ -103,7 +103,45 @@ func (c *HTTPClient) Connect() error {
 		ProtocolVersion: "2024-11-05",
 		ClientInfo:      clientInfo{Name: "fastclaw", Version: "0.1.0"},
 	})
-	return err
+	if err != nil {
+		return err
+	}
+
+	// The MCP lifecycle requires an initialized notification after the
+	// initialize response; strict servers (rmcp-based ones such as mempal)
+	// reject requests that arrive before it.
+	return c.sendNotification("notifications/initialized")
+}
+
+// sendNotification POSTs a JSON-RPC notification (no id, no response body
+// expected) to the server endpoint.
+func (c *HTTPClient) sendNotification(method string) error {
+	body, err := json.Marshal(jsonRPCNotification{JSONRPC: "2.0", Method: method})
+	if err != nil {
+		return fmt.Errorf("marshal notification: %w", err)
+	}
+
+	httpReq, err := http.NewRequest("POST", c.url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	for k, v := range c.headers {
+		httpReq.Header.Set(k, v)
+	}
+
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("send notification: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+	return nil
 }
 
 // ListTools returns the list of tools available on the MCP server.
