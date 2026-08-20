@@ -2171,7 +2171,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// real reply is coming on the next bus-fired turn." Without it,
 	// the stream closes immediately and the typing indicator vanishes
 	// while the model is still warming up.
-	if result := a.handleSlashCommand(msg); result.handled {
+	if result := a.handleSlashCommand(ctx, msg); result.handled {
 		if result.reply != "" {
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": result.reply}})
 		}
@@ -2316,7 +2316,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 	// Context compaction: check if session messages are too large
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
+	compactResult, err := CompactMessages(ctx, sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}
@@ -3051,7 +3051,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	// Reuse setup logic from HandleMessage. Empty reply is "handled
 	// but silent" — see the HandleMessage twin. Still emit a Done
 	// chunk so callers waiting on the stream don't hang.
-	if result := a.handleSlashCommand(msg); result.handled {
+	if result := a.handleSlashCommand(ctx, msg); result.handled {
 		ch := make(chan provider.StreamChunk, 2)
 		go func() {
 			ch <- provider.StreamChunk{Content: result.reply, Done: true}
@@ -3115,7 +3115,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	sess.Append(userMsg)
 
 	sessionMsgs := sess.GetMessages()
-	compactResult, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
+	compactResult, err := CompactMessages(ctx, sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		slog.Warn("compaction error", "agent", a.name, "error", err)
 	}

@@ -26,7 +26,7 @@ type slashResult struct {
 }
 
 // handleSlashCommand checks if the message is a slash command and handles it.
-func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
+func (a *Agent) handleSlashCommand(ctx context.Context, msg bus.InboundMessage) slashResult {
 	text := strings.TrimSpace(msg.Text)
 	if !strings.HasPrefix(text, "/") {
 		return slashResult{}
@@ -89,7 +89,7 @@ func (a *Agent) handleSlashCommand(msg bus.InboundMessage) slashResult {
 		return a.slashUndo(msg)
 
 	case "/compact":
-		return a.slashCompact(msg)
+		return a.slashCompact(ctx, msg)
 
 	case "/status":
 		return a.slashStatus(msg)
@@ -299,7 +299,7 @@ func (a *Agent) slashUndo(msg bus.InboundMessage) slashResult {
 	return slashResult{handled: true, reply: "Nothing to undo."}
 }
 
-func (a *Agent) slashCompact(msg bus.InboundMessage) slashResult {
+func (a *Agent) slashCompact(ctx context.Context, msg bus.InboundMessage) slashResult {
 	sess := a.sessions.Get(msg.Channel, msg.AccountID, msg.ChatID, msg.ProjectID)
 	sessionMsgs := sess.GetMessages()
 
@@ -307,7 +307,7 @@ func (a *Agent) slashCompact(msg bus.InboundMessage) slashResult {
 		return slashResult{handled: true, reply: "No messages to compact."}
 	}
 
-	result, err := CompactMessages(sessionMsgs, a.homePath, a.provider, a.model)
+	result, err := CompactMessages(ctx, sessionMsgs, a.homePath, a.provider, a.model)
 	if err != nil {
 		return slashResult{handled: true, reply: fmt.Sprintf("Compaction error: %v", err)}
 	}

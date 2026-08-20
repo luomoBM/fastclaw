@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
@@ -49,7 +51,7 @@ func TestCompactionDropsGoalContextFromSummary(t *testing.T) {
 	}
 
 	f := &fakeSummarizer{}
-	out, err := compressOlderMessages(msgs, f, "fake-model")
+	out, err := compressOlderMessages(context.Background(), msgs, f, "fake-model")
 	if err != nil {
 		t.Fatalf("compress: %v", err)
 	}
@@ -83,12 +85,126 @@ func TestCompactionPreservesContentWhenShortCircuits(t *testing.T) {
 		{Role: "user", Content: "hi"},
 		{Role: "assistant", Content: "hello"},
 	}
-	out, err := compressOlderMessages(in, nil, "")
+	out, err := compressOlderMessages(context.Background(), in, nil, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(out) != 2 {
 		t.Errorf("short input should pass through; got %d messages", len(out))
+	}
+}
+
+// --- context threading coverage ---
+//
+// Production providers hand Chat's ctx straight to
+// http.NewRequestWithContext — which is where the pre-fix literal-nil
+// call died on every compaction with "net/http: nil Context",
+// permanently degrading compaction to prune-only. The probe below
+// reproduces that exact contract so a nil or stubbed context fails
+// tests instead of shipping.
+
+// ctxProbeSummarizer records what the ctx it received can actually do:
+// requestErr is set when http.NewRequestWithContext rejects it (nil →
+// "net/http: nil Context"); ctxErr is ctx.Err() observed inside Chat,
+// proving liveness/identity of the caller's context.
+type ctxProbeSummarizer struct {
+	requestErr error
+	ctxErr     error
+}
+
+func (p *ctxProbeSummarizer) Chat(ctx context.Context, _ []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.Response, error) {
+	if _, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.example.com/v1/messages", nil); err != nil {
+		p.requestErr = err
+		// Same wrap shape the real providers use — see the
+		// "summarize conversation: create request:" chain in the logs.
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	p.ctxErr = ctx.Err()
+	return &provider.Response{Content: "[fake summary]"}, nil
+}
+
+func (p *ctxProbeSummarizer) ChatStream(_ context.Context, _ []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.StreamReader, error) {
+	return nil, nil
+}
+
+// historyLongerThanPruneTurnAge builds the minimal history that makes
+// compressOlderMessages actually run (len > PruneTurnAge).
+func historyLongerThanPruneTurnAge() []provider.Message {
+	var msgs []provider.Message
+	for i := 0; i < PruneTurnAge+5; i++ {
+		msgs = append(msgs, provider.Message{Role: "user", Content: "turn", Origin: provider.OriginUser})
+	}
+	return msgs
+}
+
+// TestCompressOlderMessagesSendsUsableContext is the regression test
+// for the nil-context bug: the summarize call must hand the provider a
+// context that survives http.NewRequestWithContext. Pre-fix, this
+// fails with the exact production error ("net/http: nil Context").
+func TestCompressOlderMessagesSendsUsableContext(t *testing.T) {
+	p := &ctxProbeSummarizer{}
+	if _, err := compressOlderMessages(context.Background(), historyLongerThanPruneTurnAge(), p, "fake-model"); err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	if p.requestErr != nil {
+		t.Fatalf("provider rejected the compaction context: %v — this is the \"net/http: nil Context\" regression", p.requestErr)
+	}
+	if p.ctxErr != nil {
+		t.Errorf("healthy caller context arrived dead at the provider: %v", p.ctxErr)
+	}
+}
+
+// TestCompressOlderMessagesPropagatesCallerContext pins the "proper
+// fix" semantics: the ctx that reaches the provider IS the caller's
+// ctx (observable via cancellation), not a detached context.TODO() —
+// so turn cancellation/timeout correctly aborts in-flight summary
+// requests instead of leaking them.
+func TestCompressOlderMessagesPropagatesCallerContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p := &ctxProbeSummarizer{}
+	if _, err := compressOlderMessages(ctx, historyLongerThanPruneTurnAge(), p, "fake-model"); err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+	if p.ctxErr != context.Canceled {
+		t.Errorf("provider saw ctx.Err()=%v, want context.Canceled — a fresh/stub context was substituted for the caller's", p.ctxErr)
+	}
+}
+
+// TestCompactMessagesThreadsCallerContextToEnd pins the OUTER seam the
+// two tests above can't see: CompactMessages must forward its own
+// caller's ctx across the CompactMessages→compressOlderMessages
+// boundary. A regression that swaps in a fresh context.Background()
+// at that boundary would pass the inner tests but fail here, because
+// the pre-cancelled ctx would never reach the provider.
+func TestCompactMessagesThreadsCallerContextToEnd(t *testing.T) {
+	// Push the history over DefaultTokenThreshold (EstimateTokens ≈
+	// chars/4) with user content that survives pruning — pruning only
+	// hollows tool results, so compression must run.
+	var msgs []provider.Message
+	for i := 0; i < PruneTurnAge+10; i++ {
+		msgs = append(msgs, provider.Message{
+			Role: "user", Content: strings.Repeat("x", 15000), Origin: provider.OriginUser,
+		})
+	}
+	if tokens := EstimateTokens(msgs); tokens < DefaultTokenThreshold {
+		t.Fatalf("fixture broken: %d tokens < %d threshold", tokens, DefaultTokenThreshold)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p := &ctxProbeSummarizer{}
+	result, err := CompactMessages(ctx, msgs, t.TempDir(), p, "fake-model")
+	if err != nil {
+		t.Fatalf("CompactMessages: %v", err)
+	}
+	if result == nil || len(result.Messages) == 0 {
+		t.Fatal("expected a compaction result with messages")
+	}
+	if p.ctxErr != context.Canceled {
+		t.Errorf("provider saw ctx.Err()=%v, want context.Canceled — the caller's ctx was dropped at the CompactMessages boundary", p.ctxErr)
 	}
 }
 
@@ -194,7 +310,7 @@ func TestCompressOlderMessagesNeverStartsTailWithTool(t *testing.T) {
 	}
 
 	f := &fakeSummarizer{}
-	out, err := compressOlderMessages(msgs, f, "fake-model")
+	out, err := compressOlderMessages(context.Background(), msgs, f, "fake-model")
 	if err != nil {
 		t.Fatalf("compress: %v", err)
 	}
