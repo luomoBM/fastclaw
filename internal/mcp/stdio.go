@@ -129,28 +129,37 @@ func (c *StdioClient) sendRequest(method string, params interface{}) (*jsonRPCRe
 			continue
 		}
 
-		var resp jsonRPCResponse
-		if err := json.Unmarshal(line, &resp); err != nil {
+		// Probe the line with a raw id BEFORE decoding a response:
+		// JSON-RPC permits string ids, and a server request carrying
+		// one fails to unmarshal into the int-id response type —
+		// decoding that first dropped the line and a strict server
+		// waited for its reply forever. The probe also separates
+		// server-initiated messages from responses to ours: a line
+		// carrying a method is not a response. Server requests (ping,
+		// roots/list, …) share our small-integer id space, so treating
+		// one as the response returned a nil Result ("unexpected end
+		// of JSON input") or, for strict servers that wait for our
+		// reply and exit, surfaced as "process exited without
+		// response". Answer requests — echoing the raw id verbatim,
+		// whatever its type — (we hold c.mu already; write stdin
+		// directly) and skip both requests and notifications.
+		var probe struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
 			continue // skip non-JSON lines (e.g. stderr leaking)
 		}
-
-		// A line carrying a method is a server-initiated message, not
-		// a response to ours. Server requests (ping, roots/list, …)
-		// share our small-integer id space, so treating one as the
-		// response returned a nil Result ("unexpected end of JSON
-		// input") or, for strict servers that wait for our reply and
-		// exit, surfaced as "process exited without response". Answer
-		// requests (we hold c.mu already — write stdin directly) and
-		// skip both requests and notifications.
-		var probe struct {
-			ID     *int   `json:"id"`
-			Method string `json:"method"`
-		}
-		if json.Unmarshal(line, &probe) == nil && probe.Method != "" {
-			if probe.ID != nil {
-				c.writeServerReply(*probe.ID, probe.Method)
+		if probe.Method != "" {
+			if len(probe.ID) > 0 && string(probe.ID) != "null" {
+				c.writeServerReply(probe.ID, probe.Method)
 			}
 			continue
+		}
+
+		var resp jsonRPCResponse
+		if err := json.Unmarshal(line, &resp); err != nil {
+			continue // not a response we can match (e.g. non-int id)
 		}
 
 		if resp.ID == id {
@@ -170,19 +179,25 @@ func (c *StdioClient) sendRequest(method string, params interface{}) (*jsonRPCRe
 // writeServerReply answers a server-initiated request: ping gets an
 // empty result; anything else (roots/list, elicitation, …) gets the
 // protocol's method-not-found error so the server doesn't stall
-// waiting on capabilities we don't implement. Caller holds c.mu.
-func (c *StdioClient) writeServerReply(id int, method string) {
-	var data []byte
-	var err error
-	if method == "ping" {
-		data, err = json.Marshal(jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: json.RawMessage("{}")})
-	} else {
-		data, err = json.Marshal(struct {
-			JSONRPC string        `json:"jsonrpc"`
-			ID      int           `json:"id"`
-			Error   *jsonRPCError `json:"error"`
-		}{JSONRPC: "2.0", ID: id, Error: &jsonRPCError{Code: -32601, Message: "client method not found: " + method}})
+// waiting on capabilities we don't implement. The id is echoed back
+// verbatim as raw JSON — JSON-RPC allows string ids and the server
+// matches replies on the exact value it sent. Caller holds c.mu.
+func (c *StdioClient) writeServerReply(id json.RawMessage, method string) {
+	reply := struct {
+		JSONRPC string          `json:"jsonrpc"`
+		ID      json.RawMessage `json:"id"`
+		Result  json.RawMessage `json:"result,omitempty"`
+		Error   *jsonRPCError   `json:"error,omitempty"`
+	}{
+		JSONRPC: "2.0",
+		ID:      id,
 	}
+	if method == "ping" {
+		reply.Result = json.RawMessage("{}")
+	} else {
+		reply.Error = &jsonRPCError{Code: -32601, Message: "client method not found: " + method}
+	}
+	data, err := json.Marshal(reply)
 	if err != nil {
 		return
 	}

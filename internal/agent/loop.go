@@ -2948,6 +2948,20 @@ func padOrphanToolResults(sess *session.Session) {
 // goroutine that drains the SSE stream, after the final assistant
 // message has been appended to the session — i.e. after the user's
 // reply is fully on-record.
+// Post-turn context budgets. postCtx (in runPostTurn) detaches from
+// the turn's cancellation — and WithoutCancel also drops the task
+// queue's taskTimeout deadline — so detached ≠ unbounded: every
+// postCtx use re-applies its own deadline from these. The sync
+// chatter-turn count is a millisecond-scale query that merely queues
+// behind SQLite's single connection (SQLITE_BUSY pileups — see
+// NewDBStore), so it gets a short leash; the async LLM extractions
+// legitimately stream for minutes and align with the task queue's own
+// 5-minute default. Vars, not consts, so tests can shrink them.
+var (
+	postTurnCountTimeout = 30 * time.Second
+	postTurnAsyncTimeout = 5 * time.Minute
+)
+
 func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, messages []provider.Message, toolCallCount int, chatterMem *Memory) {
 	if chatterMem == nil {
 		chatterMem = a.memory
@@ -2978,6 +2992,10 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	// further down, which uses context.Background() for this exact
 	// reason) — and a turn that ends on timeout/cancel needs this
 	// bookkeeping more than any other, not less.
+	//
+	// Detached ≠ unbounded: WithoutCancel also drops the queue's
+	// taskTimeout deadline, so every postCtx use below re-applies its
+	// own (see the postTurn*Timeout vars above runPostTurn).
 	postCtx := context.WithoutCancel(ctx)
 	a.hooks.Run(ctx, &HookContext{
 		AgentName:      a.name,
@@ -3018,7 +3036,12 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	willFire := false
 	chatterTurns := 0
 	if a.dataStore != nil && a.memoryCfg.AutoPersist.Enabled && a.memoryCfg.AutoPersist.EveryNTurns > 0 && chatterUID != "" {
-		n, err := a.dataStore.CountChatterUserMessages(postCtx, a.name, chatterUID)
+		// postCtx carries no deadline — bound the count locally, or a
+		// wedged store call blocks this worker (and the per-chat queue
+		// behind it) forever; the gate simply retries next turn.
+		countCtx, cancelCount := context.WithTimeout(postCtx, postTurnCountTimeout)
+		n, err := a.dataStore.CountChatterUserMessages(countCtx, a.name, chatterUID)
+		cancelCount()
 		if err != nil {
 			slog.Warn("auto-persist: count query failed", "agent", a.name, "chatter", chatterUID, "error", err)
 		} else {
@@ -3039,13 +3062,23 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 			model = a.model
 		}
 		slog.Info("auto-persist firing", "agent", a.name, "chatter", chatterUID, "model", model, "chatter_turns", chatterTurns, "messages", len(messages))
-		go AutoPersistMemory(postCtx, chatterMem, a.provider, model, messages)
+		go func() {
+			// Deadline and cancel live INSIDE the goroutine: a
+			// WithTimeout around postCtx whose cancel ran in
+			// runPostTurn would kill this call the moment
+			// runPostTurn returns.
+			asyncCtx, cancel := context.WithTimeout(postCtx, postTurnAsyncTimeout)
+			defer cancel()
+			AutoPersistMemory(asyncCtx, chatterMem, a.provider, model, messages)
+		}()
 	}
 
 	// Skills learner
 	if a.skillsLearner != nil {
 		go func() {
-			if err := a.skillsLearner.MaybeExtract(postCtx, messages, toolCallCount); err != nil {
+			asyncCtx, cancel := context.WithTimeout(postCtx, postTurnAsyncTimeout)
+			defer cancel()
+			if err := a.skillsLearner.MaybeExtract(asyncCtx, messages, toolCallCount); err != nil {
 				slog.Debug("skills learner error", "error", err)
 			}
 		}()
