@@ -418,7 +418,13 @@ func (s *Server) handleUpdateAgentChannel(w http.ResponseWriter, r *http.Request
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	s.hotRegisterChannelRecord(*target)
+	// Guard like the sibling handlers: only enabled channels hot-start.
+	// An unconditional register launched adapters the operator disabled,
+	// and bounced live ones (DingTalk stream reconnects drop messages
+	// in flight) for PATCHes that changed nothing the adapter reads.
+	if target.Enabled {
+		s.hotRegisterChannelRecord(*target)
+	}
 	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
 }
 

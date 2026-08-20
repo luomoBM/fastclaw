@@ -375,4 +375,42 @@ func TestTodoReconcileNudgeAllowsHonestIncompleteness(t *testing.T) {
 	if !strings.Contains(msg.Content, "Do not claim the task is complete") {
 		t.Errorf("nudge must forbid the contradiction: %s", msg.Content)
 	}
+	// The draft answer is held back when the nudge fires, so the model
+	// must be told its draft never reached the user — otherwise it trims
+	// the re-issue to a follow-up and the held-back content is lost
+	// (the WeChat 行情 regression: table eaten, commentary delivered).
+	if !strings.Contains(msg.Content, "NOT been delivered") {
+		t.Errorf("nudge must disclose the held-back draft: %s", msg.Content)
+	}
+	if !strings.Contains(msg.Content, "stands alone") {
+		t.Errorf("nudge must demand a self-contained re-issue: %s", msg.Content)
+	}
+}
+
+// The reconcile gate compares the checklist against a turn-start
+// snapshot so only promises made this turn are reconciled. A checklist
+// pending since an earlier turn must NOT re-fire the nudge on every
+// future message.
+func TestTodoKeyDistinguishesStaleFromTurnScopedChecklists(t *testing.T) {
+	stale := uncheckedTodoItems("- [ ] old research item\n- [ ] another old item\n")
+	unchanged := uncheckedTodoItems("- [ ] old research item\n- [ ] another old item\n")
+	if todoKey(stale) != todoKey(unchanged) {
+		t.Fatalf("identical checklists must key equal: %q vs %q", todoKey(stale), todoKey(unchanged))
+	}
+	// Same item count, different wording — still a different state.
+	reworded := uncheckedTodoItems("- [ ] old research item\n- [ ] a different item\n")
+	if todoKey(stale) == todoKey(reworded) {
+		t.Fatalf("different checklists must key differently")
+	}
+	// A turn that checks one item off changed the state, even though
+	// items remain pending — the gate fires on the change, not on
+	// mere pending-ness.
+	completedOne := uncheckedTodoItems("- [x] old research item\n- [ ] another old item\n")
+	if todoKey(stale) == todoKey(completedOne) {
+		t.Fatalf("a mutated checklist must key differently from its snapshot")
+	}
+	// No checklist and an all-done checklist are both "nothing pending".
+	if todoKey(nil) == todoKey([]string{"left undone"}) {
+		t.Fatalf("pending items must never key equal to no items")
+	}
 }

@@ -23,6 +23,14 @@ import (
 // Errors land at warn level rather than blocking the caller —
 // continuation is best-effort, and the next PostTurn will retry.
 func TryFireContinuation(ctx context.Context, st Store, mb *bus.MessageBus, agentID, sessionKey string) {
+	// Detach from the caller's cancellation. PostTurn hands this the
+	// per-turn context, which is already dead whenever a turn ends at
+	// the task timeout or is canceled during queue shutdown — and goal
+	// sessions are autonomous, so no later turn ever retries. The gate
+	// read is one indexed lookup; keeping the turn's values (tracing)
+	// while dropping its deadline/cancel is exactly the lifetime this
+	// best-effort fire-and-publish needs.
+	ctx = context.WithoutCancel(ctx)
 	g, err := st.GetGoalBySession(ctx, agentID, sessionKey)
 	if errors.Is(err, ErrNotFound) {
 		return

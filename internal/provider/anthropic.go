@@ -87,7 +87,19 @@ func toAnthropicMessages(msgs []Message) (string, []anthropicMessage) {
 
 	for i, m := range msgs {
 		if m.Role == "system" {
-			system = m.Content
+			// Concatenate, never overwrite: the loop deliberately
+			// stacks several system messages per turn (system prompt,
+			// channel hints, sender context, persistence reminder, and
+			// mid-conversation nudges). Last-wins here silently
+			// replaced the entire persona with the final nudge on
+			// every nudge/hint/reminder-bearing turn.
+			if m.Content != "" {
+				if system == "" {
+					system = m.Content
+				} else {
+					system += "\n\n" + m.Content
+				}
+			}
 			continue
 		}
 		if orphanTool[i] {

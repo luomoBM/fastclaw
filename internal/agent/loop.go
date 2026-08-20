@@ -2054,6 +2054,13 @@ func uncheckedTodoItems(body string) []string {
 	return out
 }
 
+// todoKey encodes a pending-item list as a comparable string so a turn
+// can tell "this turn changed the checklist" apart from "the checklist
+// has been sitting there since an earlier turn".
+func todoKey(pending []string) string {
+	return fmt.Sprintf("%d\x00%s", len(pending), strings.Join(pending, "\x00"))
+}
+
 // todoReconcileNudge asks for one more pass when a turn is about to end
 // with its own checklist still showing unfinished work.
 //
@@ -2063,9 +2070,16 @@ func uncheckedTodoItems(body string) []string {
 // saying "all done" beside a progress panel reading 1/5 — and there is
 // no way to tell from the outside which one is lying.
 //
-// Fires at most once per turn, and accepts "I did not finish these" as a
-// valid resolution — leaving an item unchecked is correct when the work
-// genuinely did not happen. What is not acceptable is the mismatch.
+// Fires at most once per turn, only when the checklist changed during
+// the turn, and accepts "I did not finish these" as a valid resolution —
+// leaving an item unchecked is correct when the work genuinely did not
+// happen. What is not acceptable is the mismatch.
+//
+// The draft answer is held back when this fires (not appended to
+// replyParts, not persisted), so the nudge must say so: the model can
+// see its own draft in the conversation and will otherwise trim the
+// re-issue to a follow-up — delivering commentary about content the
+// user never received.
 func todoReconcileNudge(pending []string) provider.Message {
 	return provider.Message{
 		Role: "system",
@@ -2074,7 +2088,8 @@ func todoReconcileNudge(pending []string) provider.Message {
 				"The user sees that checklist as a live progress panel next to your answer, so it must not contradict what you are about to say. "+
 				"Resolve it one of two ways: edit_file('todo.md', …) to flip the items you actually completed, "+
 				"or keep them unchecked and say plainly in your reply which steps did not get done and why. "+
-				"Do not claim the task is complete while its own checklist says otherwise.",
+				"Do not claim the task is complete while its own checklist says otherwise. "+
+				"Your previous message above was held back and has NOT been delivered to the user — after resolving the checklist, re-issue your complete final answer so it stands alone; do not trim it to a follow-up or assume the user saw any part of the draft.",
 			len(pending), strings.Join(pending, "; ")),
 	}
 }
@@ -2382,6 +2397,13 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	softDeadlineFired := false
 	iterBudgetWarned := false
 	todoReconciled := false
+	// Snapshot of the checklist before the turn did anything. The
+	// reconcile gate compares against it and only nudges when THIS turn
+	// changed todo.md: a checklist left pending by an earlier turn (or
+	// an earlier week) is not this answer's promise to keep, and nudging
+	// on it taxes every message with a held-back draft plus a regenerated
+	// reply.
+	todoAtTurnStart := todoKey(a.pendingTodoItems(ctx))
 
 	// replyParts accumulates every non-empty assistant text segment
 	// emitted across iterations (preamble lines before tool calls + the
@@ -2496,14 +2518,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			// Reconcile the checklist BEFORE the answer is emitted — once
 			// the user has read "all done", a corrected todo panel is just
 			// a second contradiction. Firing once per turn bounds this to
-			// one extra round and cannot loop.
+			// one extra round and cannot loop. Only promises made this
+			// turn (todo.md changed since todoAtTurnStart) are reconciled.
 			if !todoReconciled {
-				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
-					todoReconciled = true
+				todoReconciled = true
+				if pending := a.pendingTodoItems(ctx); len(pending) > 0 && todoKey(pending) != todoAtTurnStart {
 					messages = append(messages, asst, todoReconcileNudge(pending))
 					continue
 				}
-				todoReconciled = true
 			}
 
 			sess.Append(asst)
@@ -2947,6 +2969,16 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	}
 
 	// Fire PostTurn hooks
+	//
+	// postCtx outlives the turn: the task queue cancels the turn ctx
+	// the moment its handler returns, while the auto-persist LLM call
+	// and the skills-learner extraction below escape via `go` and are
+	// still mid-flight. Bound to the turn's cancellation they die with
+	// "context canceled" (same class as the workspace-history commit
+	// further down, which uses context.Background() for this exact
+	// reason) — and a turn that ends on timeout/cancel needs this
+	// bookkeeping more than any other, not less.
+	postCtx := context.WithoutCancel(ctx)
 	a.hooks.Run(ctx, &HookContext{
 		AgentName:      a.name,
 		Point:          PostTurn,
@@ -2986,7 +3018,7 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 	willFire := false
 	chatterTurns := 0
 	if a.dataStore != nil && a.memoryCfg.AutoPersist.Enabled && a.memoryCfg.AutoPersist.EveryNTurns > 0 && chatterUID != "" {
-		n, err := a.dataStore.CountChatterUserMessages(ctx, a.name, chatterUID)
+		n, err := a.dataStore.CountChatterUserMessages(postCtx, a.name, chatterUID)
 		if err != nil {
 			slog.Warn("auto-persist: count query failed", "agent", a.name, "chatter", chatterUID, "error", err)
 		} else {
@@ -3007,13 +3039,13 @@ func (a *Agent) runPostTurn(ctx context.Context, msg bus.InboundMessage, message
 			model = a.model
 		}
 		slog.Info("auto-persist firing", "agent", a.name, "chatter", chatterUID, "model", model, "chatter_turns", chatterTurns, "messages", len(messages))
-		go AutoPersistMemory(ctx, chatterMem, a.provider, model, messages)
+		go AutoPersistMemory(postCtx, chatterMem, a.provider, model, messages)
 	}
 
 	// Skills learner
 	if a.skillsLearner != nil {
 		go func() {
-			if err := a.skillsLearner.MaybeExtract(ctx, messages, toolCallCount); err != nil {
+			if err := a.skillsLearner.MaybeExtract(postCtx, messages, toolCallCount); err != nil {
 				slog.Debug("skills learner error", "error", err)
 			}
 		}()
@@ -3155,6 +3187,10 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	softDeadlineFired := false
 	iterBudgetWarned := false
 	todoReconciled := false
+	// Same turn-scoped checklist snapshot as HandleMessage — see the
+	// comment there for why the reconcile gate only fires on turns that
+	// changed todo.md themselves.
+	todoAtTurnStart := todoKey(a.pendingTodoItems(ctx))
 
 	// ReAct loop - use Chat for tool iterations
 	for i := 0; i < a.maxToolIterations; i++ {
@@ -3204,15 +3240,16 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 			// first, which is the last moment nothing has been sent to the
 			// user yet — and this is the path the web UI uses, where the
 			// todo panel the answer would contradict is actually rendered.
+			// Turn-scoped like HandleMessage: only a checklist this turn
+			// changed gets reconciled.
 			if !todoReconciled {
-				if pending := a.pendingTodoItems(ctx); len(pending) > 0 {
-					todoReconciled = true
+				todoReconciled = true
+				if pending := a.pendingTodoItems(ctx); len(pending) > 0 && todoKey(pending) != todoAtTurnStart {
 					messages = append(messages,
 						provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, RawAssistant: resp.RawAssistant},
 						todoReconcileNudge(pending))
 					continue
 				}
-				todoReconciled = true
 			}
 
 			// Final response - use streaming

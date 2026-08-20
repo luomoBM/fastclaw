@@ -321,3 +321,52 @@ func TestTokenAccountingHookSkipsZeroDelta(t *testing.T) {
 		t.Errorf("TokensUsed = %d, want 0 on zero-delta call", g.TokensUsed)
 	}
 }
+
+// ctxAwareGoalStore wraps memGoalStore so lookups honor ctx the way
+// the real SQL-backed store does (database/sql returns ctx.Err() the
+// moment the context is done).
+type ctxAwareGoalStore struct{ *memGoalStore }
+
+func (c *ctxAwareGoalStore) GetGoalBySession(ctx context.Context, agentID, sessionKey string) (*goal.Goal, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.memGoalStore.GetGoalBySession(ctx, agentID, sessionKey)
+}
+
+func (c *ctxAwareGoalStore) UpdateGoal(ctx context.Context, g *goal.Goal) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.memGoalStore.UpdateGoal(ctx, g)
+}
+
+// TestTokenAccountingHookSurvivesCanceledTurnCtx — AfterModelCall
+// fires synchronously with the turn ctx. A cancel landing between
+// Chat() returning successfully and this hook's persist (task timeout
+// expiring at exactly the wrong moment, or queue shutdown sweeping
+// in-flight turns) drops that call's usage delta from the budget —
+// and unlike a store blip, usage is per-call: no later call retries
+// it. The fold must detach from the turn's cancellation.
+func TestTokenAccountingHookSurvivesCanceledTurnCtx(t *testing.T) {
+	st := &memGoalStore{}
+	agentID, sessionKey := seedActiveGoal(t, st, 1_000_000)
+	wrapped := &ctxAwareGoalStore{st}
+	hook := NewTokenAccountingHook(wrapped, nil, agentID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	hook(ctx, makeAfterModelCall(sessionKey, provider.Usage{
+		InputTokens: 200, OutputTokens: 30,
+	}))
+
+	g, _ := wrapped.GetGoalBySession(context.Background(), agentID, sessionKey)
+	if g == nil || g.TokensUsed != 230 {
+		t.Fatalf("TokensUsed = %v, want 230 — usage delta lost to canceled turn ctx", func() any {
+			if g == nil {
+				return "nil goal"
+			}
+			return g.TokensUsed
+		}())
+	}
+}

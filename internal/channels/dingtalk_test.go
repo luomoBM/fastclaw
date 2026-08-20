@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"sync"
 	"time"
 
 	"github.com/open-dingtalk/dingtalk-stream-sdk-go/chatbot"
@@ -639,5 +640,201 @@ func TestDingTalkOutboundMediaRefreshesRejectedToken(t *testing.T) {
 	}
 	if tokenCalls.Load() != 2 || uploadCalls.Load() != 2 {
 		t.Fatalf("token calls=%d upload calls=%d", tokenCalls.Load(), uploadCalls.Load())
+	}
+}
+
+// TestDingTalkCardFinishSurvivesCanceledTaskCtx — the finalize PUT is
+// the single most important update of a card stream: it flips
+// flowStatus off "generating" and carries the full text. The gateway
+// calls Finish with the per-task ctx, which is already dead exactly
+// when a card-mode turn hits the task timeout (production:
+// "DingTalk AI card final update failed; falling back to Markdown …
+// context deadline exceeded" followed by "outbound enqueue cancelled"
+// — the answer lost in BOTH forms). The periodic flush already uses
+// context.Background(); the finalize write must not be the least
+// protected update on the stream.
+func TestDingTalkCardFinishSurvivesCanceledTaskCtx(t *testing.T) {
+	var streamBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/v1.0/card/instances/createAndDeliver":
+			_, _ = w.Write([]byte(`{"outTrackId":"card-1"}`))
+		case "/v1.0/card/streaming":
+			if err := json.NewDecoder(r.Body).Decode(&streamBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card", CardTemplateID: "template.schema", CardStreamIntervalMS: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.httpClient, d.apiBase = server.Client(), server.URL
+	stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{Channel: "dingtalk", AccountID: "ding-client", ChatID: "user:staff-1"})
+	if !ok {
+		t.Fatal("card stream was not started")
+	}
+	stream.WriteDelta("partial ")
+
+	// The task ctx dies the instant the task timeout fires — the
+	// moment Finish is most needed.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !stream.Finish(ctx, "# full\nanswer") {
+		t.Fatal("finalize died with the canceled task ctx — card sticks in generating state forever")
+	}
+	if streamBody["content"] != "# full\nanswer" || streamBody["isFinalize"] != true {
+		t.Fatalf("stream body = %#v", streamBody)
+	}
+}
+
+// TestDingTalkCardFinishWaitsForInflightFlush — a timer flush and a
+// Finish must never have PUT /v1.0/card/streaming in flight at the
+// same time for one card: they carry independent random GUIDs, so the
+// server cannot order them, and a partial update applied after the
+// finalize leaves the card truncated with the generating indicator
+// stuck on. The stream serializes updates in program order: the
+// finalize waits for the in-flight flush to complete.
+func TestDingTalkCardFinishWaitsForInflightFlush(t *testing.T) {
+	flushEntered := make(chan struct{}, 1)
+	releaseFlush := make(chan struct{})
+	// Leak-safe release: if the test fails (or serialization regresses),
+	// server.Close() must not block forever on the parked handler.
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFlush) }) }
+	defer release()
+	var mu sync.Mutex
+	bodies := []map[string]any{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/v1.0/card/instances/createAndDeliver":
+			_, _ = w.Write([]byte(`{"outTrackId":"card-1"}`))
+		case "/v1.0/card/streaming":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Error(err)
+			}
+			mu.Lock()
+			bodies = append(bodies, body)
+			isFinal := body["isFinalize"] == true
+			n := len(bodies)
+			mu.Unlock()
+			if n == 1 {
+				// The flush: park mid-request until the test releases it.
+				select {
+				case flushEntered <- struct{}{}:
+				default:
+				}
+				<-releaseFlush
+			}
+			_ = isFinal
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card", CardTemplateID: "template.schema", CardStreamIntervalMS: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.httpClient, d.apiBase = server.Client(), server.URL
+	stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{Channel: "dingtalk", AccountID: "ding-client", ChatID: "user:staff-1"})
+	if !ok {
+		t.Fatal("card stream was not started")
+	}
+	stream.WriteDelta("partial draft")
+
+	select {
+	case <-flushEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("flush PUT never started")
+	}
+
+	// Finish while the flush PUT is parked mid-request.
+	finished := make(chan bool, 1)
+	go func() { finished <- stream.Finish(context.Background(), "# final") }()
+
+	// The finalize must NOT reach the server while the flush is parked.
+	select {
+	case got := <-finished:
+		t.Fatalf("Finish returned %v while its PUT was still queued behind the flush — serialization broken", got)
+	case <-time.After(150 * time.Millisecond):
+		mu.Lock()
+		n := len(bodies)
+		mu.Unlock()
+		if n != 1 {
+			t.Fatalf("%d card PUTs reached the server while the flush was still in flight — finalize raced the flush", n)
+		}
+	}
+
+	release()
+	if !<-finished {
+		t.Fatal("Finish must succeed once the flush completes")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 2 {
+		t.Fatalf("card PUTs = %d, want 2 (flush then finalize)", len(bodies))
+	}
+	if bodies[1]["isFinalize"] != true || bodies[1]["content"] != "# final" {
+		t.Fatalf("finalize body = %#v", bodies[1])
+	}
+}
+
+// TestDingTalkCardFinishEmptyFinalKeepsPartial — a canceled turn
+// (user Stop, task timeout) makes HandleMessage return "" and the
+// gateway then calls Finish(ctx, ""). Blanking the card destroys the
+// partial draft the user was mid-read on; finalize it with what was
+// streamed instead.
+func TestDingTalkCardFinishEmptyFinalKeepsPartial(t *testing.T) {
+	var streamBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/v1.0/card/instances/createAndDeliver":
+			_, _ = w.Write([]byte(`{"outTrackId":"card-1"}`))
+		case "/v1.0/card/streaming":
+			if err := json.NewDecoder(r.Body).Decode(&streamBody); err != nil {
+				t.Error(err)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card", CardTemplateID: "template.schema", CardStreamIntervalMS: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.httpClient, d.apiBase = server.Client(), server.URL
+	stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{Channel: "dingtalk", AccountID: "ding-client", ChatID: "user:staff-1"})
+	if !ok {
+		t.Fatal("card stream was not started")
+	}
+	stream.WriteDelta("partial answer the user is reading")
+
+	if !stream.Finish(context.Background(), "") {
+		t.Fatal("Finish with empty final must still finalize the card")
+	}
+	if streamBody["content"] != "partial answer the user is reading" {
+		t.Fatalf("final card content = %q, want the streamed partial preserved", streamBody["content"])
+	}
+	if streamBody["isFinalize"] != true {
+		t.Fatalf("isFinalize = %v, want true", streamBody["isFinalize"])
 	}
 }

@@ -44,6 +44,11 @@ func NewManager(servers map[string]config.MCPServerConfig) *Manager {
 
 		if err := client.Connect(); err != nil {
 			slog.Warn("failed to connect to MCP server, skipping", "server", name, "error", err)
+			// Connect may fail after the stdio subprocess started
+			// (initialize or the initialized-notification write) —
+			// without Close the process and its pipes leak on every
+			// agent-loop start.
+			client.Close()
 			continue
 		}
 

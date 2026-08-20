@@ -637,9 +637,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// shouldn't sit on its taskQueue slot forever — let ctx's
 		// task-timeout serve as the upper bound and drop the reply
 		// rather than blocking the next inbound from this user.
-		select {
-		case mb.Outbound <- out:
-		case <-ctx.Done():
+		if !enqueueOutbound(ctx, mb, out) {
 			slog.Warn("outbound enqueue cancelled", "agent", task.AgentID, "chat", task.Message.ChatID)
 		}
 		return reply, nil
@@ -652,6 +650,29 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	}
 
 	return g, nil
+}
+
+// enqueueOutbound delivers a reply to the outbound bus with a bounded
+// wait: while ctx is live it blocks until either the send completes or
+// the ctx is done, so a wedged routeOutbound can't pin a taskQueue
+// slot past its task timeout. But once ctx is done it still delivers
+// if the bus has room: the common case behind a done ctx here is the
+// task timeout expiring with generation already complete, and this
+// message is the user's only copy of the answer — the non-blocking
+// fallback send keeps the original "never block the slot" guarantee
+// while no longer throwing the reply away when it doesn't have to.
+func enqueueOutbound(ctx context.Context, mb *bus.MessageBus, out bus.OutboundMessage) bool {
+	select {
+	case mb.Outbound <- out:
+		return true
+	case <-ctx.Done():
+		select {
+		case mb.Outbound <- out:
+			return true
+		default:
+			return false
+		}
+	}
 }
 
 // UserSpaceFor returns the resolved user's UserSpace, lazy-loading on

@@ -134,6 +134,25 @@ func (c *StdioClient) sendRequest(method string, params interface{}) (*jsonRPCRe
 			continue // skip non-JSON lines (e.g. stderr leaking)
 		}
 
+		// A line carrying a method is a server-initiated message, not
+		// a response to ours. Server requests (ping, roots/list, …)
+		// share our small-integer id space, so treating one as the
+		// response returned a nil Result ("unexpected end of JSON
+		// input") or, for strict servers that wait for our reply and
+		// exit, surfaced as "process exited without response". Answer
+		// requests (we hold c.mu already — write stdin directly) and
+		// skip both requests and notifications.
+		var probe struct {
+			ID     *int   `json:"id"`
+			Method string `json:"method"`
+		}
+		if json.Unmarshal(line, &probe) == nil && probe.Method != "" {
+			if probe.ID != nil {
+				c.writeServerReply(*probe.ID, probe.Method)
+			}
+			continue
+		}
+
 		if resp.ID == id {
 			if resp.Error != nil {
 				return nil, fmt.Errorf("RPC error %d: %s", resp.Error.Code, resp.Error.Message)
@@ -146,6 +165,28 @@ func (c *StdioClient) sendRequest(method string, params interface{}) (*jsonRPCRe
 		return nil, fmt.Errorf("read stdout: %w", err)
 	}
 	return nil, fmt.Errorf("process exited without response")
+}
+
+// writeServerReply answers a server-initiated request: ping gets an
+// empty result; anything else (roots/list, elicitation, …) gets the
+// protocol's method-not-found error so the server doesn't stall
+// waiting on capabilities we don't implement. Caller holds c.mu.
+func (c *StdioClient) writeServerReply(id int, method string) {
+	var data []byte
+	var err error
+	if method == "ping" {
+		data, err = json.Marshal(jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: json.RawMessage("{}")})
+	} else {
+		data, err = json.Marshal(struct {
+			JSONRPC string        `json:"jsonrpc"`
+			ID      int           `json:"id"`
+			Error   *jsonRPCError `json:"error"`
+		}{JSONRPC: "2.0", ID: id, Error: &jsonRPCError{Code: -32601, Message: "client method not found: " + method}})
+	}
+	if err != nil {
+		return
+	}
+	_, _ = c.stdin.Write(append(data, '\n'))
 }
 
 // ListTools returns the list of tools available on the MCP server.

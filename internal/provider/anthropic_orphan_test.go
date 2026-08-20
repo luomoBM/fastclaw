@@ -315,3 +315,33 @@ func allText(out []anthropicMessage) string {
 	}
 	return sb.String()
 }
+
+// TestToAnthropicMessagesConcatsSystemMessages — the loop deliberately
+// appends several system messages per turn (system prompt, channel
+// hints, sender context, persistence reminder, and mid-conversation
+// nudges like todo-reconcile / cap-reached). toAnthropicMessages used
+// to keep only the LAST one, so any turn where a nudge or reminder
+// fired replaced the entire system prompt — persona, skills catalog,
+// format rules — with that one-paragraph message. System messages must
+// concatenate, matching the OpenAI path where each is delivered.
+func TestToAnthropicMessagesConcatsSystemMessages(t *testing.T) {
+	msgs := []Message{
+		{Role: "system", Content: "You are the A-Share Strategist. Follow MEMORY.md format rules."},
+		{Role: "system", Content: "[channel hints]"},
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello"},
+		{Role: "system", Content: "nudge: reconcile your todo list"},
+		{Role: "user", Content: "again"},
+	}
+	system, out := toAnthropicMessages(msgs)
+
+	if !strings.Contains(system, "You are the A-Share Strategist") {
+		t.Fatalf("main system prompt lost — system = %q", system)
+	}
+	if !strings.Contains(system, "channel hints") || !strings.Contains(system, "reconcile your todo") {
+		t.Fatalf("later system messages dropped — system = %q", system)
+	}
+	if len(out) != 3 {
+		t.Fatalf("conversation messages = %d, want 3 (user/assistant/user): %#v", len(out), out)
+	}
+}

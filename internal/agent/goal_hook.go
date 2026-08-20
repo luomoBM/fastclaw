@@ -57,6 +57,14 @@ func NewTokenAccountingHook(st goal.Store, mb *bus.MessageBus, agentID string) H
 			return
 		}
 
+		// Detach from the turn's cancellation. The fold+persist below
+		// records per-call usage that no later call retries (the doc
+		// comment's "next call will retry" holds for store blips, not
+		// for usage deltas) — a cancel landing between Chat() returning
+		// and this write (task timeout expiring, queue shutdown
+		// sweeping in-flight turns) would silently drop the delta from
+		// the budget.
+		ctx = context.WithoutCancel(ctx)
 		g, err := st.GetGoalBySession(ctx, agentID, hc.GoalSessionKey)
 		if errors.Is(err, goal.ErrNotFound) {
 			return

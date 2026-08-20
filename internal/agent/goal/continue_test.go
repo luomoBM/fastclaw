@@ -196,6 +196,68 @@ func TestPublishNilGuards(t *testing.T) {
 	}
 }
 
+// ctxAwareStore wraps memStore so GetGoalBySession honors ctx
+// cancellation the way the real SQL-backed store does (database/sql
+// returns ctx.Err() the moment the context is done). Production
+// gateway.log showed "goal continue: load goal failed" with exactly
+// these errors on turns that ended at the task timeout.
+type ctxAwareStore struct{ *memStore }
+
+func (c *ctxAwareStore) GetGoalBySession(ctx context.Context, agentID, sessionKey string) (*Goal, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.memStore.GetGoalBySession(ctx, agentID, sessionKey)
+}
+
+// TestTryFireContinuationCanceledTurnCtxStillPublishes — the
+// continuation gate runs from a PostTurn hook carrying the per-turn
+// context. A turn that ends at the task timeout (or is canceled during
+// queue shutdown) hands PostTurn an already-dead context; goal sessions
+// are autonomous, so no later PostTurn ever retries. The read must
+// detach from the turn's cancellation or the goal loop stalls forever
+// exactly when the turn struggled the most.
+func TestTryFireContinuationCanceledTurnCtxStillPublishes(t *testing.T) {
+	st := newMemStore()
+	g := seedActive(t, st)
+	wrapped := &ctxAwareStore{st}
+	mb := bus.New()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	TryFireContinuation(ctx, wrapped, mb, g.AgentID, g.SessionKey)
+
+	select {
+	case got := <-mb.Inbound:
+		if got.Source != bus.SourceGoalContext {
+			t.Errorf("Source = %q, want %q", got.Source, bus.SourceGoalContext)
+		}
+	default:
+		t.Fatal("canceled turn ctx must not kill the continuation publish — the autonomous goal loop would stall with no retry")
+	}
+}
+
+// TestTryFireContinuationDeadlineExceededTurnCtxStillPublishes — same
+// failure mode with the other production signature: the task-timeout
+// deadline elapsing mid-turn (observed after "max tool iterations
+// reached — forcing final delivery" at 2026-08-19 22:26/22:27).
+func TestTryFireContinuationDeadlineExceededTurnCtxStillPublishes(t *testing.T) {
+	st := newMemStore()
+	g := seedActive(t, st)
+	wrapped := &ctxAwareStore{st}
+	mb := bus.New()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 0)
+	defer cancel()
+	TryFireContinuation(ctx, wrapped, mb, g.AgentID, g.SessionKey)
+
+	select {
+	case <-mb.Inbound:
+	default:
+		t.Fatal("deadline-exceeded turn ctx must not kill the continuation publish")
+	}
+}
+
 func assertNoPublish(t *testing.T, mb *bus.MessageBus) {
 	t.Helper()
 	select {

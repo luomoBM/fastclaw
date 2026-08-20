@@ -59,6 +59,13 @@ type dingTalkReplyStream struct {
 	failed    bool
 	finalized bool
 	timer     *time.Timer
+	// updateMu serializes the PUT /v1.0/card/streaming calls (flush,
+	// Finish, Abort) in program order. Without it a timer flush and a
+	// Finish can both be in flight for the same outTrackId with
+	// independent random GUIDs — the server has no way to order them,
+	// and a partial update applied after the finalize leaves the card
+	// showing truncated text with the "generating" indicator stuck on.
+	updateMu sync.Mutex
 }
 
 func (s *dingTalkReplyStream) WriteDelta(delta string) {
@@ -86,6 +93,8 @@ func (s *dingTalkReplyStream) flush() {
 	content := s.content
 	s.timer = nil
 	s.mu.Unlock()
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
 	if err := s.d.updateCard(context.Background(), s.outTrackID, content, false); err != nil {
 		slog.Warn("DingTalk AI card streaming update failed", "account", s.d.accountID, "error", err)
 		s.mu.Lock()
@@ -105,8 +114,24 @@ func (s *dingTalkReplyStream) Finish(ctx context.Context, final string) bool {
 		return false
 	}
 	s.finalized = true
+	// A canceled turn (user Stop, task timeout) reaches the gateway's
+	// Finish(ctx, "") with the draft already streamed to the card.
+	// Blanking it destroys the partial the user was mid-read on —
+	// finalize with whatever was streamed.
+	if strings.TrimSpace(final) == "" {
+		final = s.content
+	}
 	s.content = final
 	s.mu.Unlock()
+	// Detach from the caller's cancellation, mirroring flush()'s
+	// context.Background(): the gateway hands Finish the per-task ctx,
+	// which is already dead exactly when a card turn hits the task
+	// timeout. A finalize bound to that ctx strands the card in
+	// "generating" state and the Markdown fallback is dropped by the
+	// same dead ctx — the user loses the answer in both forms.
+	ctx = context.WithoutCancel(ctx)
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
 	if err := s.d.updateCard(ctx, s.outTrackID, final, true); err != nil {
 		slog.Warn("DingTalk AI card final update failed; falling back to Markdown", "account", s.d.accountID, "error", err)
 		return false
@@ -129,6 +154,8 @@ func (s *dingTalkReplyStream) Abort(ctx context.Context) {
 	if strings.TrimSpace(content) == "" {
 		content = "已停止"
 	}
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
 	_ = s.d.updateCard(ctx, s.outTrackID, content, true)
 }
 
