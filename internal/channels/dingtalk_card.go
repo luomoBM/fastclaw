@@ -241,7 +241,12 @@ func (d *DingTalk) updateCard(ctx context.Context, outTrackID, content string, f
 		"outTrackId": outTrackID,
 		"guid":       randomCardGUID(),
 		"key":        "content",
-		"content":    FlattenMarkdownTables(strings.TrimSpace(content)),
+		// A streamed card is one message — it can't render the multiple
+		// bubbles SplitMessageMarker asks for, so collapse the token to a
+		// newline instead of surfacing it as literal text. Covers both the
+		// periodic flushes (raw deltas) and the finalize (joined reply
+		// parts); the gateway also pre-collapses before Finish.
+		"content":    FlattenMarkdownTables(strings.ReplaceAll(strings.TrimSpace(content), SplitMessageMarker, "\n")),
 		"isFull":     true,
 		"isFinalize": finalize,
 		"isError":    false,

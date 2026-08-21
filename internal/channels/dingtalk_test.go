@@ -211,6 +211,45 @@ func TestDingTalkCardStreamCreatesAndFinalizesOneCard(t *testing.T) {
 	}
 }
 
+func TestDingTalkCardStreamCollapsesSplitMarker(t *testing.T) {
+	var streamBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1.0/oauth2/accessToken":
+			_, _ = w.Write([]byte(`{"accessToken":"token-1","expireIn":7200}`))
+		case "/v1.0/card/instances/createAndDeliver":
+			_, _ = w.Write([]byte(`{"outTrackId":"card-1"}`))
+		case "/v1.0/card/streaming":
+			if err := json.NewDecoder(r.Body).Decode(&streamBody); err != nil {
+				t.Fatal(err)
+			}
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card", CardTemplateID: "template.schema", CardStreamIntervalMS: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.httpClient, d.apiBase = server.Client(), server.URL
+	stream, ok := d.StartReplyStream(context.Background(), bus.InboundMessage{Channel: "dingtalk", AccountID: "ding-client", ChatID: "user:staff-1"})
+	if !ok {
+		t.Fatal("card stream was not started")
+	}
+	// joinReplyParts concatenates per-iteration assistant texts with the
+	// split marker; a card is one message, so the token must collapse to a
+	// newline instead of reaching the chatter as literal `<|split|>`.
+	if !stream.Finish(context.Background(), "第一条<|split|>第二条") {
+		t.Fatal("card stream did not finish")
+	}
+	if got := streamBody["content"]; got != "第一条\n第二条" {
+		t.Fatalf("stream content = %#v, want marker collapsed to newline", got)
+	}
+}
+
 func TestDingTalkCardStreamDisabledWithoutTemplate(t *testing.T) {
 	d, err := NewDingTalkWithOptions("ding-client", "secret", "ding-client", bus.New(), &memoryReplyEndpoints{}, DingTalkCardOptions{ReplyMode: "card"})
 	if err != nil {

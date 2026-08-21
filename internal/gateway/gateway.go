@@ -609,7 +609,14 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 			// Finish receives the post-processed Markdown body so card and
 			// fallback display exactly the same text. A failed finalization
 			// deliberately falls through to normal Markdown delivery.
-			cardDelivered = replyStream.Finish(ctx, text)
+			//
+			// A card is a single-message surface: unlike the outbound bus
+			// (where dispatchOutbound splits or collapses the marker), a
+			// live-streamed card can't render multiple bubbles, so collapse
+			// SplitMessageMarker to a newline before finalizing — otherwise
+			// joinReplyParts' raw `<|split|>` token reaches the chatter.
+			cardText := strings.ReplaceAll(text, channels.SplitMessageMarker, "\n")
+			cardDelivered = replyStream.Finish(ctx, cardText)
 			if cardDelivered && len(items) == 0 {
 				return reply, nil
 			}
