@@ -34,6 +34,7 @@ type Job struct {
 	ChatID      string  `json:"chatId"`                // chat to send results to
 	Message     string  `json:"message"`               // message to send to the agent
 	OwnerUserID string  `json:"ownerUserId,omitempty"` // fastclaw user that owns this job
+	Silent      bool    `json:"silent,omitempty"`
 }
 
 // CronConfig holds cron job configuration.
@@ -95,6 +96,7 @@ type StoreJob struct {
 	// captured from the chatter at creation time. Legacy rows carry
 	// "UTC" (the old hardcoded value); empty means server-local.
 	Timezone string
+	Silent   bool
 }
 
 // globalNotify wakes the DB-mode scheduler when a cron tool creates or
@@ -252,7 +254,7 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 		// endpoint — both are always reachable (replies go through
 		// the plugin's channel.send, not an IM adapter). Empty
 		// channel is a legacy row that doesn't route through any bot.
-		if s.channels != nil && j.Channel != "" && j.Channel != "web" && j.Channel != "api" {
+		if !j.Silent && s.channels != nil && j.Channel != "" && j.Channel != "web" && j.Channel != "api" {
 			if !s.channels.Has(j.Channel, j.AccountID) {
 				count, ferr := s.store.IncrementCronJobFailure(ctx, j.ID)
 				if ferr != nil {
@@ -303,6 +305,7 @@ func (s *Scheduler) processDueJobs(ctx context.Context) {
 			Text:        text,
 			PeerKind:    "dm",
 			Source:      bus.SourceCron,
+			Silent:      j.Silent,
 		}
 
 		// Calculate next run based on job type.
@@ -477,6 +480,7 @@ func (s *Scheduler) fireJob(job Job) {
 		Text:        text,
 		PeerKind:    "dm",
 		Source:      bus.SourceCron,
+		Silent:      job.Silent,
 	}
 }
 

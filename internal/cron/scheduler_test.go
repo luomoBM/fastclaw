@@ -19,6 +19,10 @@ type mockStore struct {
 	updated map[string]time.Time // jobID → nextRun
 }
 
+type unavailableChannels struct{}
+
+func (unavailableChannels) Has(string, string) bool { return false }
+
 func newMockStore() *mockStore {
 	return &mockStore{
 		locked:  make(map[string]bool),
@@ -245,6 +249,26 @@ func TestProcessDueJobs_Cron(t *testing.T) {
 	}
 	if nextRun.Hour() != 9 || nextRun.Minute() != 0 {
 		t.Errorf("cron nextRun should be at 9:00, got %v", nextRun)
+	}
+}
+
+func TestProcessDueJobs_SilentRunsWithoutChannel(t *testing.T) {
+	mb := bus.New()
+	store := newMockStore()
+	store.addJob(StoreJob{
+		ID: "silent-1", Name: "background", Type: "interval", Schedule: "1h",
+		Message: "clean cache", Channel: "telegram", AccountID: "bot", Silent: true,
+	})
+	s := &Scheduler{bus: mb, store: store, channels: unavailableChannels{}, instanceID: "test"}
+
+	s.processDueJobs(context.Background())
+	select {
+	case msg := <-mb.Inbound:
+		if !msg.Silent || msg.Source != bus.SourceCron {
+			t.Fatalf("unexpected inbound: %+v", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("silent job was blocked by unavailable channel")
 	}
 }
 

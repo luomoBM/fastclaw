@@ -83,6 +83,8 @@ type InboundMessage struct {
 	// agent-loop side to decide whether the turn should fire downstream
 	// reactions that are only valid for genuine user input.
 	Source string
+	// Silent suppresses the automatic user-visible reply for a cron turn.
+	Silent bool
 	// SharedIdentity is set by the gateway when the channel has
 	// shared_identity enabled. The agent loop uses this to resolve
 	// sessions by owner identity instead of by channel triple, so

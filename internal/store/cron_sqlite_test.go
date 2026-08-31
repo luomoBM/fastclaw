@@ -39,6 +39,7 @@ func TestCronJobSQLiteRoundTrip(t *testing.T) {
 		Timezone:  "UTC",
 		Enabled:   true,
 		NextRun:   &futureTime,
+		Silent:    true,
 		CreatedAt: time.Now().UTC(),
 	}
 	if err := db.SaveCronJob(ctx, job); err != nil {
@@ -69,6 +70,9 @@ func TestCronJobSQLiteRoundTrip(t *testing.T) {
 	}
 	if got := due[0].ChatterID; got != "chatter-7" {
 		t.Errorf("ChatterID round-trip failed: got %q, want chatter-7", got)
+	}
+	if !due[0].Silent {
+		t.Error("Silent round-trip failed: got false, want true")
 	}
 
 	// Verify: GetNextDueTime should return the job's NextRun

@@ -114,6 +114,9 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateCronJobsFailureCount(ctx); err != nil {
 		return fmt.Errorf("migrate cron_jobs.failure_count: %w", err)
 	}
+	if err := d.migrateCronJobsSilent(ctx); err != nil {
+		return fmt.Errorf("migrate cron_jobs.silent: %w", err)
+	}
 	if err := d.migrateAgentsAddIsPublic(ctx); err != nil {
 		return fmt.Errorf("migrate agents.is_public: %w", err)
 	}
@@ -988,6 +991,15 @@ func (d *DBStore) migrateCronJobsFailureCount(ctx context.Context) error {
 	return nil
 }
 
+func (d *DBStore) migrateCronJobsSilent(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "cron_jobs", "silent")
+	if err != nil || has {
+		return err
+	}
+	_, err = d.db.ExecContext(ctx, `ALTER TABLE cron_jobs ADD COLUMN silent BOOLEAN NOT NULL DEFAULT FALSE`)
+	return err
+}
+
 // migrateCronJobsTimestampTZ fixes the timezone bug on the cron schedule
 // columns. The time columns (next_run, last_run, locked_at, created_at)
 // were declared TIMESTAMP without time zone. lib/pq sends each Go
@@ -1812,6 +1824,7 @@ func (d *DBStore) migrationSQL() []string {
 			-- row once it crosses the threshold so a dead bot doesn't
 			-- log forever.
 			failure_count INTEGER NOT NULL DEFAULT 0,
+			silent BOOLEAN NOT NULL DEFAULT FALSE,
 			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		)`,
 		// idx_cron_jobs_user creation is moved to migrateCronJobsAddUserID
@@ -4042,7 +4055,7 @@ func (d *DBStore) migrateChannelsAddSharedIdentity(ctx context.Context) error {
 
 // --- Cron jobs ---
 
-const cronSelectCols = `id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, failure_count, created_at`
+const cronSelectCols = `id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, failure_count, silent, created_at`
 
 func (d *DBStore) ListCronJobsByOwner(ctx context.Context, ownerUserID string) ([]CronJobRecord, error) {
 	// user_id is denormalized onto cron_jobs; the JOIN against agents
@@ -4075,7 +4088,7 @@ func (d *DBStore) GetCronJob(ctx context.Context, jobID string) (*CronJobRecord,
 		fmt.Sprintf(`SELECT `+cronSelectCols+` FROM cron_jobs WHERE id = %s`, d.ph(1)), jobID)
 	var j CronJobRecord
 	var lastRun, nextRun sql.NullTime
-	if err := row.Scan(&j.ID, &j.UserID, &j.ChatterID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.CreatedAt); err != nil {
+	if err := row.Scan(&j.ID, &j.UserID, &j.ChatterID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.Silent, &j.CreatedAt); err != nil {
 		return nil, scanErr(err)
 	}
 	if lastRun.Valid {
@@ -4108,23 +4121,23 @@ func (d *DBStore) SaveCronJob(ctx context.Context, job *CronJobRecord) error {
 	}
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
-			`INSERT INTO cron_jobs (id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, created_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+			`INSERT INTO cron_jobs (id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, silent, created_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 				ON CONFLICT (id) DO UPDATE SET
 				  user_id=$2, chatter_id=$3, agent_id=$4, name=$5, type=$6, schedule=$7, message=$8, channel=$9,
-				  chat_id=$10, account_id=$11, timezone=$12, enabled=$13, last_run=$14, next_run=$15`,
-			job.ID, job.UserID, job.ChatterID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.CreatedAt)
+				  chat_id=$10, account_id=$11, timezone=$12, enabled=$13, last_run=$14, next_run=$15, silent=$16`,
+			job.ID, job.UserID, job.ChatterID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.Silent, job.CreatedAt)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO cron_jobs (id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, created_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO cron_jobs (id, user_id, chatter_id, agent_id, name, type, schedule, message, channel, chat_id, account_id, timezone, enabled, last_run, next_run, silent, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
 			  user_id=excluded.user_id, chatter_id=excluded.chatter_id, agent_id=excluded.agent_id, name=excluded.name, type=excluded.type,
 			  schedule=excluded.schedule, message=excluded.message, channel=excluded.channel,
 			  chat_id=excluded.chat_id, account_id=excluded.account_id, timezone=excluded.timezone,
-			  enabled=excluded.enabled, last_run=excluded.last_run, next_run=excluded.next_run`,
-		job.ID, job.UserID, job.ChatterID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.CreatedAt)
+			  enabled=excluded.enabled, last_run=excluded.last_run, next_run=excluded.next_run, silent=excluded.silent`,
+		job.ID, job.UserID, job.ChatterID, job.AgentID, job.Name, job.Type, job.Schedule, job.Message, job.Channel, job.ChatID, job.AccountID, job.Timezone, job.Enabled, job.LastRun, job.NextRun, job.Silent, job.CreatedAt)
 	return err
 }
 
@@ -4586,7 +4599,7 @@ func scanCronJobs(rows *sql.Rows) ([]CronJobRecord, error) {
 	for rows.Next() {
 		var j CronJobRecord
 		var lastRun, nextRun sql.NullTime
-		if err := rows.Scan(&j.ID, &j.UserID, &j.ChatterID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.CreatedAt); err != nil {
+		if err := rows.Scan(&j.ID, &j.UserID, &j.ChatterID, &j.AgentID, &j.Name, &j.Type, &j.Schedule, &j.Message, &j.Channel, &j.ChatID, &j.AccountID, &j.Timezone, &j.Enabled, &lastRun, &nextRun, &j.FailureCount, &j.Silent, &j.CreatedAt); err != nil {
 			return nil, err
 		}
 		if lastRun.Valid {

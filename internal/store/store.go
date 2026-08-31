@@ -760,6 +760,7 @@ type CronJobRecord struct {
 	// resets it to 0; IncrementCronJobFailure bumps it. The scheduler
 	// deletes the row once it crosses an internal threshold.
 	FailureCount int       `json:"failureCount,omitempty"`
+	Silent       bool      `json:"silent,omitempty"`
 	CreatedAt    time.Time `json:"createdAt"`
 }
 

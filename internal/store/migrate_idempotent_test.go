@@ -52,6 +52,7 @@ func TestMigrateIdempotentOnFreshInstall(t *testing.T) {
 	missing(t, "configs", "agent_id", false)
 	missing(t, "configs", "credential_key", false)
 	missing(t, "cron_jobs", "user_id", true)
+	missing(t, "cron_jobs", "silent", true)
 	missing(t, "sessions", "channel", true)
 	missing(t, "sessions", "account_id", true)
 	missing(t, "sessions", "chat_id", true)

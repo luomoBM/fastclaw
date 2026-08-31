@@ -488,6 +488,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		if ag == nil {
 			return "", fmt.Errorf("agent %q not found", task.AgentID)
 		}
+		silentCron := isSilentCron(task.Message)
 		if len(task.Message.MediaItems) > 0 {
 			atts := make([]agent.Attachment, 0, len(task.Message.MediaItems))
 			for _, item := range task.Message.MediaItems {
@@ -509,22 +510,25 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 				task.Message.Text = refs.String() + task.Message.Text
 			}
 		}
-		chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
-		typingDone := make(chan struct{})
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-typingDone:
-					return
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
+		var typingDone chan struct{}
+		if !silentCron {
+			chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
+			typingDone = make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-typingDone:
+						return
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						chanMgr.SendTyping(task.Message.Channel, task.AccountID, task.Message.ChatID)
+					}
 				}
-			}
-		}()
+			}()
+		}
 
 		// IM channels show only the final reply — no per-tool_call
 		// progress messages. Users see a typing indicator (above)
@@ -544,7 +548,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// session can't be resolved — the OutboundMessage push below
 		// still delivers the final reply.
 		webStreamed := false
-		if g.chatEvents != nil && task.Message.Channel == "web" {
+		if !silentCron && g.chatEvents != nil && task.Message.Channel == "web" {
 			if sess := ag.Sessions().Get(task.Message.Channel, task.Message.AccountID, task.Message.ChatID, task.Message.ProjectID); sess != nil {
 				ctx = agent.ContextWithStream(ctx, nil, g.store, g.chatEvents, task.OwnerUserID, task.AgentID, sess.SessionKey())
 				webStreamed = true
@@ -554,7 +558,11 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		// DingTalk card mode owns one visible reply while the model is
 		// generating. The optional capability keeps every other IM adapter on
 		// the established typing-indicator + final-message path.
-		replyStream, cardStreamed := chanMgr.StartReplyStream(ctx, task.Message)
+		var replyStream channels.ReplyStream
+		cardStreamed := false
+		if !silentCron {
+			replyStream, cardStreamed = chanMgr.StartReplyStream(ctx, task.Message)
+		}
 		cardDelivered := false
 		if cardStreamed && ctx.Err() != nil {
 			replyStream.Abort(context.Background())
@@ -565,7 +573,13 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 		}
 
 		reply := ag.HandleMessage(ctx, task.Message)
-		close(typingDone)
+		if typingDone != nil {
+			close(typingDone)
+		}
+		if silentCron {
+			slog.Info("cron job completed silently", "agent", task.AgentID, "chat", task.Message.ChatID)
+			return reply, nil
+		}
 		// Extract `![alt](workspace/relative/path)` markdown image refs
 		// from the agent's reply, resolve their bytes via the
 		// workspace.Store, and ship them as MediaItems so IM channels
@@ -657,6 +671,10 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	}
 
 	return g, nil
+}
+
+func isSilentCron(msg bus.InboundMessage) bool {
+	return msg.Source == bus.SourceCron && msg.Silent
 }
 
 // enqueueOutbound delivers a reply to the outbound bus with a bounded

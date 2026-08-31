@@ -18,6 +18,7 @@ type createCronJobArgs struct {
 	Schedule string `json:"schedule"`
 	Message  string `json:"message"`
 	Type     string `json:"type"`
+	Silent   bool   `json:"silent"`
 }
 
 type deleteCronJobArgs struct {
@@ -54,8 +55,12 @@ func RegisterCronTools(r *Registry, st store.Store, userID, agentID string) {
 					"description": "Schedule type. Use 'once' for one-shot reminders ('5 分钟后…'), 'cron' for calendar-style recurring schedules ('每天 9 点'), or 'interval' for fixed-period polling ('每 30 分钟检查一次'). Defaults to 'cron'.",
 					"enum":        []string{"cron", "interval", "once"},
 				},
+				"silent": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Set true when the user asks to run the task quietly, in the background, or without a reminder/notification. Defaults to false.",
+				},
 			},
-			"required": []string{"name", "schedule", "message"},
+			"required": []string{"name", "schedule", "message", "silent"},
 		},
 		makeCreateCronJob(st, r, userID, agentID),
 	)
@@ -170,6 +175,7 @@ func makeCreateCronJob(st store.Store, r *Registry, userID, agentID string) Tool
 			Timezone:  tzName,
 			Enabled:   true,
 			NextRun:   &nextRun,
+			Silent:    args.Silent,
 			CreatedAt: now,
 		}
 
@@ -187,8 +193,8 @@ func makeCreateCronJob(st store.Store, r *Registry, userID, agentID string) Tool
 		if tzShown == "" {
 			tzShown = loc.String() + " (server default)"
 		}
-		return fmt.Sprintf("Cron job created successfully.\nID: %s\nName: %s\nSchedule: %s\nType: %s\nTimezone: %s\nFirst fire: %s",
-			id, args.Name, args.Schedule, jobType, tzShown, nextRun.In(loc).Format("2006-01-02 15:04:05 -0700")), nil
+		return fmt.Sprintf("Cron job created successfully.\nID: %s\nName: %s\nSchedule: %s\nType: %s\nTimezone: %s\nSilent: %t\nFirst fire: %s",
+			id, args.Name, args.Schedule, jobType, tzShown, args.Silent, nextRun.In(loc).Format("2006-01-02 15:04:05 -0700")), nil
 	}
 }
 

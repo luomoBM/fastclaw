@@ -60,3 +60,12 @@ func TestEnqueueOutboundDeliversLiveCtx(t *testing.T) {
 		t.Fatal("live ctx with room must deliver")
 	}
 }
+
+func TestIsSilentCron(t *testing.T) {
+	if !isSilentCron(bus.InboundMessage{Source: bus.SourceCron, Silent: true}) {
+		t.Fatal("silent cron message was not recognized")
+	}
+	if isSilentCron(bus.InboundMessage{Silent: true}) {
+		t.Fatal("user message must not be silenced")
+	}
+}

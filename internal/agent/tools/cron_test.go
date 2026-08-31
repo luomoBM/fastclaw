@@ -31,6 +31,7 @@ func TestCreateCronJobPersistsMessageAccountID(t *testing.T) {
 		Type:     "once",
 		Schedule: time.Now().Add(time.Hour).Format(time.RFC3339),
 		Message:  "提醒我",
+		Silent:   true,
 	})
 	if err != nil {
 		t.Fatalf("marshal args: %v", err)
@@ -58,6 +59,9 @@ func TestCreateCronJobPersistsMessageAccountID(t *testing.T) {
 	}
 	if got := jobs[0].ChatterID; got != "user-1" {
 		t.Fatalf("ChatterID = %q, want user-1 (stamped from registry chatter)", got)
+	}
+	if !jobs[0].Silent {
+		t.Fatal("Silent = false, want true")
 	}
 }
 
