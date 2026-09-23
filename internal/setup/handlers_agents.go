@@ -200,6 +200,17 @@ func (s *Server) agentScopeAutoPersist(r *http.Request, agentID string) *bool {
 	return &v
 }
 
+// agentScopeSubagentTimeoutSec reads the per-agent delegate_task
+// sub-agent wall-time budget override, in seconds. 0 = not set —
+// the runtime falls back to config.DefaultSubagentTimeoutSec.
+func (s *Server) agentScopeSubagentTimeoutSec(r *http.Request, agentID string) int {
+	// JSON numbers come back as float64 out of the raw map.
+	if v, ok := s.agentScopeDefaultsRead(r, agentID)["subagentTimeoutSec"].(float64); ok && v > 0 {
+		return int(v)
+	}
+	return 0
+}
+
 // agentScopeSharedIdentity returns true when ANY channel bound to this
 // agent has shared_identity enabled. The toggle is conceptually agent-
 // level (Context page) but physically stored per-channel so the gateway
@@ -512,6 +523,12 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		// To clear all overrides for this agent, send pluginsReset:true.
 		Plugins      map[string]bool `json:"plugins,omitempty"`
 		PluginsReset bool            `json:"pluginsReset,omitempty"`
+		// SubagentTimeoutSec — per-agent override of the delegate_task
+		// sub-agent wall-time budget, in seconds. nil = leave unchanged;
+		// non-nil <= 0 clears the override (inherit system default);
+		// positive sets it. Takes effect on the next delegate_task —
+		// the agent is invalidated below and rebuilt with the new value.
+		SubagentTimeoutSec *int `json:"subagentTimeoutSec,omitempty"`
 		// MCPServers is a whole-map replace: omit to leave untouched,
 		// send {} to clear, or send the full desired map to replace.
 		MCPServers      map[string]config.MCPServerConfig `json:"mcpServers,omitempty"`
@@ -617,6 +634,15 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 	} else if req.AutoPersist != nil {
 		defaultsPatch["autoPersist"] = *req.AutoPersist
 	}
+	if req.SubagentTimeoutSec != nil {
+		if *req.SubagentTimeoutSec > 0 {
+			defaultsPatch["subagentTimeoutSec"] = *req.SubagentTimeoutSec
+		} else {
+			// <= 0 is the caller's signal to clear the override and
+			// fall back to the system default (15 min).
+			defaultsPatch["subagentTimeoutSec"] = nil
+		}
+	}
 	if err := s.applyAgentScopeDefaultsPatch(r, rec.ID, defaultsPatch); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
@@ -661,6 +687,8 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			"config":           rec.Config,
 			"isPublic":         rec.IsPublic,
 			"shareModelConfig": share,
+			// 0 = no override (runtime uses the 15-min default).
+			"subagentTimeoutSec": s.agentScopeSubagentTimeoutSec(r, rec.ID),
 		},
 	})
 }
@@ -703,6 +731,8 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 			"createdAt":        rec.CreatedAt,
 			"isPublic":         rec.IsPublic,
 			"shareModelConfig": share,
+			// 0 = no override (runtime uses the 15-min default).
+			"subagentTimeoutSec": s.agentScopeSubagentTimeoutSec(r, rec.ID),
 		},
 	})
 }

@@ -690,8 +690,11 @@ var agentScopeKeys = map[string]string{
 	"temperature":          "agents.defaults",
 	"maxToolIterations":    "agents.defaults",
 	"maxParallelToolCalls": "agents.defaults",
-	"thinking":             "agents.defaults",
-	"policy":               "agents.defaults",
+	// subagentTimeoutSec — wall-time budget for one delegate_task
+	// sub-agent, in seconds. 0/unset = default 15 min.
+	"subagentTimeoutSec": "agents.defaults",
+	"thinking":           "agents.defaults",
+	"policy":             "agents.defaults",
 	// promptMode selects which framework sections BuildSystemPromptAs
 	// emits AND which built-in tools the LLM sees. One of "agent",
 	// "chatbot", "customize". Stored as a plain string under

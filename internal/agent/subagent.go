@@ -7,17 +7,33 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
 )
 
-// subagentDefaultTimeout caps the wall time one subagent can spend on
-// its loop, independent of how long the parent's overall turn has left.
-// Big enough for ~15-20 camoufox-cli-driven iterations including cold-
-// start. Smaller than agentTurnTimeout so a parallel fan-out where one
-// subagent goes slow doesn't take the rest down with it; parent ctx
-// cancel still propagates so a genuinely killed parent kills every
-// subagent.
-const subagentDefaultTimeout = 15 * time.Minute
+// subagentDefaultTimeout is the fallback wall-time budget for one
+// subagent loop when the agent carries no positive subagentTimeout
+// value. Derived from config.DefaultSubagentTimeoutSec so the config
+// layer's default and the runtime fallback can't drift apart. 15 min
+// because it's big enough for ~15-20 camoufox-cli-driven iterations
+// including cold-start, and smaller than agentTurnTimeout so a parallel
+// fan-out where one subagent goes slow doesn't take the rest down with
+// it; parent ctx cancel still propagates so a genuinely killed parent
+// kills every subagent.
+const subagentDefaultTimeout = time.Duration(config.DefaultSubagentTimeoutSec) * time.Second
+
+// effectiveSubagentTimeout returns this agent's effective sub-agent
+// wall-time budget: the configured value when positive, the default
+// (config.DefaultSubagentTimeoutSec) otherwise. The single place the
+// fallback fires — config loading usually resolves 0 → 900 via
+// ApplyDefaults, so this only matters for direct constructions and
+// non-positive values.
+func (a *Agent) effectiveSubagentTimeout() time.Duration {
+	if a.subagentTimeout > 0 {
+		return a.subagentTimeout
+	}
+	return subagentDefaultTimeout
+}
 
 // RunSubagent implements tools.SubagentRunner so the delegate_task tool
 // can call back into the Agent without creating an import cycle.
@@ -75,8 +91,10 @@ func (a *Agent) runSubagentLoop(ctx context.Context, task string, maxIterations 
 
 	// Each subagent gets its own bounded ctx so a slow sibling can't
 	// drain the rest of a parallel fan-out. Parent cancel still wins —
-	// we're wrapping, not detaching.
-	subCtx, cancel := context.WithTimeout(ctx, subagentDefaultTimeout)
+	// we're wrapping, not detaching, so the parent turn's own deadline
+	// caps whatever larger budget the operator configured here.
+	timeout := a.effectiveSubagentTimeout()
+	subCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	ctx = subCtx
 
@@ -143,8 +161,8 @@ func (a *Agent) runSubagentLoop(ctx context.Context, task string, maxIterations 
 			// agent can decide to retry with a tighter task scope.
 			if errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 				return "", fmt.Errorf(
-					"subagent ran out of its %s wall-time budget at iteration %d — task was too large; the parent should retry with a tighter scope or lower max_iterations",
-					subagentDefaultTimeout, i+1)
+					"subagent ran out of its %s wall-time budget at iteration %d — task was too large; the parent should retry with a tighter scope or lower max_iterations (the budget is configurable per agent)",
+					timeout, i+1)
 			}
 			return "", fmt.Errorf("subagent chat failed at iteration %d: %w", i+1, err)
 		}

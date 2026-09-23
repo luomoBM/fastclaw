@@ -48,7 +48,14 @@ type Agent struct {
 	temperature          float64
 	maxToolIterations    int
 	maxParallelToolCalls int // 0 = unlimited
-	thinking             string
+	// subagentTimeout is the effective delegate_task sub-agent
+	// wall-time budget, resolved from rc.SubagentTimeoutSec at build
+	// time. Live changes flow through agent invalidation (the manager
+	// rebuilds the Agent from a fresh ResolvedAgent); UpdateConfig
+	// assigns it too for callers that re-resolve in place. <= 0 falls
+	// back to subagentDefaultTimeout inside runSubagentLoop.
+	subagentTimeout time.Duration
+	thinking        string
 	// promptMode is kept on Agent so ReloadWorkspaceFiles can re-apply it
 	// when it rebuilds ctxBuilder — without this, every skill install /
 	// dashboard reload silently drops the agent back to agent-mode prompt
@@ -383,6 +390,7 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		temperature:          rc.Temperature,
 		maxToolIterations:    rc.MaxToolIterations,
 		maxParallelToolCalls: rc.MaxParallelToolCalls,
+		subagentTimeout:      time.Duration(rc.SubagentTimeoutSec) * time.Second,
 		thinking:             rc.Thinking,
 		promptMode:           rc.PromptMode,
 		homePath:             rc.Home,
@@ -3834,6 +3842,10 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	a.temperature = rc.Temperature
 	a.maxToolIterations = rc.MaxToolIterations
 	a.maxParallelToolCalls = rc.MaxParallelToolCalls
+	// Sub-agent wall-time budget follows config re-resolution —
+	// dashboard saves invalidate the agent and the rebuilt one picks
+	// up the new value on its next delegate_task.
+	a.subagentTimeout = time.Duration(rc.SubagentTimeoutSec) * time.Second
 	// Sandbox flags drive the system prompt's "Working Directory" / "home
 	// dir" description and the sandbox-capabilities block. Without this
 	// propagation an agent that existed before sandbox was enabled keeps

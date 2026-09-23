@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/config"
 	"github.com/fastclaw-ai/fastclaw/internal/scope"
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/users"
@@ -159,5 +160,82 @@ func TestResolveChatterSeparatesIMSendersForRegularOwner(t *testing.T) {
 	// survives bot reconnections and is shared across agents.
 	if aliceAccount.ExternalID != "telegram:111" {
 		t.Fatalf("unexpected external id: %q", aliceAccount.ExternalID)
+	}
+}
+
+// TestApplyAgentDefaultsOverlay locks the read+apply pair the two
+// agent-scope overlay sites (EnsureAgent, loadUserSpace) share: every
+// knob on the row must land on the resolved config, zero-valued knobs
+// must not clobber already-resolved values, and WorkspaceHistory must
+// stay out of the helper (owner-path-only today — see its doc comment).
+func TestApplyAgentDefaultsOverlay(t *testing.T) {
+	db, err := store.NewDBStore("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer db.Close()
+	if err := db.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	ctx := context.Background()
+
+	// No row → ok=false, zero value.
+	if _, ok := readAgentScopeDefaults(ctx, db, "agt_none"); ok {
+		t.Fatal("missing row should report ok=false")
+	}
+
+	// Full row: every knob set.
+	if err := scope.SaveSetting(ctx, db, "", "agt_full", "agents.defaults", map[string]interface{}{
+		"model":                "openai/gpt-5.5",
+		"maxTokens":            float64(4096),
+		"temperature":          0.2,
+		"maxToolIterations":    float64(7),
+		"maxParallelToolCalls": float64(2),
+		"subagentTimeoutSec":   float64(1800),
+		"thinking":             "low",
+		"policy":               "strict",
+		"promptMode":           "chatbot",
+		"splitReplies":         true,
+		"autoPersist":          true,
+		"workspaceHistory":     true,
+	}); err != nil {
+		t.Fatalf("save row: %v", err)
+	}
+	ovr, ok := readAgentScopeDefaults(ctx, db, "agt_full")
+	if !ok {
+		t.Fatal("existing row should report ok=true")
+	}
+
+	rc := config.ResolvedAgent{Model: "baseline", MaxToolIterations: 20, SubagentTimeoutSec: 900}
+	applyAgentDefaultsOverlay(&rc, ovr)
+
+	if rc.Model != "openai/gpt-5.5" || rc.MaxTokens != 4096 || rc.Temperature != 0.2 ||
+		rc.MaxToolIterations != 7 || rc.MaxParallelToolCalls != 2 ||
+		rc.SubagentTimeoutSec != 1800 || rc.Thinking != "low" || rc.PolicyPreset != "strict" ||
+		rc.PromptMode != "chatbot" {
+		t.Fatalf("scalar knobs not applied: %+v", rc)
+	}
+	if rc.SplitReplies == nil || !*rc.SplitReplies || rc.AutoPersist == nil || !*rc.AutoPersist {
+		t.Fatalf("pointer knobs not applied: splitReplies=%v autoPersist=%v", rc.SplitReplies, rc.AutoPersist)
+	}
+	// WorkspaceHistory is deliberately outside the helper.
+	if rc.WorkspaceHistory != nil {
+		t.Fatalf("WorkspaceHistory must not be applied by the helper, got %v", *rc.WorkspaceHistory)
+	}
+
+	// Sparse row: absent/zero knobs keep the already-resolved values.
+	if err := scope.SaveSetting(ctx, db, "", "agt_sparse", "agents.defaults", map[string]interface{}{
+		"subagentTimeoutSec": float64(600),
+	}); err != nil {
+		t.Fatalf("save sparse row: %v", err)
+	}
+	sparse, _ := readAgentScopeDefaults(ctx, db, "agt_sparse")
+	rc2 := config.ResolvedAgent{Model: "keep-me", MaxToolIterations: 12, SubagentTimeoutSec: 900}
+	applyAgentDefaultsOverlay(&rc2, sparse)
+	if rc2.Model != "keep-me" || rc2.MaxToolIterations != 12 {
+		t.Fatalf("zero-valued knobs clobbered resolved values: %+v", rc2)
+	}
+	if rc2.SubagentTimeoutSec != 600 {
+		t.Fatalf("sparse override not applied: %d", rc2.SubagentTimeoutSec)
 	}
 }

@@ -365,6 +365,73 @@ func readUserScopeAgentDefaults(ctx context.Context, st store.Store, userID stri
 	return out
 }
 
+// readAgentScopeDefaults loads an agent's scope=agent agents.defaults
+// row and decodes it. ok=false when the row is absent or unreadable.
+// Both agent-scope overlay sites (EnsureAgent for lazy-attached foreign
+// agents, loadUserSpace for the owner's own agents) read the row this
+// way — directly, NOT via SettingInto system+user, which would re-merge
+// those layers and clobber the user-scoped values already resolved into
+// cfg.Agents.Defaults.
+func readAgentScopeDefaults(ctx context.Context, st store.Store, agentID string) (config.AgentDefaults, bool) {
+	var out config.AgentDefaults
+	rec, err := st.GetConfigByName(ctx, store.KindSetting, "", agentID, NSAgentDefaults)
+	if err != nil || rec == nil {
+		return out, false
+	}
+	blob, _ := json.Marshal(rec.Data)
+	_ = json.Unmarshal(blob, &out)
+	return out, true
+}
+
+// applyAgentDefaultsOverlay layers a non-empty agents.defaults row onto
+// a resolved agent config: scalar fields apply when positive/non-empty,
+// pointer fields copy their value so the row can't be aliased into rc.
+// Shared by both agent-scope overlay sites so a new per-agent knob is
+// added here once instead of hand-synced in two places (the drift this
+// extraction replaces had EnsureAgent silently missing fields that
+// loadUserSpace applied).
+//
+// WorkspaceHistory is deliberately NOT applied here: only the owner
+// loadUserSpace path honors it today (EnsureAgent lazy-attach skips
+// it), and this helper preserves that split rather than blessing it.
+func applyAgentDefaultsOverlay(rc *config.ResolvedAgent, ovr config.AgentDefaults) {
+	if ovr.Model != "" {
+		rc.Model = ovr.Model
+	}
+	if ovr.MaxTokens > 0 {
+		rc.MaxTokens = ovr.MaxTokens
+	}
+	if ovr.Temperature > 0 {
+		rc.Temperature = ovr.Temperature
+	}
+	if ovr.MaxToolIterations > 0 {
+		rc.MaxToolIterations = ovr.MaxToolIterations
+	}
+	if ovr.MaxParallelToolCalls > 0 {
+		rc.MaxParallelToolCalls = ovr.MaxParallelToolCalls
+	}
+	if ovr.SubagentTimeoutSec > 0 {
+		rc.SubagentTimeoutSec = ovr.SubagentTimeoutSec
+	}
+	if ovr.Thinking != "" {
+		rc.Thinking = ovr.Thinking
+	}
+	if ovr.PolicyPreset != "" {
+		rc.PolicyPreset = ovr.PolicyPreset
+	}
+	if ovr.PromptMode != "" {
+		rc.PromptMode = ovr.PromptMode
+	}
+	if ovr.SplitReplies != nil {
+		v := *ovr.SplitReplies
+		rc.SplitReplies = &v
+	}
+	if ovr.AutoPersist != nil {
+		v := *ovr.AutoPersist
+		rc.AutoPersist = &v
+	}
+}
+
 // EnsureAgent attaches an agent the user does not own to this UserSpace.
 // Used by super_admin chat: the admin operates on a foreign agent under
 // their own user_id namespace (sessions, memory, mem0 scope all stay
@@ -456,6 +523,9 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			if ovr.MaxParallelToolCalls > 0 {
 				rc.MaxParallelToolCalls = ovr.MaxParallelToolCalls
 			}
+			if ovr.SubagentTimeoutSec > 0 {
+				rc.SubagentTimeoutSec = ovr.SubagentTimeoutSec
+			}
 			if ovr.Thinking != "" {
 				rc.Thinking = ovr.Thinking
 			}
@@ -479,48 +549,8 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 		}
 	}
 	if applyOwnerOverlays {
-		if cfgRec, err := st.GetConfigByName(ctx, store.KindSetting, "", rc.ID, "agents.defaults"); err == nil && cfgRec != nil {
-			var ovr config.AgentDefaults
-			blob, _ := json.Marshal(cfgRec.Data)
-			_ = json.Unmarshal(blob, &ovr)
-			if ovr.Model != "" {
-				rc.Model = ovr.Model
-			}
-			if ovr.MaxTokens > 0 {
-				rc.MaxTokens = ovr.MaxTokens
-			}
-			if ovr.Temperature > 0 {
-				rc.Temperature = ovr.Temperature
-			}
-			if ovr.MaxToolIterations > 0 {
-				rc.MaxToolIterations = ovr.MaxToolIterations
-			}
-			if ovr.MaxParallelToolCalls > 0 {
-				rc.MaxParallelToolCalls = ovr.MaxParallelToolCalls
-			}
-			if ovr.Thinking != "" {
-				rc.Thinking = ovr.Thinking
-			}
-			if ovr.PolicyPreset != "" {
-				rc.PolicyPreset = ovr.PolicyPreset
-			}
-			// Keep this overlay aligned with the owner-path equivalent in
-			// loadUserSpace — missing fields silently break per-agent
-			// settings for chatters who lazy-attach the agent via a
-			// channel binding (e.g. wechat multi-bubble hint never fires
-			// because rc.SplitReplies stays nil; chatbot persona renders
-			// in agent-prompt mode because rc.PromptMode stays "").
-			if ovr.PromptMode != "" {
-				rc.PromptMode = ovr.PromptMode
-			}
-			if ovr.SplitReplies != nil {
-				v := *ovr.SplitReplies
-				rc.SplitReplies = &v
-			}
-			if ovr.AutoPersist != nil {
-				v := *ovr.AutoPersist
-				rc.AutoPersist = &v
-			}
+		if ovr, ok := readAgentScopeDefaults(ctx, st, rc.ID); ok {
+			applyAgentDefaultsOverlay(&rc, ovr)
 		}
 	}
 	if chatterPin.Model != "" {
@@ -686,62 +716,18 @@ func loadUserSpace(ctx context.Context, userID string, mb *bus.MessageBus, st st
 	resolved := config.ResolveAgents(cfg, entries)
 	for i := range resolved {
 		// Layer the agent-scope agents.defaults on top of the
-		// system→user merge that ResolveAgents already applied. We
-		// read the agent-scope row directly (not via SettingInto
-		// system+user, which would re-merge those layers and clobber
-		// the user-scoped Model already in cfg.Agents.Defaults).
+		// system→user merge that ResolveAgents already applied (see
+		// readAgentScopeDefaults for why the row is read directly).
 		//
 		// Index into resolved (not range-by-value) so the writes
 		// land on the slice element the manager later reads —
 		// otherwise the agent-scope Model never reaches NewManager
 		// and chat silently uses the system/user default.
 		rc := &resolved[i]
-		var agentOverride config.AgentDefaults
-		if rec, err := st.GetConfigByName(ctx, store.KindSetting, "", rc.ID, "agents.defaults"); err == nil && rec != nil {
-			blob, _ := json.Marshal(rec.Data)
-			_ = json.Unmarshal(blob, &agentOverride)
-			if agentOverride.Model != "" {
-				rc.Model = agentOverride.Model
-			}
-			if agentOverride.MaxTokens > 0 {
-				rc.MaxTokens = agentOverride.MaxTokens
-			}
-			if agentOverride.Temperature > 0 {
-				rc.Temperature = agentOverride.Temperature
-			}
-			if agentOverride.MaxToolIterations > 0 {
-				rc.MaxToolIterations = agentOverride.MaxToolIterations
-			}
-			if agentOverride.MaxParallelToolCalls > 0 {
-				rc.MaxParallelToolCalls = agentOverride.MaxParallelToolCalls
-			}
-			if agentOverride.Thinking != "" {
-				rc.Thinking = agentOverride.Thinking
-			}
-			if agentOverride.PolicyPreset != "" {
-				rc.PolicyPreset = agentOverride.PolicyPreset
-			}
-			if agentOverride.PromptMode != "" {
-				rc.PromptMode = agentOverride.PromptMode
-			}
-			// Per-agent WeChat split-replies — pointer semantics so
-			// "absent" (no row, or row without the key) is distinct
-			// from "explicitly false". Non-nil from the row means the
-			// operator made a deliberate choice; nil falls through to
-			// system WeChatCfg.SplitReplies later in NewAgentWithFullCfg.
-			if agentOverride.SplitReplies != nil {
-				v := *agentOverride.SplitReplies
-				rc.SplitReplies = &v
-			}
-			// Per-agent autoPersist — same pointer semantics. Non-nil
-			// here overrides the system/user memory.autoPersist.enabled
-			// for this agent specifically. Used most by chatbot-mode
-			// personas where the LLM can't write_file directly so the
-			// background distill pass is the only persistence path.
-			if agentOverride.AutoPersist != nil {
-				v := *agentOverride.AutoPersist
-				rc.AutoPersist = &v
-			}
+		if agentOverride, ok := readAgentScopeDefaults(ctx, st, rc.ID); ok {
+			applyAgentDefaultsOverlay(rc, agentOverride)
+			// WorkspaceHistory — owner path only; EnsureAgent
+			// lazy-attach deliberately skips it (see the helper).
 			if agentOverride.WorkspaceHistory != nil {
 				v := *agentOverride.WorkspaceHistory
 				rc.WorkspaceHistory = &v

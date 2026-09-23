@@ -362,6 +362,13 @@ type AgentsConfig struct {
 	Defaults AgentDefaults `json:"defaults"`
 }
 
+// DefaultSubagentTimeoutSec is the fallback wall-time budget (15 min)
+// for one delegate_task sub-agent when no per-agent override is set.
+// Single source of truth: ApplyDefaults fills it into
+// Agents.Defaults, and the agent runtime derives its Duration fallback
+// from it — keeping both encodings pinned to one number.
+const DefaultSubagentTimeoutSec = 900
+
 type AgentDefaults struct {
 	Model             string  `json:"model,omitempty"`
 	MaxTokens         int     `json:"maxTokens,omitempty"`
@@ -378,6 +385,12 @@ type AgentDefaults struct {
 	MaxParallelToolCalls int    `json:"maxParallelToolCalls,omitempty"`
 	Thinking             string `json:"thinking,omitempty"`
 	PolicyPreset         string `json:"policy,omitempty"`
+	// SubagentTimeoutSec caps the wall time one delegate_task
+	// sub-agent can spend on its loop, in seconds. 0 = default
+	// (15 min). Note the parent turn's own budget still applies:
+	// a sub-agent configured for 2h is nonetheless killed when
+	// the parent turn ctx expires.
+	SubagentTimeoutSec int `json:"subagentTimeoutSec,omitempty"`
 	// PromptMode lives here so the agent-scope `agents.defaults`
 	// config row (written by CLI and dashboard) round-trips into
 	// ResolvedAgent at userspace assembly time — see
@@ -413,18 +426,22 @@ type AgentEntry struct {
 	// Name mirrors agents.name (the operator-given display name) and is
 	// carried through to ResolvedAgent.DisplayName so the system prompt
 	// can stamp a fallback identity line when IDENTITY.md is empty.
-	Name                 string                     `json:"name,omitempty"`
-	Workspace            string                     `json:"workspace,omitempty"`
-	MaxTokens            int                        `json:"maxTokens,omitempty"`
-	Temperature          float64                    `json:"temperature,omitempty"`
-	MaxToolIterations    int                        `json:"maxToolIterations,omitempty"`
-	MaxParallelToolCalls int                        `json:"maxParallelToolCalls,omitempty"`
-	Skills               []string                   `json:"skills,omitempty"`
-	MCPServers           map[string]MCPServerConfig `json:"mcpServers,omitempty"`
-	AlwaysLoadSkills     []string                   `json:"alwaysLoadSkills,omitempty"`
-	Thinking             string                     `json:"thinking,omitempty"`
-	Sandbox              SandboxCfg                 `json:"sandbox,omitempty"`
-	PolicyPreset         string                     `json:"policy,omitempty"`
+	Name                 string  `json:"name,omitempty"`
+	Workspace            string  `json:"workspace,omitempty"`
+	MaxTokens            int     `json:"maxTokens,omitempty"`
+	Temperature          float64 `json:"temperature,omitempty"`
+	MaxToolIterations    int     `json:"maxToolIterations,omitempty"`
+	MaxParallelToolCalls int     `json:"maxParallelToolCalls,omitempty"`
+	// SubagentTimeoutSec — per-agent override of the delegate_task
+	// sub-agent wall-time budget, in seconds. 0 = inherit default
+	// (15 min).
+	SubagentTimeoutSec int                        `json:"subagentTimeoutSec,omitempty"`
+	Skills             []string                   `json:"skills,omitempty"`
+	MCPServers         map[string]MCPServerConfig `json:"mcpServers,omitempty"`
+	AlwaysLoadSkills   []string                   `json:"alwaysLoadSkills,omitempty"`
+	Thinking           string                     `json:"thinking,omitempty"`
+	Sandbox            SandboxCfg                 `json:"sandbox,omitempty"`
+	PolicyPreset       string                     `json:"policy,omitempty"`
 	// PromptMode selects how heavily the framework system prompt
 	// participates AND which built-in tools the LLM sees. Empty =
 	// "agent" (current default) for backward compatibility. See
@@ -567,17 +584,21 @@ func defaultAgentFileConfigLoader(_, home string) (AgentFileConfig, bool) {
 // (agents.config column). Per-agent providers/channels live in their own
 // scoped DB tables and are NOT persisted here.
 type AgentFileConfig struct {
-	Model                string                     `json:"model,omitempty"`
-	MaxTokens            int                        `json:"maxTokens,omitempty"`
-	Temperature          float64                    `json:"temperature,omitempty"`
-	MaxToolIterations    int                        `json:"maxToolIterations,omitempty"`
-	MaxParallelToolCalls int                        `json:"maxParallelToolCalls,omitempty"`
-	Workspace            string                     `json:"workspace,omitempty"`
-	Skills               SkillsConfig               `json:"skills,omitempty"`
-	MCPServers           map[string]MCPServerConfig `json:"mcpServers,omitempty"`
-	ToolProviders        map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
-	Tools                map[string]ToolCategoryCfg `json:"tools,omitempty"`
-	Providers            map[string]ProviderConfig  `json:"providers,omitempty"`
+	Model                string  `json:"model,omitempty"`
+	MaxTokens            int     `json:"maxTokens,omitempty"`
+	Temperature          float64 `json:"temperature,omitempty"`
+	MaxToolIterations    int     `json:"maxToolIterations,omitempty"`
+	MaxParallelToolCalls int     `json:"maxParallelToolCalls,omitempty"`
+	// SubagentTimeoutSec — per-agent override of the delegate_task
+	// sub-agent wall-time budget, in seconds. 0 = inherit default
+	// (15 min).
+	SubagentTimeoutSec int                        `json:"subagentTimeoutSec,omitempty"`
+	Workspace          string                     `json:"workspace,omitempty"`
+	Skills             SkillsConfig               `json:"skills,omitempty"`
+	MCPServers         map[string]MCPServerConfig `json:"mcpServers,omitempty"`
+	ToolProviders      map[string]ToolProviderCfg `json:"toolProviders,omitempty"`
+	Tools              map[string]ToolCategoryCfg `json:"tools,omitempty"`
+	Providers          map[string]ProviderConfig  `json:"providers,omitempty"`
 	// PromptMode mirrors AgentEntry.PromptMode at the file-config layer.
 	// Non-empty values override the entry-level setting.
 	PromptMode string `json:"promptMode,omitempty"`
@@ -645,8 +666,13 @@ type ResolvedAgent struct {
 	Temperature          float64
 	MaxToolIterations    int
 	MaxParallelToolCalls int
-	Thinking             string
-	Skills               SkillsConfig
+	// SubagentTimeoutSec — effective delegate_task sub-agent
+	// wall-time budget in seconds. 0 = default (15 min); the agent
+	// loop maps it to the context.WithTimeout deadline in
+	// runSubagentLoop.
+	SubagentTimeoutSec int
+	Thinking           string
+	Skills             SkillsConfig
 	MCPServers           map[string]MCPServerConfig
 	Sandbox              SandboxCfg
 	PolicyPreset         string
@@ -752,6 +778,9 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Agents.Defaults.MaxToolIterations == 0 {
 		cfg.Agents.Defaults.MaxToolIterations = 20
 	}
+	if cfg.Agents.Defaults.SubagentTimeoutSec == 0 {
+		cfg.Agents.Defaults.SubagentTimeoutSec = DefaultSubagentTimeoutSec
+	}
 }
 
 // MergedAgentConfig merges defaults with an agent entry to produce a fully
@@ -774,6 +803,7 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		Temperature:          cfg.Agents.Defaults.Temperature,
 		MaxToolIterations:    cfg.Agents.Defaults.MaxToolIterations,
 		MaxParallelToolCalls: cfg.Agents.Defaults.MaxParallelToolCalls,
+		SubagentTimeoutSec:   cfg.Agents.Defaults.SubagentTimeoutSec,
 		Thinking:             cfg.Agents.Defaults.Thinking,
 		Sandbox:              cfg.Sandbox,
 		PolicyPreset:         cfg.Agents.Defaults.PolicyPreset,
@@ -791,6 +821,9 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 	}
 	if entry.MaxParallelToolCalls > 0 {
 		resolved.MaxParallelToolCalls = entry.MaxParallelToolCalls
+	}
+	if entry.SubagentTimeoutSec > 0 {
+		resolved.SubagentTimeoutSec = entry.SubagentTimeoutSec
 	}
 	if entry.Thinking != "" {
 		resolved.Thinking = entry.Thinking
@@ -857,6 +890,9 @@ func (cfg *Config) MergedAgentConfig(entry AgentEntry) ResolvedAgent {
 		}
 		if fileCfg.MaxParallelToolCalls > 0 {
 			resolved.MaxParallelToolCalls = fileCfg.MaxParallelToolCalls
+		}
+		if fileCfg.SubagentTimeoutSec > 0 {
+			resolved.SubagentTimeoutSec = fileCfg.SubagentTimeoutSec
 		}
 		resolved.Skills = fileCfg.Skills
 		if len(fileCfg.Admins) > 0 {

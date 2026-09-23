@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -11,7 +13,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Brain, Check, Link2, MessageSquare, MessagesSquare, Puzzle } from "lucide-react";
+import { Brain, Check, Link2, MessageSquare, MessagesSquare, Puzzle, Timer } from "lucide-react";
 import { getAgent, updateAgent } from "@/lib/api";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { useAgentName } from "@/hooks/use-agent-name";
@@ -53,9 +55,20 @@ export default function AgentContextPage() {
   const [autoPersistSaving, setAutoPersistSaving] = useState(false);
   const [sharedIdentity, setSharedIdentity] = useState(false);
   const [sharedIdentitySaving, setSharedIdentitySaving] = useState(false);
+  // Sub-agent (delegate_task) wall-time budget, edited in MINUTES for
+  // operator ergonomics, stored in seconds on the wire. "" = no
+  // override saved (runtime default 15 min).
+  const [subagentTimeoutMin, setSubagentTimeoutMin] = useState("");
+  const [subagentTimeoutSaving, setSubagentTimeoutSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  // Parsed once per render — the save handler and the Save button's
+  // disabled check share one derivation instead of re-parsing the
+  // input at each call site.
+  const budgetMin = parseFloat(subagentTimeoutMin);
+  const budgetValid = Number.isFinite(budgetMin) && budgetMin > 0;
 
   const fetchAll = useCallback(async () => {
     if (!agentId) return;
@@ -71,6 +84,10 @@ export default function AgentContextPage() {
       setSplitReplies(agentRec?.splitReplies === true);
       setAutoPersist(agentRec?.autoPersist === true);
       setSharedIdentity(agentRec?.sharedIdentity === true);
+      const st = agentRec?.subagentTimeoutSec || 0;
+      // Keep fractional minutes (e.g. a CLI-set 90s → 1.5) so a
+      // display→save round-trip doesn't silently rewrite the value.
+      setSubagentTimeoutMin(st > 0 ? String(st / 60) : "");
     } finally {
       setLoading(false);
     }
@@ -145,6 +162,40 @@ export default function AgentContextPage() {
       setSharedIdentity(prev);
     } finally {
       setSharedIdentitySaving(false);
+    }
+  };
+
+  // Save the sub-agent budget: minutes in the input → seconds on the
+  // wire. Non-positive / unparsable input is ignored (button disabled).
+  // catch matches every sibling handler — a failed PATCH must not
+  // escape as an unhandled rejection.
+  const handleSubagentTimeoutSave = async () => {
+    if (!budgetValid) return;
+    setSubagentTimeoutSaving(true);
+    try {
+      await updateAgent(agentId, { subagentTimeoutSec: Math.round(budgetMin * 60) });
+      flashSaved();
+    } catch {
+      // No optimistic state to roll back — the input keeps the user's
+      // edit so they can retry; flashSaved() is simply skipped.
+    } finally {
+      setSubagentTimeoutSaving(false);
+    }
+  };
+
+  // Clear the override — backend treats non-positive as "remove the
+  // key" so the runtime falls back to the 15-minute default.
+  const handleSubagentTimeoutReset = async () => {
+    const prev = subagentTimeoutMin;
+    setSubagentTimeoutMin("");
+    setSubagentTimeoutSaving(true);
+    try {
+      await updateAgent(agentId, { subagentTimeoutSec: 0 });
+      flashSaved();
+    } catch {
+      setSubagentTimeoutMin(prev);
+    } finally {
+      setSubagentTimeoutSaving(false);
     }
   };
 
@@ -341,6 +392,74 @@ export default function AgentContextPage() {
             disabled={sharedIdentitySaving}
             aria-label="Shared identity across channels"
           />
+        </div>
+      </div>
+
+      {/* Sub-agent time budget — how long one delegate_task sub-agent
+          may run before the runtime kills it and hands the parent
+          whatever partial result it produced. */}
+      <div className="rounded-lg border border-border bg-card p-5">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex items-start gap-3 min-w-0">
+            <Timer className="h-4 w-4 text-primary mt-0.5 shrink-0" />
+            <div className="min-w-0">
+              <h3 className="font-medium flex items-center gap-2">
+                Sub-agent time budget
+                {subagentTimeoutMin === "" ? (
+                  <Badge variant="outline" className="text-[10px]">
+                    Default
+                  </Badge>
+                ) : (
+                  <Badge className="bg-primary/10 text-primary hover:bg-primary/10 text-[10px]">
+                    {subagentTimeoutMin} min
+                  </Badge>
+                )}
+              </h3>
+              <p className="text-sm text-muted-foreground mt-1">
+                Wall-time budget for one delegated sub-task (
+                <code className="text-[10px]">delegate_task</code>). When it
+                expires the runtime kills the sub-agent and the parent
+                works with whatever partial result came back. Default is
+                15 minutes. The parent turn&apos;s overall budget still
+                applies — a sub-agent configured for longer than the turn
+                is nonetheless capped by it. Takes effect on the next
+                delegation, no restart needed.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Input
+              type="number"
+              min={1}
+              step={0.5}
+              inputMode="decimal"
+              value={subagentTimeoutMin}
+              onChange={(e) => setSubagentTimeoutMin(e.target.value)}
+              placeholder="15"
+              disabled={subagentTimeoutSaving}
+              aria-label="Sub-agent time budget in minutes"
+              className="w-24"
+            />
+            <span className="text-xs text-muted-foreground">min</span>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleSubagentTimeoutSave}
+              disabled={subagentTimeoutSaving || !budgetValid}
+            >
+              Save
+            </Button>
+            {subagentTimeoutMin !== "" && (
+              <Button
+                size="sm"
+                variant="ghost"
+                onClick={handleSubagentTimeoutReset}
+                disabled={subagentTimeoutSaving}
+              >
+                Reset
+              </Button>
+            )}
+          </div>
         </div>
       </div>
     </div>

@@ -118,6 +118,10 @@ export interface AgentDetail {
   // sharedIdentity — when true, all channels share sessions and memory
   // with the web channel (owner's identity). Default false.
   sharedIdentity?: boolean;
+  // subagentTimeoutSec is the per-agent delegate_task sub-agent
+  // wall-time budget in seconds, as saved on the agents.defaults row.
+  // 0 / undefined = no override (runtime uses the 15-min default).
+  subagentTimeoutSec?: number;
   // plugins is the per-agent hook-plugin enable overlay: pluginID →
   // enabled. Missing keys fall back to the system-wide enable state
   // (visible via /api/plugins). null/undefined means "no per-agent
@@ -1387,6 +1391,11 @@ export interface AgentUpdatePayload {
   // to this agent use the owner's user_id as chatter so sessions
   // and memory are shared across web + IM channels.
   sharedIdentity?: boolean;
+  // Sub-agent (delegate_task) wall-time budget in seconds. Omit to
+  // leave unchanged; pass a positive value to set; pass 0 (or any
+  // non-positive) to clear the override and fall back to the
+  // 15-minute system default.
+  subagentTimeoutSec?: number;
   // Per-agent plugin enable overrides (patch semantics — keys not in
   // the map are preserved). Pass pluginsReset:true to clear ALL
   // per-agent overrides and fall back to system-wide enable state.
