@@ -68,6 +68,13 @@ type Message struct {
 	// When sending history back to the LLM, use this instead of re-serializing from
 	// parsed fields — guarantees prompt cache hits by maintaining byte-identical prefix.
 	// Only set on role="assistant" messages.
+	//
+	// The shape is provider-specific: the OpenAI adapter stores a full chat
+	// message ({"role":"assistant",...}); the Anthropic adapter stores a bare
+	// {"type":"thinking",...} content block for its own replay. Sessions can
+	// outlive the provider that wrote them, so wire-build consumers must
+	// validate the shape before any verbatim reuse — see
+	// isOpenAIChatMessage (openai.go) and thinkingBlockFor (anthropic.go).
 	RawAssistant json.RawMessage `json:"_raw,omitempty"`
 
 	// Origin distinguishes runtime-injected messages from real user /

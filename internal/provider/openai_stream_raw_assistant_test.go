@@ -164,6 +164,69 @@ func TestToAPIMessagesRebuildAssistantKeepsReasoningContent(t *testing.T) {
 	}
 }
 
+// TestToAPIMessagesRejectsNonOpenAIRawAssistant pins the 422 seen after
+// switching a session's default provider from an anthropic-compat route
+// to DeepSeek's openai-chat route. The Anthropic provider stores its
+// thinking replay payload — a bare {type:"thinking",...} content block —
+// on Message.RawAssistant with NO "role" field. toAPIMessages used to
+// append any non-empty RawAssistant verbatim, so the OpenAI wire carried:
+//
+//	[..., {"type":"thinking","thinking":"..."} , ...]
+//
+// and DeepSeek's strict deserializer rejected the request with
+// `messages[2]: missing field role`. The raw JSON without a role must be
+// rebuilt from the parsed fields instead (Thinking → reasoning_content),
+// while genuine OpenAI-format raw JSON is still reused verbatim.
+func TestToAPIMessagesRejectsNonOpenAIRawAssistant(t *testing.T) {
+	anthropicThinkingRaw := json.RawMessage(
+		`{"type":"thinking","thinking":"need to check the file first","signature":"sig123"}`)
+
+	msgs := []Message{
+		{Role: "user", Content: "hi"},
+		{
+			Role:         "assistant",
+			Content:      "",
+			Thinking:     "need to check the file first",
+			ToolCalls:    []ToolCall{{ID: "call_abc", Type: "function", Function: FunctionCall{Name: "read_file", Arguments: `{"path":"IDENTITY.md"}`}}},
+			RawAssistant: anthropicThinkingRaw,
+		},
+		{Role: "tool", ToolCallID: "call_abc", Content: "file contents"},
+	}
+
+	wire := toAPIMessages(msgs)
+	if len(wire) != 3 {
+		t.Fatalf("toAPIMessages returned %d msgs, want 3", len(wire))
+	}
+
+	// The thinking block must have been rebuilt, not shipped verbatim: the
+	// wire message carries the assistant role and the stored Thinking as
+	// reasoning_content (a verbatim thinking block would fail both).
+	var am apiMessage
+	if err := json.Unmarshal(wire[1], &am); err != nil {
+		t.Fatalf("wire[1] is not a valid apiMessage: %v\n---\n%s", err, string(wire[1]))
+	}
+	if am.Role != "assistant" {
+		t.Errorf("rebuilt wire[1].role = %q, want \"assistant\"\n---\n%s", am.Role, string(wire[1]))
+	}
+	if am.ReasoningContent != "need to check the file first" {
+		t.Errorf("rebuilt wire[1].reasoning_content = %q, want the stored Thinking\n---\n%s",
+			am.ReasoningContent, string(wire[1]))
+	}
+
+	// A genuine OpenAI-format raw message must still be reused verbatim
+	// so the byte-identical-prefix cache-hit guarantee survives.
+	openAIRaw := json.RawMessage(`{"role":"assistant","content":"hello"}`)
+	verbatimMsgs := []Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello", RawAssistant: openAIRaw},
+	}
+	verbatimWire := toAPIMessages(verbatimMsgs)
+	if string(verbatimWire[1]) != string(openAIRaw) {
+		t.Errorf("OpenAI-format RawAssistant must round-trip verbatim:\ngot  %s\nwant %s",
+			string(verbatimWire[1]), string(openAIRaw))
+	}
+}
+
 // Avoid an unused import on io when go vet is strict; keep one
 // reference so future edits don't break compile if io is needed.
 var _ = io.EOF

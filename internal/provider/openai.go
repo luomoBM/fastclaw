@@ -83,6 +83,27 @@ type sseUsage struct {
 	} `json:"prompt_tokens_details,omitempty"`
 }
 
+// isOpenAIChatMessage reports whether raw is an OpenAI-format chat
+// message, i.e. carries a non-empty "role" field. RawAssistant is
+// provider-shaped, not universally so: the Anthropic provider packs a
+// bare {type:"thinking",...} content block in there (no role) for its
+// own content-block replay. Shipping that block verbatim on the
+// OpenAI wire makes strict OpenAI-compat APIs (DeepSeek) 422 with
+// `messages[N]: missing field role` — in that case callers must fall
+// through and rebuild from the parsed fields instead.
+func isOpenAIChatMessage(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	var probe struct {
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil || probe.Role == "" {
+		return false
+	}
+	return true
+}
+
 // toAPIMessages converts provider Messages to wire-format apiMessages,
 // handling ContentParts for multimodal messages.
 //
@@ -108,9 +129,10 @@ func toAPIMessages(msgs []Message) []json.RawMessage {
 
 		// For assistant messages with cached raw JSON, use it directly
 		// to guarantee prompt cache hits (byte-identical prefix) —
-		// unless the cached message has orphan tool_calls, in which
-		// case rebuild it without them.
-		if m.Role == "assistant" && len(m.RawAssistant) > 0 && !orphanAssistant[i] {
+		// unless it has orphan tool_calls or isn't an OpenAI chat
+		// message at all (no "role", e.g. an Anthropic thinking block),
+		// in which case rebuild. See isOpenAIChatMessage.
+		if m.Role == "assistant" && !orphanAssistant[i] && isOpenAIChatMessage(m.RawAssistant) {
 			out = append(out, m.RawAssistant)
 			continue
 		}
